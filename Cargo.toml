@@ -1,0 +1,27 @@
+[package]
+name = "hello_world"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flecs_ecs = "0.1.3"
+
+[dependencies.vulkano]
+version = "0.34"
+git = "https://github.com/vulkano-rs/vulkano"
+
+[dependencies.vulkano-shaders]
+version = "0.34"
+git = "https://github.com/vulkano-rs/vulkano"
+
+[dependencies.sdl2]
+version = "0.37"
+features = ["raw-window-handle"]
+
+[dependencies.glam]
+version = "0.29"
+
+[dependencies.gltf]
+version = "1.4"
+features = ["extras", "names"]
+
