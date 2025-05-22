@@ -19,7 +19,7 @@ pub struct Mesh {
     pub index_buffer: Subbuffer<[u32]>,
 }
 
-#[derive(Debug, Component)]
+#[derive(Debug, Component, Clone)]
 pub struct Material {
     pub diffuse: Option<Arc<ImageView>>,
     pub metallic_roughness: Option<Arc<ImageView>>,
@@ -34,4 +34,16 @@ pub struct EnvironmentCubemap {
     pub irradiance_map: Arc<ImageView>,
     pub prefiltered_environment_map: Arc<ImageView>,
     pub environment_brdf_lut: Arc<ImageView>,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            diffuse: None,
+            metallic_roughness: None,
+            ambient_oclussion: None,
+            emissive: None,
+            normal: None,
+        }
+    }
 }

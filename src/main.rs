@@ -434,7 +434,7 @@ impl App {
                 index_buffer: cube_mesh.1,
             })
             .set(Material {
-                diffuse: Some(diffuse.clone()),
+                diffuse: None,
                 metallic_roughness: Some(metallic_roughness.clone()),
                 ambient_oclussion: Some(ambient_oclussion.clone()),
                 emissive: Some(emissive.clone()),

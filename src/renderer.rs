@@ -7,16 +7,27 @@ use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         BufferUsage, Subbuffer,
-    }, command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo
-    }, descriptor_set::{
+    },
+    command_buffer::{
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
+        CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
+        SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+    },
+    descriptor_set::{
         allocator::StandardDescriptorSetAllocator, layout::DescriptorType, DescriptorBufferInfo,
         DescriptorSet, WriteDescriptorSet,
-    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{
+    },
+    device::{Device, DeviceOwned, Queue},
+    format::Format,
+    image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
         view::ImageView,
         Image, ImageCreateInfo, ImageType, ImageUsage,
-    }, instance::Instance, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, padded::Padded, pipeline::{
+    },
+    instance::Instance,
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    padded::Padded,
+    pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
@@ -30,14 +41,19 @@ use vulkano::{
         layout::PipelineDescriptorSetLayoutCreateInfo,
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, swapchain::{
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    shader::EntryPoint,
+    swapchain::{
         acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture,
         SwapchainCreateInfo, SwapchainPresentInfo,
-    }, sync::{
+    },
+    sync::{
         self,
         future::{FenceSignalFuture, JoinFuture},
         GpuFuture,
-    }, DeviceSize, Validated, VulkanError
+    },
+    DeviceSize, Validated, VulkanError,
 };
 
 use crate::{
@@ -46,7 +62,7 @@ use crate::{
         vertex::Vertex,
     },
     camera::Camera,
-    ecs::components,
+    ecs::components::{self, Material, Mesh, Transform},
 };
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -95,17 +111,61 @@ pub struct Renderer {
 
 fn create_default_material_textures(
     queue: Arc<Queue>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
 ) -> DefaultMaterialTextures {
     let format = Format::R8G8B8A8_UNORM;
-    let diffuse = load_texture_from_buffer(memory_allocator, command_buffer_allocator, queue, format, [1; 2], &[255; 3]);
+    let diffuse = load_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        format,
+        [1; 2],
+        &[255, 0, 255, 255],
+    )
+    .unwrap();
+    let metallic_roughness = load_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        format,
+        [1; 2],
+        &[0, 255, 0, 255],
+    )
+    .unwrap();
+    let ambient_oclussion = load_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        Format::R8_UNORM,
+        [1; 2],
+        &[255; 1],
+    )
+    .unwrap();
+    let emissive = load_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        format,
+        [1; 2],
+        &[255; 4],
+    )
+    .unwrap();
+    let normal = load_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        format,
+        [1; 2],
+        &[0, 0, 255, 255],
+    )
+    .unwrap();
     DefaultMaterialTextures {
         diffuse,
-        metallic_roughness: todo!(),
-        ambient_oclussion: todo!(),
-        emissive: todo!(),
-        normal: todo!(),
+        metallic_roughness,
+        ambient_oclussion,
+        emissive,
+        normal,
     }
 }
 
@@ -512,6 +572,12 @@ impl Renderer {
         )
         .unwrap();
 
+        let default_material_textures = create_default_material_textures(
+            queue.clone(), 
+            memory_allocator.clone(), 
+            command_buffer_allocator.clone(),
+        );
+
         Self {
             window,
             device,
@@ -534,6 +600,7 @@ impl Renderer {
             fences: [const { None }; MAX_FRAMES_IN_FLIGHT],
             recreate_swapchain: false,
             previous_fence_index: 0,
+            default_material_textures,
         }
     }
 
@@ -554,7 +621,10 @@ impl Renderer {
 
             self.swapchain = new_swapchain;
 
-            (self.framebuffers, (self.mesh_pipeline, self.skybox_pipeline)) = window_size_dependent_setup(
+            (
+                self.framebuffers,
+                (self.mesh_pipeline, self.skybox_pipeline),
+            ) = window_size_dependent_setup(
                 window_size.into(),
                 &new_images,
                 &self.render_pass,
@@ -567,7 +637,7 @@ impl Renderer {
 
             self.recreate_swapchain = false;
         }
-        
+
         let (image_index, suboptimal, acquire_future) =
             match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
                 Ok(r) => r,
@@ -673,7 +743,8 @@ impl Renderer {
         let mut irradiance_map = None;
         let mut prefiltered_environment_map = None;
         let mut environment_brdf_lut = None;
-        world.query::<&components::EnvironmentCubemap>()
+        world
+            .query::<&components::EnvironmentCubemap>()
             .term_at(0)
             .singleton()
             .build()
@@ -712,7 +783,10 @@ impl Renderer {
 
             let uniform_data = mesh_shaders::vs::FrameUniforms {
                 view: view.to_cols_array_2d(),
-                inv_view: Mat3::from_mat4(view).inverse().to_cols_array_2d().map(Padded),
+                inv_view: Mat3::from_mat4(view)
+                    .inverse()
+                    .to_cols_array_2d()
+                    .map(Padded),
                 proj: proj.to_cols_array_2d(),
             };
 
@@ -752,7 +826,11 @@ impl Renderer {
 
         let mut models_unforms = Vec::with_capacity(100); // maybe save it in the renderer so it
                                                           // isnt allocated every frame
-        world.each::<(&components::Mesh, &components::Material, &components::Transform)>(|(mesh, material, transform)| {
+        world.each::<(
+            &Mesh,
+            Option<&components::Material>,
+            &Transform,
+        )>(|(mesh, material, transform)| {
             let model_matrix = Mat4::from_scale_rotation_translation(
                 transform.scale,
                 transform.rotation,
@@ -778,15 +856,28 @@ impl Renderer {
             )
             .unwrap();
 
+            let material = material.cloned().unwrap_or(Material::default());
+
+            let diffuse = material.diffuse
+                .unwrap_or(self.default_material_textures.diffuse.clone());
+            let metallic_roughness = material.metallic_roughness
+                .unwrap_or(self.default_material_textures.metallic_roughness.clone());
+            let ambient_oclussion = material.ambient_oclussion
+                .unwrap_or(self.default_material_textures.ambient_oclussion.clone());
+            let emissive = material.emissive
+                .unwrap_or(self.default_material_textures.emissive.clone());
+            let normal = material.normal
+                .unwrap_or(self.default_material_textures.normal.clone());
+
             let material_descriptor_set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
                 self.mesh_pipeline.layout().set_layouts()[2].clone(),
                 [
-                    WriteDescriptorSet::image_view(0, material.diffuse.clone().unwrap().clone()),
-                    WriteDescriptorSet::image_view(1, material.metallic_roughness.clone().unwrap().clone()),
-                    WriteDescriptorSet::image_view(2, material.ambient_oclussion.clone().unwrap().clone()),
-                    WriteDescriptorSet::image_view(3, material.emissive.clone().unwrap().clone()),
-                    WriteDescriptorSet::image_view(4, material.normal.clone().unwrap().clone()),
+                    WriteDescriptorSet::image_view(0, diffuse),
+                    WriteDescriptorSet::image_view(1, metallic_roughness),
+                    WriteDescriptorSet::image_view(2, ambient_oclussion),
+                    WriteDescriptorSet::image_view(3, emissive),
+                    WriteDescriptorSet::image_view(4, normal),
                 ],
                 [],
             )
@@ -836,7 +927,8 @@ impl Renderer {
             .unwrap();
 
         let mut environment_map = None;
-        world.query::<&components::EnvironmentCubemap>()
+        world
+            .query::<&components::EnvironmentCubemap>()
             .term_at(0)
             .singleton()
             .build()
