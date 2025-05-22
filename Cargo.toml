@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 flecs_ecs = "0.1.3"
+image = "0.25.6"
 
 [dependencies.vulkano]
 version = "0.34"

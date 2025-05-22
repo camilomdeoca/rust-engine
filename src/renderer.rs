@@ -1,23 +1,28 @@
 use std::sync::Arc;
 
 use flecs_ecs::prelude::*;
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use sdl2::video::Window;
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         BufferUsage, Subbuffer,
     }, command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo
     }, descriptor_set::{
-        allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator}, layout::DescriptorType, DescriptorBufferInfo, DescriptorSet, WriteDescriptorSet
-    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{view::ImageView, Image, ImageCreateInfo, ImageType, ImageUsage}, instance::Instance, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
+        allocator::StandardDescriptorSetAllocator, layout::DescriptorType, DescriptorBufferInfo,
+        DescriptorSet, WriteDescriptorSet,
+    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
+        view::ImageView,
+        Image, ImageCreateInfo, ImageType, ImageUsage,
+    }, instance::Instance, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, padded::Padded, pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
-            depth_stencil::{DepthState, DepthStencilState},
+            depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
-            rasterization::RasterizationState,
+            rasterization::{CullMode, RasterizationState},
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
@@ -26,16 +31,33 @@ use vulkano::{
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
     }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, swapchain::{
-        acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo
-    }, sync::{self, future::{FenceSignalFuture, JoinFuture}, GpuFuture}, DeviceSize, Validated, VulkanError
+        acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture,
+        SwapchainCreateInfo, SwapchainPresentInfo,
+    }, sync::{
+        self,
+        future::{FenceSignalFuture, JoinFuture},
+        GpuFuture,
+    }, DeviceSize, Validated, VulkanError
 };
 
 use crate::{
-    assets::{database::AssetDatabase, Mesh, Vertex},
-    camera::Camera, ecs::components,
+    assets::{
+        loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::load_texture_from_buffer},
+        vertex::Vertex,
+    },
+    camera::Camera,
+    ecs::components,
 };
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+struct DefaultMaterialTextures {
+    pub diffuse: Arc<ImageView>,
+    pub metallic_roughness: Arc<ImageView>,
+    pub ambient_oclussion: Arc<ImageView>,
+    pub emissive: Arc<ImageView>,
+    pub normal: Arc<ImageView>,
+}
 
 pub struct Renderer {
     window: Arc<Window>,
@@ -48,13 +70,43 @@ pub struct Renderer {
     render_pass: Arc<RenderPass>,
     swapchain: Arc<Swapchain>,
     framebuffers: Vec<Arc<Framebuffer>>,
-    vs: EntryPoint,
-    fs: EntryPoint,
-    pipeline: Arc<GraphicsPipeline>,
-    viewport: Viewport,
+    mesh_vs: EntryPoint,
+    mesh_fs: EntryPoint,
+    mesh_pipeline: Arc<GraphicsPipeline>,
+    skybox_vs: EntryPoint,
+    skybox_fs: EntryPoint,
+    skybox_pipeline: Arc<GraphicsPipeline>,
+    cube_vertex_buffer: Subbuffer<[Vertex]>,
+    cube_index_buffer: Subbuffer<[u32]>,
     recreate_swapchain: bool,
-    fences: [Option<Arc<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>>>; MAX_FRAMES_IN_FLIGHT],
+    fences: [Option<
+        Arc<
+            FenceSignalFuture<
+                PresentFuture<
+                    CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>,
+                >,
+            >,
+        >,
+    >; MAX_FRAMES_IN_FLIGHT],
     previous_fence_index: u32,
+
+    default_material_textures: DefaultMaterialTextures,
+}
+
+fn create_default_material_textures(
+    queue: Arc<Queue>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+) -> DefaultMaterialTextures {
+    let format = Format::R8G8B8A8_UNORM;
+    let diffuse = load_texture_from_buffer(memory_allocator, command_buffer_allocator, queue, format, [1; 2], &[255; 3]);
+    DefaultMaterialTextures {
+        diffuse,
+        metallic_roughness: todo!(),
+        ambient_oclussion: todo!(),
+        emissive: todo!(),
+        normal: todo!(),
+    }
 }
 
 fn window_size_dependent_setup(
@@ -62,9 +114,14 @@ fn window_size_dependent_setup(
     images: &[Arc<Image>],
     render_pass: &Arc<RenderPass>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
-    vs: &EntryPoint,
-    fs: &EntryPoint,
-) -> (Vec<Arc<Framebuffer>>, Arc<GraphicsPipeline>) {
+    mesh_vs: &EntryPoint,
+    mesh_fs: &EntryPoint,
+    skybox_vs: &EntryPoint,
+    skybox_fs: &EntryPoint,
+) -> (
+    Vec<Arc<Framebuffer>>,
+    (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>),
+) {
     let device = memory_allocator.device();
 
     let depth_buffer = ImageView::new_default(
@@ -99,27 +156,54 @@ fn window_size_dependent_setup(
         })
         .collect::<Vec<_>>();
 
-    let pipeline = {
-        let vertex_input_state = Vertex::per_vertex()
-            .definition(vs)
-            .unwrap();
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs.clone()),
-            PipelineShaderStageCreateInfo::new(fs.clone()),
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: window_size.map(|e| e as f32),
+        depth_range: 0.0..=1.0,
+    };
+
+    let mesh_pipeline = {
+        let mesh_pipeline_stages = [
+            PipelineShaderStageCreateInfo::new(mesh_vs.clone()),
+            PipelineShaderStageCreateInfo::new(mesh_fs.clone()),
         ];
-        let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-        layout_create_info
-            .set_layouts[0]
+        let mut layout_create_info =
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
+
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Env descriptor set (rebound when the skybox changes, not too often)
+        layout_create_info.set_layouts[0]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .immutable_samplers = vec![sampler];
+
+        // Frame descriptor set (bound during the whole frame)
+        layout_create_info.set_layouts[1]
             .bindings
             .get_mut(&0)
             .unwrap()
             .descriptor_type = DescriptorType::UniformBuffer;
-        layout_create_info
-            .set_layouts[1]
+
+        // Material descriptor set (rebound for each material)
+
+        // Model descriptor set (rebound at an offset per model)
+        layout_create_info.set_layouts[3]
             .bindings
             .get_mut(&0)
             .unwrap()
             .descriptor_type = DescriptorType::UniformBufferDynamic;
+
         let layout = PipelineLayout::new(
             device.clone(),
             layout_create_info
@@ -127,47 +211,126 @@ fn window_size_dependent_setup(
                 .unwrap(),
         )
         .unwrap();
-        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+        let mesh_pass = Subpass::from(render_pass.clone(), 0).unwrap();
 
         GraphicsPipeline::new(
             device.clone(),
             None,
             GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
+                stages: mesh_pipeline_stages.into_iter().collect(),
+                vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs).unwrap()),
                 input_assembly_state: Some(InputAssemblyState::default()),
                 viewport_state: Some(ViewportState {
-                    viewports: [Viewport {
-                        offset: [0.0, 0.0],
-                        extent: window_size.map(|e| e as f32),
-                        depth_range: 0.0..=1.0,
-                    }]
-                    .into_iter()
-                    .collect(),
+                    viewports: [viewport.clone()].into_iter().collect(),
                     ..Default::default()
                 }),
-                rasterization_state: Some(RasterizationState::default()),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: CullMode::Back,
+                    ..Default::default()
+                }),
                 depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState::simple()),
                     ..Default::default()
                 }),
                 multisample_state: Some(MultisampleState::default()),
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
+                    mesh_pass.num_color_attachments(),
                     ColorBlendAttachmentState::default(),
                 )),
-                subpass: Some(subpass.into()),
+                subpass: Some(mesh_pass.into()),
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
         .unwrap()
     };
 
-    (framebuffers, pipeline)
+    let skybox_pipeline = {
+        let stages = [
+            PipelineShaderStageCreateInfo::new(skybox_vs.clone()),
+            PipelineShaderStageCreateInfo::new(skybox_fs.clone()),
+        ];
+        let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Env descriptor set (rebound when the skybox changes, not too often)
+        layout_create_info.set_layouts[0]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .immutable_samplers = vec![sampler];
+
+        // Frame descriptor set (bound during the whole frame)
+        layout_create_info.set_layouts[1]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .descriptor_type = DescriptorType::UniformBuffer;
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            layout_create_info
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let skybox_pass = Subpass::from(render_pass.clone(), 1).unwrap();
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs).unwrap()),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState {
+                    viewports: [viewport.clone()].into_iter().collect(),
+                    ..Default::default()
+                }),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: CullMode::None,
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState {
+                        write_enable: false,
+                        compare_op: CompareOp::LessOrEqual,
+                    }),
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    skybox_pass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                subpass: Some(skybox_pass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .unwrap()
+    };
+
+    (framebuffers, (mesh_pipeline, skybox_pipeline))
 }
 
 impl Renderer {
-    pub fn new(instance: Arc<Instance>, window: Arc<Window>, device: Arc<Device>, queue: Arc<Queue>, memory_allocator: Arc<StandardMemoryAllocator>) -> Self {
+    pub fn new(
+        instance: Arc<Instance>,
+        window: Arc<Window>,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        memory_allocator: Arc<StandardMemoryAllocator>,
+    ) -> Self {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
             Default::default(),
@@ -222,7 +385,7 @@ impl Renderer {
             .unwrap()
         };
 
-        let render_pass = vulkano::single_pass_renderpass!(
+        let render_pass = vulkano::ordered_passes_renderpass!(
             device.clone(),
             attachments: {
                 color: {
@@ -238,36 +401,116 @@ impl Renderer {
                     store_op: DontCare,
                 },
             },
-            pass: {
-                color: [color],
-                depth_stencil: {depth_stencil},
-            },
+            passes: [
+                // Mesh rendering
+                {
+                    color: [color],
+                    depth_stencil: {depth_stencil},
+                    input: []
+                },
+                // Skybox (after so it doesnt draw behind the meshes)
+                {
+                    color: [color],
+                    depth_stencil: {depth_stencil},
+                    input: []
+                }
+            ]
         )
         .unwrap();
 
-        let vs = vs::load(device.clone())
+        let mesh_vs = mesh_shaders::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = fs::load(device.clone())
+        let mesh_fs = mesh_shaders::fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let skybox_vs = skybox_shaders::vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let skybox_fs = skybox_shaders::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
 
-        let (framebuffers, pipeline) = window_size_dependent_setup(
+        let (framebuffers, (mesh_pipeline, skybox_pipeline)) = window_size_dependent_setup(
             <[u32; 2]>::from(window_size),
             &images,
             &render_pass,
             &memory_allocator,
-            &vs,
-            &fs,
+            &mesh_vs,
+            &mesh_fs,
+            &skybox_vs,
+            &skybox_fs,
         );
 
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: [window_size.0 as f32, window_size.1 as f32],
-            depth_range: 0.0..=1.0,
-        };
+        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone(),
+            [
+                Vertex {
+                    a_position: [-1.0, -1.0, 1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [1.0, -1.0, 1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [-1.0, 1.0, 1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [1.0, 1.0, 1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [-1.0, -1.0, -1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [1.0, -1.0, -1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [-1.0, 1.0, -1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+                Vertex {
+                    a_position: [1.0, 1.0, -1.0],
+                    a_normal: [0.0; 3],
+                    a_tangent: [0.0; 3],
+                    a_uv: [0.0; 2],
+                },
+            ],
+            [
+                // Front face (inverted)
+                2, 1, 0, 3, 1, 2, // Back face (inverted)
+                5, 6, 4, 7, 6, 5, // Left face (inverted)
+                4, 2, 0, 6, 2, 4, // Right face (inverted)
+                3, 5, 1, 7, 5, 3, // Top face (inverted)
+                6, 3, 2, 7, 3, 6, // Bottom face (inverted)
+                1, 4, 0, 5, 4, 1,
+            ],
+        )
+        .unwrap();
 
         Self {
             window,
@@ -280,24 +523,29 @@ impl Renderer {
             render_pass,
             swapchain,
             framebuffers,
-            vs,
-            fs,
-            pipeline,
-            viewport,
+            mesh_vs,
+            mesh_fs,
+            skybox_vs,
+            skybox_fs,
+            mesh_pipeline,
+            skybox_pipeline,
+            cube_vertex_buffer,
+            cube_index_buffer,
             fences: [const { None }; MAX_FRAMES_IN_FLIGHT],
             recreate_swapchain: false,
             previous_fence_index: 0,
         }
     }
 
-    pub fn draw(&mut self, camera: &Camera, world: &World, asset_database: &AssetDatabase) {
+    pub fn draw(&mut self, camera: &Camera, world: &World) {
         let window_size = self.window.size();
         if window_size.0 == 0 || window_size.1 == 0 {
             return;
         }
 
         if self.recreate_swapchain {
-            let (new_swapchain, new_images) = self.swapchain
+            let (new_swapchain, new_images) = self
+                .swapchain
                 .recreate(SwapchainCreateInfo {
                     image_extent: window_size.into(),
                     ..self.swapchain.create_info()
@@ -306,67 +554,29 @@ impl Renderer {
 
             self.swapchain = new_swapchain;
 
-            (self.framebuffers, self.pipeline) = window_size_dependent_setup(
+            (self.framebuffers, (self.mesh_pipeline, self.skybox_pipeline)) = window_size_dependent_setup(
                 window_size.into(),
                 &new_images,
                 &self.render_pass,
                 &self.memory_allocator,
-                &self.vs,
-                &self.fs,
+                &self.mesh_vs,
+                &self.mesh_fs,
+                &self.skybox_vs,
+                &self.skybox_fs,
             );
 
-            self.viewport.extent = [window_size.0 as f32, window_size.1 as f32];
             self.recreate_swapchain = false;
         }
-
-        let camera_uniform_buffer = {
-            let aspect_ratio = self.swapchain.image_extent()[0] as f32
-                / self.swapchain.image_extent()[1] as f32;
-
-            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * Mat4::perspective_rh_gl(
-                camera.fov,
-                aspect_ratio,
-                0.01,
-                100.0,
-            );
-            let view = Mat4::look_to_rh(
-                camera.position,
-                camera.rotation * Vec3::NEG_Z,
-                camera.rotation * Vec3::Y
-            );
-
-            let uniform_data = vs::CameraUniforms {
-                world: Mat4::IDENTITY.to_cols_array_2d(),
-                view: view.to_cols_array_2d(),
-                proj: proj.to_cols_array_2d(),
+        
+        let (image_index, suboptimal, acquire_future) =
+            match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
+                Ok(r) => r,
+                Err(VulkanError::OutOfDate) => {
+                    self.recreate_swapchain = true;
+                    return;
+                }
+                Err(e) => panic!("failed to acquire next image: {e}"),
             };
-
-            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-            *buffer.write().unwrap() = uniform_data;
-
-            buffer
-        };
-
-        let camera_descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, camera_uniform_buffer)],
-            [],
-        )
-        .unwrap();
-
-        let (image_index, suboptimal, acquire_future) = match acquire_next_image(
-            self.swapchain.clone(),
-            None,
-        )
-        .map_err(Validated::unwrap) {
-            Ok(r) => r,
-            Err(VulkanError::OutOfDate) => {
-                self.recreate_swapchain = true;
-                return;
-            }
-            Err(e) => panic!("failed to acquire next image: {e}"),
-        };
 
         if suboptimal {
             self.recreate_swapchain = true;
@@ -388,16 +598,6 @@ impl Renderer {
             Some(fence) => fence.boxed(),
         };
 
-        let model_uniform_buffer = self.uniform_buffer_allocator.allocate_slice(256).unwrap();
-
-        let model_descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, model_uniform_buffer.clone())],
-            [],
-        )
-        .unwrap();
-
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
             self.queue.queue_family_index(),
@@ -408,10 +608,7 @@ impl Renderer {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some([0.0, 0.0, 1.0, 1.0].into()),
-                        Some(1f32.into()),
-                    ],
+                    clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into()), Some(1f32.into())],
 
                     ..RenderPassBeginInfo::framebuffer(
                         self.framebuffers[image_index as usize].clone(),
@@ -422,45 +619,23 @@ impl Renderer {
                     ..Default::default()
                 },
             )
-            .unwrap()
-            .set_viewport(0, [self.viewport.clone()].into_iter().collect())
-            .unwrap()
-            .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap();
 
-        let model_index = 0;
-        world.each::<(&components::Mesh, &components::Transform)>(|(mesh, transform)| {
-            let mesh = asset_database.get_mesh(&mesh.id).unwrap();
-            let model_matrix = Mat4::from_scale_rotation_translation(
-                transform.scale,
-                transform.rotation,
-                transform.translation
-            );
-
-            *model_uniform_buffer.clone().index(model_index).write().unwrap() = vs::ModelUniforms {
-                transform: model_matrix.to_cols_array_2d()
-            };
-
-            let offset = (model_index * size_of::<vs::ModelUniforms>() as DeviceSize) as u32;
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    self.pipeline.layout().clone(),
-                    0,
-                    (camera_descriptor_set.clone(), model_descriptor_set.clone().offsets([offset]))
-                )
-                .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
-                .unwrap();
-
-            unsafe { builder.draw_indexed(mesh.index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
-        });
+        self.draw_meshes(&mut builder, &camera, &world);
 
         builder
-            .end_render_pass(Default::default())
+            .next_subpass(
+                SubpassEndInfo::default(),
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            )
             .unwrap();
+
+        self.draw_skybox(&mut builder, &camera, &world);
+
+        builder.end_render_pass(Default::default()).unwrap();
 
         let command_buffer = builder.build().unwrap();
 
@@ -470,10 +645,7 @@ impl Renderer {
             .unwrap()
             .then_swapchain_present(
                 self.queue.clone(),
-                SwapchainPresentInfo::swapchain_image_index(
-                    self.swapchain.clone(),
-                    image_index,
-                ),
+                SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
             )
             .then_signal_fence_and_flush();
 
@@ -491,18 +663,275 @@ impl Renderer {
 
         self.previous_fence_index = image_index;
     }
-}
 
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "assets/shaders/vertex.glsl",
+    fn draw_meshes(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        camera: &Camera,
+        world: &World,
+    ) {
+        let mut irradiance_map = None;
+        let mut prefiltered_environment_map = None;
+        let mut environment_brdf_lut = None;
+        world.query::<&components::EnvironmentCubemap>()
+            .term_at(0)
+            .singleton()
+            .build()
+            .each(|env_cubemap| {
+                irradiance_map = Some(env_cubemap.irradiance_map.clone());
+                prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
+                environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
+            });
+        let irradiance_map = irradiance_map.unwrap();
+        let prefiltered_environment_map = prefiltered_environment_map.unwrap();
+        let environment_brdf_lut = environment_brdf_lut.unwrap();
+
+        let environment_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.mesh_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::image_view(1, irradiance_map.clone()),
+                WriteDescriptorSet::image_view(2, prefiltered_environment_map.clone()),
+                WriteDescriptorSet::image_view(3, environment_brdf_lut.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
+        let frame_uniform_buffer = {
+            let aspect_ratio =
+                self.swapchain.image_extent()[0] as f32 / self.swapchain.image_extent()[1] as f32;
+
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
+            let view = Mat4::look_to_rh(
+                camera.position,
+                camera.rotation * Vec3::NEG_Z,
+                camera.rotation * Vec3::Y,
+            );
+
+            let uniform_data = mesh_shaders::vs::FrameUniforms {
+                view: view.to_cols_array_2d(),
+                inv_view: Mat3::from_mat4(view).inverse().to_cols_array_2d().map(Padded),
+                proj: proj.to_cols_array_2d(),
+            };
+
+            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *buffer.write().unwrap() = uniform_data;
+
+            buffer
+        };
+
+        let frame_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.mesh_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, frame_uniform_buffer)],
+            [],
+        )
+        .unwrap();
+
+        let model_uniform_buffer = self
+            .uniform_buffer_allocator
+            .allocate_slice(16 * 1024)
+            .unwrap();
+
+        builder
+            .bind_pipeline_graphics(self.mesh_pipeline.clone())
+            .unwrap();
+
+        let min_dynamic_align = self
+            .device
+            .physical_device()
+            .properties()
+            .min_uniform_buffer_offset_alignment
+            .as_devicesize();
+
+        let align =
+            (size_of::<mesh_shaders::vs::ModelUniforms>() as DeviceSize + min_dynamic_align - 1)
+                & !(min_dynamic_align - 1);
+
+        let mut models_unforms = Vec::with_capacity(100); // maybe save it in the renderer so it
+                                                          // isnt allocated every frame
+        world.each::<(&components::Mesh, &components::Material, &components::Transform)>(|(mesh, material, transform)| {
+            let model_matrix = Mat4::from_scale_rotation_translation(
+                transform.scale,
+                transform.rotation,
+                transform.translation,
+            );
+
+            let model_index = models_unforms.len() as DeviceSize;
+            models_unforms.push(mesh_shaders::vs::ModelUniforms {
+                transform: model_matrix.to_cols_array_2d(),
+            });
+
+            let model_descriptor_set = DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                self.mesh_pipeline.layout().set_layouts()[3].clone(),
+                [WriteDescriptorSet::buffer_with_range(
+                    0,
+                    DescriptorBufferInfo {
+                        buffer: model_uniform_buffer.clone(),
+                        range: 0..size_of::<mesh_shaders::vs::ModelUniforms>() as DeviceSize,
+                    },
+                )],
+                [],
+            )
+            .unwrap();
+
+            let material_descriptor_set = DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                self.mesh_pipeline.layout().set_layouts()[2].clone(),
+                [
+                    WriteDescriptorSet::image_view(0, material.diffuse.clone().unwrap().clone()),
+                    WriteDescriptorSet::image_view(1, material.metallic_roughness.clone().unwrap().clone()),
+                    WriteDescriptorSet::image_view(2, material.ambient_oclussion.clone().unwrap().clone()),
+                    WriteDescriptorSet::image_view(3, material.emissive.clone().unwrap().clone()),
+                    WriteDescriptorSet::image_view(4, material.normal.clone().unwrap().clone()),
+                ],
+                [],
+            )
+            .unwrap();
+
+            let offset = (model_index * align) as u32;
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.mesh_pipeline.layout().clone(),
+                    0,
+                    (
+                        environment_descriptor_set.clone(),
+                        frame_descriptor_set.clone(),
+                        material_descriptor_set.clone(),
+                        model_descriptor_set.clone().offsets([offset]),
+                    ),
+                )
+                .unwrap()
+                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .unwrap()
+                .bind_index_buffer(mesh.index_buffer.clone())
+                .unwrap();
+
+            unsafe { builder.draw_indexed(mesh.index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
+        });
+
+        for (model_index, model_uniforms) in models_unforms.iter().enumerate() {
+            *model_uniform_buffer
+                .clone()
+                .slice(model_index as DeviceSize * align..)
+                .cast_aligned()
+                .index(0)
+                .write()
+                .unwrap() = model_uniforms.clone();
+        }
+    }
+
+    fn draw_skybox(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        camera: &Camera,
+        world: &World,
+    ) {
+        builder
+            .bind_pipeline_graphics(self.skybox_pipeline.clone())
+            .unwrap();
+
+        let mut environment_map = None;
+        world.query::<&components::EnvironmentCubemap>()
+            .term_at(0)
+            .singleton()
+            .build()
+            .each(|env_cubemap| {
+                environment_map = Some(env_cubemap.environment_map.clone());
+            });
+        let environment_map = environment_map.unwrap();
+
+        let environment_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.skybox_pipeline.layout().set_layouts()[0].clone(),
+            [WriteDescriptorSet::image_view(1, environment_map.clone())],
+            [],
+        )
+        .unwrap();
+
+        let frame_uniform_buffer = {
+            let aspect_ratio =
+                self.swapchain.image_extent()[0] as f32 / self.swapchain.image_extent()[1] as f32;
+
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) // Correction for vulkan's
+                                                                   // inverted y
+                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
+            let view = Mat4::look_at_rh(
+                Vec3::ZERO,
+                camera.rotation * Vec3::NEG_Z,
+                camera.rotation * Vec3::Y,
+            );
+
+            let uniform_data = skybox_shaders::vs::FrameUniforms {
+                view_proj: (proj * view).to_cols_array_2d(),
+            };
+
+            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *buffer.write().unwrap() = uniform_data;
+
+            buffer
+        };
+
+        let frame_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.skybox_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, frame_uniform_buffer)],
+            [],
+        )
+        .unwrap();
+
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.skybox_pipeline.layout().clone(),
+                0,
+                (
+                    environment_descriptor_set.clone(),
+                    frame_descriptor_set.clone(),
+                ),
+            )
+            .unwrap()
+            .bind_vertex_buffers(0, self.cube_vertex_buffer.clone())
+            .unwrap()
+            .bind_index_buffer(self.cube_index_buffer.clone())
+            .unwrap();
+
+        unsafe { builder.draw_indexed(self.cube_index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
     }
 }
 
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "assets/shaders/fragment.glsl",
+mod mesh_shaders {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            path: "assets/shaders/vertex.glsl",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/fragment.glsl",
+        }
+    }
+}
+
+mod skybox_shaders {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            path: "assets/shaders/skybox_vertex.glsl",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/skybox_fragment.glsl",
+        }
     }
 }

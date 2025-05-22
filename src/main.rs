@@ -8,23 +8,47 @@
 // vertex or a shader is.
 
 mod assets;
-mod ecs;
 mod camera;
+mod ecs;
+mod image_based_lighting_maps_generator;
 mod renderer;
 
-use std::{path::Path, sync::Arc};
-use assets::{database::AssetDatabase, Mesh};
+use assets::database::AssetDatabase;
 use camera::Camera;
-use ecs::components;
+use ecs::components::{self, EnvironmentCubemap, Material};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
+use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use renderer::Renderer;
+use sdl2::{
+    event::{Event, WindowEvent},
+    keyboard::{Keycode, Scancode},
+    mouse::MouseButton,
+    video::Window,
+    Sdl,
+};
+use std::sync::Arc;
 use vulkano::{
     device::{
-        physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags
-    }, instance::{debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo}, Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions}, memory::allocator::StandardMemoryAllocator, VulkanLibrary
+        physical::{PhysicalDevice, PhysicalDeviceType},
+        Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
+    },
+    format::Format,
+    image::{
+        view::{ImageView, ImageViewCreateInfo, ImageViewType},
+        Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
+    },
+    instance::{
+        debug::{
+            DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
+            DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData,
+            DebugUtilsMessengerCreateInfo,
+        },
+        Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
+    },
+    memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
+    VulkanLibrary,
 };
-use sdl2::{event::{Event, WindowEvent}, keyboard::{Keycode, Scancode}, mouse::MouseButton, video::Window, Sdl};
 
 fn main() {
     let mut app = App::new();
@@ -32,7 +56,7 @@ fn main() {
 }
 
 struct App {
-    instance: Arc<Instance>,
+    _instance: Arc<Instance>,
     world: World,
     asset_database: AssetDatabase,
     renderer: Renderer,
@@ -45,7 +69,7 @@ struct App {
 fn debug_messenger_callback(
     message_severity: DebugUtilsMessageSeverity,
     message_type: DebugUtilsMessageType,
-    callback_data: DebugUtilsMessengerCallbackData<'_>
+    callback_data: DebugUtilsMessengerCallbackData<'_>,
 ) {
     // https://github.com/gfx-rs/wgpu/pull/3627
     // This seems to not be a real error
@@ -54,9 +78,7 @@ fn debug_messenger_callback(
         return;
     }
 
-    let severity = if message_severity
-        .intersects(DebugUtilsMessageSeverity::ERROR)
-    {
+    let severity = if message_severity.intersects(DebugUtilsMessageSeverity::ERROR) {
         "error"
     } else if message_severity.intersects(DebugUtilsMessageSeverity::WARNING) {
         "warning"
@@ -96,15 +118,18 @@ fn select_physical_device(
         .enumerate_physical_devices()
         .unwrap()
         .filter(|candidate_physical_device| {
-            candidate_physical_device.supported_extensions().contains(&device_extensions)
+            candidate_physical_device
+                .supported_extensions()
+                .contains(&device_extensions)
         })
         .filter_map(|candidate_physical_device| {
-            candidate_physical_device.queue_family_properties()
+            candidate_physical_device
+                .queue_family_properties()
                 .iter()
                 .enumerate()
                 .position(|(_i, queue)| {
                     queue.queue_flags.intersects(QueueFlags::GRAPHICS)
-                        //&& candidate_physical_device.presentation_support(i as u32, &window).unwrap_or(false) // TODO: Make this work
+                    //&& candidate_physical_device.presentation_support(i as u32, &window).unwrap_or(false) // TODO: Make this work
                 })
                 .map(|i| (candidate_physical_device, i as u32))
         })
@@ -129,11 +154,11 @@ impl App {
 
         let window = Arc::new(
             video_subsystem
-                .window("Window name", 640, 480)
+                .window("Window name", 1280, 720)
                 .resizable()
                 .vulkan()
                 .build()
-                .unwrap()
+                .unwrap(),
         );
 
         let required_extensions = InstanceExtensions {
@@ -141,9 +166,7 @@ impl App {
             ..InstanceExtensions::from_iter(window.vulkan_instance_extensions().unwrap())
         };
 
-        let required_layers = vec![
-            "VK_LAYER_KHRONOS_validation".to_string()
-        ];
+        let required_layers = vec!["VK_LAYER_KHRONOS_validation".to_string()];
 
         // Validate that required layers are available
         let available_layers_names: Vec<String> = library
@@ -156,7 +179,10 @@ impl App {
             .iter()
             .find(|required_layer_name| !available_layers_names.contains(required_layer_name))
         {
-            panic!("Required validation layer: \"{}\" is missing.", not_found_layer_name);
+            panic!(
+                "Required validation layer: \"{}\" is missing.",
+                not_found_layer_name
+            );
         }
 
         // Now creating the instance.
@@ -195,7 +221,7 @@ impl App {
                     },
                 )
             }
-            .unwrap()
+            .unwrap(),
         );
 
         let device_extensions = DeviceExtensions {
@@ -226,7 +252,7 @@ impl App {
         .unwrap();
 
         let queue = queues.next().unwrap();
-        
+
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
         let renderer = Renderer::new(
@@ -238,40 +264,191 @@ impl App {
         );
 
         let world = World::new();
-        let mut asset_database = AssetDatabase::new();
+        let mut asset_database = AssetDatabase::new(queue.clone(), memory_allocator.clone());
 
-        let damaged_helmet_mesh_id = asset_database.add_mesh(Mesh::from_path(
-            memory_allocator.clone(),
-            Path::new("/home/camilo/cosas/ruest/hello_world/DamagedHelmet.gltf")
-        ).unwrap());
-        let teapot_mesh_id = asset_database.add_mesh(Mesh::from_path(
-            memory_allocator.clone(),
-            Path::new("/home/camilo/cosas/ruest/hello_world/teapot.gltf")
-        ).unwrap());
+        let damaged_helmet_mesh = asset_database
+            .load_mesh(
+                "/home/camilo/cosas/ruest/hello_world/DamagedHelmet.gltf",
+                "DamagedHelmet",
+            )
+            .unwrap();
+        let cube_mesh = asset_database
+            .load_mesh("/home/camilo/cosas/ruest/hello_world/Cube.gltf", "Cube")
+            .unwrap();
 
-        world.entity_named("DamagedHelmet")
+        let diffuse = asset_database
+            .load_texture("texture.jpg", "diffuse")
+            .unwrap();
+        let metallic_roughness = asset_database
+            .load_texture("texture_2.jpg", "metallic_roughness")
+            .unwrap();
+        let ambient_oclussion = asset_database
+            .load_texture("texture_4.jpg", "ambient_oclussion")
+            .unwrap();
+        let emissive = asset_database
+            .load_texture("texture_5.jpg", "emissive")
+            .unwrap();
+        let normal = asset_database
+            .load_texture("texture_3.jpg", "normal")
+            .unwrap();
+
+        let irradiance_map_image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R16G16B16A16_SFLOAT,
+                extent: [64, 64, 1],
+                array_layers: 6,
+                flags: ImageCreateFlags::CUBE_COMPATIBLE,
+                usage: ImageUsage::TRANSFER_DST
+                    | ImageUsage::SAMPLED
+                    | ImageUsage::COLOR_ATTACHMENT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let irradiance_map = ImageView::new(
+            irradiance_map_image.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Cube,
+                ..ImageViewCreateInfo::from_image(&irradiance_map_image.clone())
+            },
+        )
+        .unwrap();
+
+        let prefiltered_environment_map_image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R16G16B16A16_SFLOAT,
+                extent: [1024, 1024, 1],
+                array_layers: 6,
+                mip_levels: 5,
+                flags: ImageCreateFlags::CUBE_COMPATIBLE,
+                usage: ImageUsage::TRANSFER_DST
+                    | ImageUsage::SAMPLED
+                    | ImageUsage::COLOR_ATTACHMENT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let prefiltered_environment_map = ImageView::new(
+            prefiltered_environment_map_image.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Cube,
+                ..ImageViewCreateInfo::from_image(&prefiltered_environment_map_image.clone())
+            },
+        )
+        .unwrap();
+
+        let environment_brdf_lut_image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R16G16_SFLOAT,
+                extent: [512, 512, 1],
+                usage: ImageUsage::TRANSFER_DST
+                    | ImageUsage::SAMPLED
+                    | ImageUsage::COLOR_ATTACHMENT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let environment_brdf_lut = ImageView::new(
+            environment_brdf_lut_image.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2d,
+                ..ImageViewCreateInfo::from_image(&environment_brdf_lut_image.clone())
+            },
+        )
+        .unwrap();
+
+        let environment_map = asset_database
+            .load_cubemap(
+                [
+                    "assets/cubemaps/skybox/px.hdr",
+                    "assets/cubemaps/skybox/nx.hdr",
+                    "assets/cubemaps/skybox/py.hdr",
+                    "assets/cubemaps/skybox/ny.hdr",
+                    "assets/cubemaps/skybox/pz.hdr",
+                    "assets/cubemaps/skybox/nz.hdr",
+                ],
+                "Skybox",
+            )
+            .unwrap();
+
+        let irradiance_map_renderer = ImageBasedLightingMapsGenerator::new(
+            device.clone(),
+            queue.clone(),
+            memory_allocator.clone(),
+            irradiance_map_image.format(),
+        );
+
+        irradiance_map_renderer.render_to_image(
+            environment_map.clone(),
+            irradiance_map_image.clone(),
+            prefiltered_environment_map_image.clone(),
+            environment_brdf_lut_image.clone(),
+        );
+
+        world.set(EnvironmentCubemap {
+            environment_map: environment_map.clone(),
+            irradiance_map: irradiance_map.clone(),
+            prefiltered_environment_map: prefiltered_environment_map.clone(),
+            environment_brdf_lut: environment_brdf_lut.clone(),
+        });
+
+        world
+            .entity_named("DamagedHelmet")
             .set(components::Transform {
                 translation: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
+                rotation: Quat::from_rotation_x((90f32).to_radians()),
                 scale: Vec3::ONE,
             })
-            .set(components::Mesh { id: damaged_helmet_mesh_id });
-        world.entity_named("Teapot")
+            .set(components::Mesh {
+                vertex_buffer: damaged_helmet_mesh.0,
+                index_buffer: damaged_helmet_mesh.1,
+            })
+            .set(Material {
+                diffuse: Some(diffuse.clone()),
+                metallic_roughness: Some(metallic_roughness.clone()),
+                ambient_oclussion: Some(ambient_oclussion.clone()),
+                emissive: Some(emissive.clone()),
+                normal: Some(normal.clone()),
+            });
+        world
+            .entity_named("Cube")
             .set(components::Transform {
                 translation: Vec3::new(0.0, 4.0, 0.0),
                 rotation: Quat::IDENTITY,
                 scale: Vec3::ONE,
             })
-            .set(components::Mesh { id: teapot_mesh_id });
+            .set(components::Mesh {
+                vertex_buffer: cube_mesh.0,
+                index_buffer: cube_mesh.1,
+            })
+            .set(Material {
+                diffuse: Some(diffuse.clone()),
+                metallic_roughness: Some(metallic_roughness.clone()),
+                ambient_oclussion: Some(ambient_oclussion.clone()),
+                emissive: Some(emissive.clone()),
+                normal: Some(normal.clone()),
+            });
 
         App {
-            instance,
+            _instance: instance,
             world,
             asset_database,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 1.0),
                 rotation: Quat::from_euler(EulerRot::YXZ, 0.0, 0.0, 0.0),
-                fov: std::f32::consts::FRAC_PI_2,
+                fov: 90f32.to_radians(),
             },
             sdl_context,
             _debug_callback: debug_callback,
@@ -364,14 +541,31 @@ impl App {
                     direction = direction.normalize();
                 }
                 self.camera.position += direction * speed * 0.01;
+
+                if keyboard_state.is_scancode_pressed(Scancode::Right) {
+                    self.world
+                        .lookup("DamagedHelmet")
+                        .get::<&mut components::Transform>(|transform| {
+                            transform.rotation =
+                                Quat::from_rotation_y(1f32.to_radians()) * transform.rotation;
+                        });
+                }
+                if keyboard_state.is_scancode_pressed(Scancode::Left) {
+                    self.world
+                        .lookup("DamagedHelmet")
+                        .get::<&mut components::Transform>(|transform| {
+                            transform.rotation =
+                                Quat::from_rotation_y(-1f32.to_radians()) * transform.rotation;
+                        });
+                }
             }
+
 
             //self.camera.position += self.camera_move_state.speed;
 
-            self.renderer.draw(&self.camera, &self.world, &self.asset_database);
+            self.renderer.draw(&self.camera, &self.world);
 
-            ::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
+            //::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }
     }
 }
-
