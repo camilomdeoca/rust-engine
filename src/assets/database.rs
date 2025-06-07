@@ -264,10 +264,12 @@ impl AssetDatabase {
 
         let cubemap;
         if format == Format::R16G16B16A16_UNORM {
-            let mut faces = Vec::new();
+            let mut data = Vec::new();
+            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba16();
-                faces.push(face);
+                dimensions = face.dimensions();
+                data.extend_from_slice(face.as_bytes());
             }
             
             cubemap = load_cubemap_from_buffer(
@@ -275,14 +277,16 @@ impl AssetDatabase {
                 self.command_buffer_allocator.clone(),
                 self.queue.clone(),
                 format,
-                faces[0].dimensions().into(),
-                faces.iter().map(|face| face.as_bytes()).collect::<Vec<_>>().try_into().unwrap(),
+                dimensions.into(),
+                &data,
             )?;
         } else if format == Format::R32G32B32A32_SFLOAT {
-            let mut faces = Vec::new();
+            let mut data = Vec::new();
+            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba32f();
-                faces.push(face);
+                dimensions = face.dimensions();
+                data.extend_from_slice(face.as_bytes());
             }
             
             cubemap = load_cubemap_from_buffer(
@@ -290,14 +294,16 @@ impl AssetDatabase {
                 self.command_buffer_allocator.clone(),
                 self.queue.clone(),
                 format,
-                faces[0].dimensions().into(),
-                faces.iter().map(|face| face.as_bytes()).collect::<Vec<_>>().try_into().unwrap(),
+                dimensions.into(),
+                &data,
             )?;
         } else {
-            let mut faces = Vec::new();
+            let mut data = Vec::new();
+            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba8();
-                faces.push(face);
+                dimensions = face.dimensions();
+                data.extend_from_slice(face.as_bytes());
             }
             
             cubemap = load_cubemap_from_buffer(
@@ -305,8 +311,8 @@ impl AssetDatabase {
                 self.command_buffer_allocator.clone(),
                 self.queue.clone(),
                 format,
-                faces[0].dimensions().into(),
-                faces.iter().map(|face| face.as_bytes()).collect::<Vec<_>>().try_into().unwrap(),
+                dimensions.into(),
+                &data,
             )?;
         }
         self.cubemaps.insert(

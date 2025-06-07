@@ -12,8 +12,9 @@ mod camera;
 mod ecs;
 mod image_based_lighting_maps_generator;
 mod renderer;
+mod profile;
 
-use assets::database::AssetDatabase;
+use assets::{database::AssetDatabase, loaders::gltf_scene_loader::load_gltf_scene};
 use camera::Camera;
 use ecs::components::{self, EnvironmentCubemap, Material};
 use flecs_ecs::prelude::*;
@@ -29,25 +30,20 @@ use sdl2::{
 };
 use std::sync::Arc;
 use vulkano::{
-    device::{
+    command_buffer::allocator::StandardCommandBufferAllocator, device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
         Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
-    },
-    format::Format,
-    image::{
+    }, format::Format, image::{
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
-    },
-    instance::{
+    }, instance::{
         debug::{
             DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
             DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData,
             DebugUtilsMessengerCreateInfo,
         },
         Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
-    },
-    memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
-    VulkanLibrary,
+    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, VulkanLibrary
 };
 
 fn main() {
@@ -262,42 +258,53 @@ impl App {
             queue.clone(),
             memory_allocator.clone(),
         );
+        println!("Initialized renderer");
 
         let world = World::new();
         let mut asset_database = AssetDatabase::new(queue.clone(), memory_allocator.clone());
 
-        let damaged_helmet_mesh = asset_database
-            .load_mesh(
-                "/home/camilo/cosas/ruest/hello_world/DamagedHelmet.gltf",
-                "DamagedHelmet",
-            )
-            .unwrap();
-        let cube_mesh = asset_database
-            .load_mesh("/home/camilo/cosas/ruest/hello_world/Cube.gltf", "Cube")
-            .unwrap();
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+            queue.device().clone(),
+            Default::default(),
+        ));
+        load_gltf_scene(
+            "assets/meshes/Bistro_with_tangents_all.glb",
+            &world,
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone()
+        ).unwrap();
+        println!("Loaded scene");
 
-        let diffuse = asset_database
-            .load_texture("texture.jpg", "diffuse")
-            .unwrap();
-        let metallic_roughness = asset_database
-            .load_texture("texture_2.jpg", "metallic_roughness")
-            .unwrap();
-        let ambient_oclussion = asset_database
-            .load_texture("texture_4.jpg", "ambient_oclussion")
-            .unwrap();
-        let emissive = asset_database
-            .load_texture("texture_5.jpg", "emissive")
-            .unwrap();
-        let normal = asset_database
-            .load_texture("texture_3.jpg", "normal")
-            .unwrap();
+        // let damaged_helmet_mesh = asset_database
+        //     .load_mesh(
+        //         "/home/camilo/cosas/ruest/hello_world/assets/meshes/Bistro_with_tangents.glb",
+        //         "DamagedHelmet",
+        //     )
+        //     .unwrap();
+        //
+        // let diffuse = asset_database
+        //     .load_texture("texture.jpg", "diffuse")
+        //     .unwrap();
+        // let metallic_roughness = asset_database
+        //     .load_texture("texture_2.jpg", "metallic_roughness")
+        //     .unwrap();
+        // let ambient_oclussion = asset_database
+        //     .load_texture("texture_4.jpg", "ambient_oclussion")
+        //     .unwrap();
+        // let emissive = asset_database
+        //     .load_texture("texture_5.jpg", "emissive")
+        //     .unwrap();
+        // let normal = asset_database
+        //     .load_texture("texture_3.jpg", "normal")
+        //     .unwrap();
 
         let irradiance_map_image = Image::new(
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
-                extent: [64, 64, 1],
+                extent: [32, 32, 1],
                 array_layers: 6,
                 flags: ImageCreateFlags::CUBE_COMPATIBLE,
                 usage: ImageUsage::TRANSFER_DST
@@ -308,6 +315,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
+        println!("Created irradiance map image");
 
         let irradiance_map = ImageView::new(
             irradiance_map_image.clone(),
@@ -323,7 +331,7 @@ impl App {
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
-                extent: [1024, 1024, 1],
+                extent: [512, 512, 1],
                 array_layers: 6,
                 mip_levels: 5,
                 flags: ImageCreateFlags::CUBE_COMPATIBLE,
@@ -335,6 +343,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
+        println!("Created prefiltered environment image");
 
         let prefiltered_environment_map = ImageView::new(
             prefiltered_environment_map_image.clone(),
@@ -359,6 +368,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
+        println!("Created environment brdf lut");
 
         let environment_brdf_lut = ImageView::new(
             environment_brdf_lut_image.clone(),
@@ -382,6 +392,7 @@ impl App {
                 "Skybox",
             )
             .unwrap();
+        println!("Loaded skybox");
 
         let irradiance_map_renderer = ImageBasedLightingMapsGenerator::new(
             device.clone(),
@@ -396,6 +407,7 @@ impl App {
             prefiltered_environment_map_image.clone(),
             environment_brdf_lut_image.clone(),
         );
+        println!("Created ibl maps");
 
         world.set(EnvironmentCubemap {
             environment_map: environment_map.clone(),
@@ -404,42 +416,24 @@ impl App {
             environment_brdf_lut: environment_brdf_lut.clone(),
         });
 
-        world
-            .entity_named("DamagedHelmet")
-            .set(components::Transform {
-                translation: Vec3::ZERO,
-                rotation: Quat::from_rotation_x((90f32).to_radians()),
-                scale: Vec3::ONE,
-            })
-            .set(components::Mesh {
-                vertex_buffer: damaged_helmet_mesh.0,
-                index_buffer: damaged_helmet_mesh.1,
-            })
-            .set(Material {
-                diffuse: Some(diffuse.clone()),
-                metallic_roughness: Some(metallic_roughness.clone()),
-                ambient_oclussion: Some(ambient_oclussion.clone()),
-                emissive: Some(emissive.clone()),
-                normal: Some(normal.clone()),
-            });
-        world
-            .entity_named("Cube")
-            .set(components::Transform {
-                translation: Vec3::new(0.0, 4.0, 0.0),
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-            })
-            .set(components::Mesh {
-                vertex_buffer: cube_mesh.0,
-                index_buffer: cube_mesh.1,
-            })
-            .set(Material {
-                diffuse: None,
-                metallic_roughness: Some(metallic_roughness.clone()),
-                ambient_oclussion: Some(ambient_oclussion.clone()),
-                emissive: Some(emissive.clone()),
-                normal: Some(normal.clone()),
-            });
+        // world
+        //     .entity_named("DamagedHelmet")
+        //     .set(components::Transform {
+        //         translation: Vec3::ZERO,
+        //         rotation: Quat::from_rotation_x((90f32).to_radians()),
+        //         scale: Vec3::ONE,
+        //     })
+        //     .set(components::Mesh {
+        //         vertex_buffer: damaged_helmet_mesh.0,
+        //         index_buffer: damaged_helmet_mesh.1,
+        //     })
+        //     .set(Material {
+        //         diffuse: Some(diffuse.clone()),
+        //         metallic_roughness: Some(metallic_roughness.clone()),
+        //         ambient_oclussion: Some(ambient_oclussion.clone()),
+        //         emissive: Some(emissive.clone()),
+        //         normal: Some(normal.clone()),
+        //     });
 
         App {
             _instance: instance,

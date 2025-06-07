@@ -368,7 +368,7 @@ impl ImageBasedLightingMapsGenerator {
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),
-            [
+            vec![
                 Vertex {
                     a_position: [-1.0, -1.0, 1.0],
                     a_normal: [0.0; 3],
@@ -418,7 +418,7 @@ impl ImageBasedLightingMapsGenerator {
                     a_uv: [0.0; 2],
                 },
             ],
-            [
+            vec![
                 // Front face (inverted)
                 2, 1, 0, 3, 1, 2, // Back face (inverted)
                 5, 6, 4, 7, 6, 5, // Left face (inverted)
@@ -434,7 +434,7 @@ impl ImageBasedLightingMapsGenerator {
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),
-            [
+            vec![
                 Vertex {
                     a_position: [-1.0, -1.0, 0.0],
                     a_normal: [0.0; 3],
@@ -460,7 +460,7 @@ impl ImageBasedLightingMapsGenerator {
                     a_uv: [0.0, 1.0],
                 },
             ],
-            [0, 1, 2, 2, 3, 0],
+            vec![0, 1, 2, 2, 3, 0],
         )
         .unwrap();
 

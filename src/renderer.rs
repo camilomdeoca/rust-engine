@@ -5,8 +5,7 @@ use glam::{Mat3, Mat4, Vec3};
 use sdl2::video::Window;
 use vulkano::{
     buffer::{
-        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
-        BufferUsage, Subbuffer,
+        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}, BufferContents, BufferUsage, Subbuffer
     },
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
@@ -65,8 +64,6 @@ use crate::{
     ecs::components::{self, Material, Mesh, Transform},
 };
 
-const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
 struct DefaultMaterialTextures {
     pub diffuse: Arc<ImageView>,
     pub metallic_roughness: Arc<ImageView>,
@@ -76,7 +73,6 @@ struct DefaultMaterialTextures {
 }
 
 pub struct Renderer {
-    window: Arc<Window>,
     device: Arc<Device>,
     queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -95,7 +91,7 @@ pub struct Renderer {
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
     recreate_swapchain: bool,
-    fences: [Option<
+    fences: Vec<Option<
         Arc<
             FenceSignalFuture<
                 PresentFuture<
@@ -103,7 +99,9 @@ pub struct Renderer {
                 >,
             >,
         >,
-    >; MAX_FRAMES_IN_FLIGHT],
+    >>,
+    window: Arc<Window>, // The window has to be dropped after the fences for some reason :)
+                         // Probably a SDL2 issue
     previous_fence_index: u32,
 
     default_material_textures: DefaultMaterialTextures,
@@ -121,7 +119,7 @@ fn create_default_material_textures(
         queue.clone(),
         format,
         [1; 2],
-        &[255, 0, 255, 255],
+        &[255; 4],
     )
     .unwrap();
     let metallic_roughness = load_texture_from_buffer(
@@ -130,7 +128,7 @@ fn create_default_material_textures(
         queue.clone(),
         format,
         [1; 2],
-        &[0, 255, 0, 255],
+        &[0, 255, 255, 255],
     )
     .unwrap();
     let ambient_oclussion = load_texture_from_buffer(
@@ -256,6 +254,11 @@ fn window_size_dependent_setup(
             .descriptor_type = DescriptorType::UniformBuffer;
 
         // Material descriptor set (rebound for each material)
+        layout_create_info.set_layouts[2]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .descriptor_type = DescriptorType::UniformBufferDynamic;
 
         // Model descriptor set (rebound at an offset per model)
         layout_create_info.set_layouts[3]
@@ -383,6 +386,22 @@ fn window_size_dependent_setup(
     (framebuffers, (mesh_pipeline, skybox_pipeline))
 }
 
+fn write_aligned_into_buffer<T>(data: &Vec<T>, align: DeviceSize, buffer: Subbuffer<[u8]>)
+where
+    T: BufferContents,
+    T: Copy,
+{
+    for (model_index, model_uniforms) in data.iter().enumerate() {
+        *buffer
+            .clone()
+            .slice(model_index as DeviceSize * align..)
+            .cast_aligned()
+            .index(0)
+            .write()
+            .unwrap() = model_uniforms.clone();
+    }
+}
+
 impl Renderer {
     pub fn new(
         instance: Arc<Instance>,
@@ -411,7 +430,7 @@ impl Renderer {
             },
         );
 
-        let surface = unsafe { Surface::from_window_ref(instance.clone(), &window).unwrap() };
+        let surface = unsafe { Surface::from_window_ref(instance.clone(), &window) }.unwrap();
         let window_size = window.size();
 
         let (swapchain, images) = {
@@ -429,7 +448,6 @@ impl Renderer {
                 device.clone(),
                 surface,
                 SwapchainCreateInfo {
-                    min_image_count: surface_capabilities.min_image_count.max(2),
                     image_format,
                     present_mode: PresentMode::Fifo,
                     image_extent: window_size.into(),
@@ -510,7 +528,7 @@ impl Renderer {
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),
-            [
+            vec![
                 Vertex {
                     a_position: [-1.0, -1.0, 1.0],
                     a_normal: [0.0; 3],
@@ -560,7 +578,7 @@ impl Renderer {
                     a_uv: [0.0; 2],
                 },
             ],
-            [
+            vec![
                 // Front face (inverted)
                 2, 1, 0, 3, 1, 2, // Back face (inverted)
                 5, 6, 4, 7, 6, 5, // Left face (inverted)
@@ -577,6 +595,9 @@ impl Renderer {
             memory_allocator.clone(), 
             command_buffer_allocator.clone(),
         );
+
+        let frames_in_flight = images.len();
+        let fences = vec![None; frames_in_flight];
 
         Self {
             window,
@@ -597,7 +618,7 @@ impl Renderer {
             skybox_pipeline,
             cube_vertex_buffer,
             cube_index_buffer,
-            fences: [const { None }; MAX_FRAMES_IN_FLIGHT],
+            fences,
             recreate_swapchain: false,
             previous_fence_index: 0,
             default_material_textures,
@@ -804,11 +825,6 @@ impl Renderer {
         )
         .unwrap();
 
-        let model_uniform_buffer = self
-            .uniform_buffer_allocator
-            .allocate_slice(16 * 1024)
-            .unwrap();
-
         builder
             .bind_pipeline_graphics(self.mesh_pipeline.clone())
             .unwrap();
@@ -820,29 +836,18 @@ impl Renderer {
             .min_uniform_buffer_offset_alignment
             .as_devicesize();
 
-        let align =
-            (size_of::<mesh_shaders::vs::ModelUniforms>() as DeviceSize + min_dynamic_align - 1)
-                & !(min_dynamic_align - 1);
+        let max_uniform_buffer_range = self
+            .device
+            .physical_device()
+            .properties()
+            .max_uniform_buffer_range;
 
-        let mut models_unforms = Vec::with_capacity(100); // maybe save it in the renderer so it
-                                                          // isnt allocated every frame
-        world.each::<(
-            &Mesh,
-            Option<&components::Material>,
-            &Transform,
-        )>(|(mesh, material, transform)| {
-            let model_matrix = Mat4::from_scale_rotation_translation(
-                transform.scale,
-                transform.rotation,
-                transform.translation,
-            );
+        let mut model_uniform_buffer = self
+            .uniform_buffer_allocator
+            .allocate_slice(max_uniform_buffer_range as DeviceSize)
+            .unwrap();
 
-            let model_index = models_unforms.len() as DeviceSize;
-            models_unforms.push(mesh_shaders::vs::ModelUniforms {
-                transform: model_matrix.to_cols_array_2d(),
-            });
-
-            let model_descriptor_set = DescriptorSet::new(
+        let mut model_descriptor_set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
                 self.mesh_pipeline.layout().set_layouts()[3].clone(),
                 [WriteDescriptorSet::buffer_with_range(
@@ -855,6 +860,66 @@ impl Renderer {
                 [],
             )
             .unwrap();
+
+        let model_uniforms_align =
+            (size_of::<mesh_shaders::vs::ModelUniforms>() as DeviceSize + min_dynamic_align - 1)
+                & !(min_dynamic_align - 1);
+
+        let max_model_uniforms_per_uniform_buffer = max_uniform_buffer_range / model_uniforms_align as u32;
+
+        // maybe save it in the renderer so it isnt allocated every frame
+        let mut models_uniforms = Vec::with_capacity(max_model_uniforms_per_uniform_buffer as usize);
+        
+        let mut materials_uniform_buffer = self
+            .uniform_buffer_allocator
+            .allocate_slice(max_uniform_buffer_range as DeviceSize)
+            .unwrap();
+        
+        let material_uniforms_align =
+            (size_of::<mesh_shaders::fs::MaterialFactors>() as DeviceSize + min_dynamic_align - 1)
+                & !(min_dynamic_align - 1);
+        
+        let max_material_uniforms_per_uniform_buffer = max_uniform_buffer_range / material_uniforms_align as u32;
+        // maybe save it in the renderer so it isnt allocated every frame
+        let mut material_uniforms = Vec::with_capacity(max_material_uniforms_per_uniform_buffer as usize);
+
+        world.each::<(
+            &Mesh,
+            Option<&components::Material>,
+            &Transform,
+        )>(|(mesh, material, transform)| {
+            let model_matrix = Mat4::from_scale_rotation_translation(
+                transform.scale,
+                transform.rotation,
+                transform.translation,
+            );
+
+            let model_index = models_uniforms.len() as DeviceSize;
+            models_uniforms.push(mesh_shaders::vs::ModelUniforms {
+                transform: model_matrix.to_cols_array_2d(),
+            });
+
+            if models_uniforms.len() >= max_model_uniforms_per_uniform_buffer as usize {
+                write_aligned_into_buffer(&models_uniforms, model_uniforms_align, model_uniform_buffer.clone());
+                models_uniforms.clear();
+                model_uniform_buffer = self
+                    .uniform_buffer_allocator
+                    .allocate_slice(max_uniform_buffer_range as DeviceSize)
+                    .unwrap();
+                model_descriptor_set = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    self.mesh_pipeline.layout().set_layouts()[3].clone(),
+                    [WriteDescriptorSet::buffer_with_range(
+                        0,
+                        DescriptorBufferInfo {
+                            buffer: model_uniform_buffer.clone(),
+                            range: 0..size_of::<mesh_shaders::vs::ModelUniforms>() as DeviceSize,
+                        },
+                    )],
+                    [],
+                )
+                .unwrap();
+            }
 
             let material = material.cloned().unwrap_or(Material::default());
 
@@ -873,17 +938,40 @@ impl Renderer {
                 self.descriptor_set_allocator.clone(),
                 self.mesh_pipeline.layout().set_layouts()[2].clone(),
                 [
-                    WriteDescriptorSet::image_view(0, diffuse),
-                    WriteDescriptorSet::image_view(1, metallic_roughness),
-                    WriteDescriptorSet::image_view(2, ambient_oclussion),
-                    WriteDescriptorSet::image_view(3, emissive),
-                    WriteDescriptorSet::image_view(4, normal),
+                    WriteDescriptorSet::buffer_with_range(
+                        0,
+                        DescriptorBufferInfo {
+                            buffer: materials_uniform_buffer.clone(),
+                            range: 0..size_of::<mesh_shaders::fs::MaterialFactors>() as DeviceSize,
+                        },
+                    ),
+                    WriteDescriptorSet::image_view(1, diffuse),
+                    WriteDescriptorSet::image_view(2, metallic_roughness),
+                    WriteDescriptorSet::image_view(3, ambient_oclussion),
+                    WriteDescriptorSet::image_view(4, emissive),
+                    WriteDescriptorSet::image_view(5, normal),
                 ],
                 [],
             )
             .unwrap();
 
-            let offset = (model_index * align) as u32;
+            let material_index = material_uniforms.len() as DeviceSize;
+            material_uniforms.push(mesh_shaders::fs::MaterialFactors {
+                base_color_factor: material.color_factor.into(),
+                emissive_factor: material.emissive_factor.into(),
+            });
+
+            if material_uniforms.len() >= max_material_uniforms_per_uniform_buffer as usize {
+                write_aligned_into_buffer(&material_uniforms, material_uniforms_align, materials_uniform_buffer.clone());
+                material_uniforms.clear();
+                materials_uniform_buffer = self
+                    .uniform_buffer_allocator
+                    .allocate_slice(max_uniform_buffer_range as DeviceSize)
+                    .unwrap();
+            }
+
+            let model_uniform_buffer_offset = (model_index * model_uniforms_align) as u32;
+            let material_uniform_buffer_offset = (material_index * material_uniforms_align) as u32;
             builder
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
@@ -892,8 +980,8 @@ impl Renderer {
                     (
                         environment_descriptor_set.clone(),
                         frame_descriptor_set.clone(),
-                        material_descriptor_set.clone(),
-                        model_descriptor_set.clone().offsets([offset]),
+                        material_descriptor_set.clone().offsets([material_uniform_buffer_offset]),
+                        model_descriptor_set.clone().offsets([model_uniform_buffer_offset]),
                     ),
                 )
                 .unwrap()
@@ -905,15 +993,8 @@ impl Renderer {
             unsafe { builder.draw_indexed(mesh.index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
         });
 
-        for (model_index, model_uniforms) in models_unforms.iter().enumerate() {
-            *model_uniform_buffer
-                .clone()
-                .slice(model_index as DeviceSize * align..)
-                .cast_aligned()
-                .index(0)
-                .write()
-                .unwrap() = model_uniforms.clone();
-        }
+        write_aligned_into_buffer(&material_uniforms, material_uniforms_align, materials_uniform_buffer.clone());
+        write_aligned_into_buffer(&models_uniforms, model_uniforms_align, model_uniform_buffer.clone());
     }
 
     fn draw_skybox(

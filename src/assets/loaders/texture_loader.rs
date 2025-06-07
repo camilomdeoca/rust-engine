@@ -40,7 +40,7 @@ pub fn load_cubemap_from_buffer(
     queue: Arc<Queue>,
     format: Format,
     extent: [u32; 2],
-    pixel_data: [&[u8]; 6],
+    pixel_data: &[u8],
 ) -> Result<Arc<ImageView>, String> {
     load_texture_from_buffer_impl(
         memory_allocator,
@@ -48,7 +48,7 @@ pub fn load_cubemap_from_buffer(
         queue,
         format,
         extent,
-        pixel_data.concat(),
+        pixel_data.iter().cloned(),
         6,
         ImageCreateFlags::CUBE_COMPATIBLE,
         ImageViewType::Cube,

@@ -21,11 +21,16 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
 } frame;
 
 // Material descriptor
-layout(set = 2, binding = 0) uniform texture2D diffuse;
-layout(set = 2, binding = 1) uniform texture2D metallic_roughness;
-layout(set = 2, binding = 2) uniform texture2D ambient_oclussion;
-layout(set = 2, binding = 3) uniform texture2D emissive;
-layout(set = 2, binding = 4) uniform texture2D normal;
+layout(set = 2, binding = 0) uniform MaterialFactors {
+    vec4 base_color_factor;
+    vec3 emissive_factor;
+} material_factors;
+
+layout(set = 2, binding = 1) uniform texture2D diffuse;
+layout(set = 2, binding = 2) uniform texture2D metallic_roughness;
+layout(set = 2, binding = 3) uniform texture2D ambient_oclussion;
+layout(set = 2, binding = 4) uniform texture2D emissive;
+layout(set = 2, binding = 5) uniform texture2D normal;
 
 const float PI = 3.14159265359;
 // ----------------------------------------------------------------------------
@@ -83,11 +88,13 @@ void main()
     vec3 V = normalize(-v_pos);
     vec3 R = reflect(-V, N);
     
-    vec3 albedo = texture(sampler2D(diffuse, s), v_uv).rgb;
+    vec3 albedo = texture(sampler2D(diffuse, s), v_uv).rgb
+                  * material_factors.base_color_factor.rgb;
     float metallic = texture(sampler2D(metallic_roughness, s), v_uv).b;
     float roughness = texture(sampler2D(metallic_roughness, s), v_uv).g;
     float ao = texture(sampler2D(ambient_oclussion, s), v_uv).r;
-    vec3 emissive = texture(sampler2D(emissive, s), v_uv).rgb;
+    vec3 emissive = texture(sampler2D(emissive, s), v_uv).rgb
+                    * material_factors.emissive_factor.rgb;
 
     // calculate reflectance at normal incidence; if dia-electric (like plastic) use F0 
     // of 0.04 and if it's a metal, use the albedo color as F0 (metallic workflow)    
