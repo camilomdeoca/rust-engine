@@ -16,7 +16,7 @@ mod profile;
 
 use assets::{database::AssetDatabase, loaders::gltf_scene_loader::load_gltf_scene};
 use camera::Camera;
-use ecs::components::{self, EnvironmentCubemap, Material};
+use ecs::components::{self, EnvironmentCubemap};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
@@ -28,9 +28,9 @@ use sdl2::{
     video::Window,
     Sdl,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use vulkano::{
-    command_buffer::allocator::StandardCommandBufferAllocator, device::{
+    device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
         Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
     }, format::Format, image::{
@@ -54,7 +54,7 @@ fn main() {
 struct App {
     _instance: Arc<Instance>,
     world: World,
-    asset_database: AssetDatabase,
+    asset_database: Arc<RwLock<AssetDatabase>>,
     renderer: Renderer,
     camera: Camera,
     sdl_context: Sdl,
@@ -251,53 +251,29 @@ impl App {
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
+        let world = World::new();
+
+        let asset_database = Arc::new(RwLock::new(
+            AssetDatabase::new(queue.clone(), memory_allocator.clone())
+        ));
+
         let renderer = Renderer::new(
             instance.clone(),
             window.clone(),
             device.clone(),
             queue.clone(),
+            asset_database.clone(),
             memory_allocator.clone(),
+            world.clone(),
         );
         println!("Initialized renderer");
 
-        let world = World::new();
-        let mut asset_database = AssetDatabase::new(queue.clone(), memory_allocator.clone());
-
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            queue.device().clone(),
-            Default::default(),
-        ));
         load_gltf_scene(
             "assets/meshes/Bistro_with_tangents_all.glb",
-            &world,
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            queue.clone()
+            world.clone(),
+            asset_database.clone(),
         ).unwrap();
         println!("Loaded scene");
-
-        // let damaged_helmet_mesh = asset_database
-        //     .load_mesh(
-        //         "/home/camilo/cosas/ruest/hello_world/assets/meshes/Bistro_with_tangents.glb",
-        //         "DamagedHelmet",
-        //     )
-        //     .unwrap();
-        //
-        // let diffuse = asset_database
-        //     .load_texture("texture.jpg", "diffuse")
-        //     .unwrap();
-        // let metallic_roughness = asset_database
-        //     .load_texture("texture_2.jpg", "metallic_roughness")
-        //     .unwrap();
-        // let ambient_oclussion = asset_database
-        //     .load_texture("texture_4.jpg", "ambient_oclussion")
-        //     .unwrap();
-        // let emissive = asset_database
-        //     .load_texture("texture_5.jpg", "emissive")
-        //     .unwrap();
-        // let normal = asset_database
-        //     .load_texture("texture_3.jpg", "normal")
-        //     .unwrap();
 
         let irradiance_map_image = Image::new(
             memory_allocator.clone(),
@@ -379,8 +355,9 @@ impl App {
         )
         .unwrap();
 
-        let environment_map = asset_database
-            .load_cubemap(
+        let environment_map_id = asset_database
+            .write().unwrap()
+            .add_cubemap_from_path(
                 [
                     "assets/cubemaps/skybox/px.hdr",
                     "assets/cubemaps/skybox/nx.hdr",
@@ -389,7 +366,6 @@ impl App {
                     "assets/cubemaps/skybox/pz.hdr",
                     "assets/cubemaps/skybox/nz.hdr",
                 ],
-                "Skybox",
             )
             .unwrap();
         println!("Loaded skybox");
@@ -402,38 +378,26 @@ impl App {
         );
 
         irradiance_map_renderer.render_to_image(
-            environment_map.clone(),
+            asset_database.read().unwrap()
+                .get_cubemap(environment_map_id.clone())
+                .unwrap().cubemap.clone(),
             irradiance_map_image.clone(),
             prefiltered_environment_map_image.clone(),
             environment_brdf_lut_image.clone(),
         );
         println!("Created ibl maps");
 
+        let mut asset_database_write = asset_database.write().unwrap();
         world.set(EnvironmentCubemap {
-            environment_map: environment_map.clone(),
-            irradiance_map: irradiance_map.clone(),
-            prefiltered_environment_map: prefiltered_environment_map.clone(),
-            environment_brdf_lut: environment_brdf_lut.clone(),
+            environment_map: environment_map_id,
+            irradiance_map: asset_database_write
+                .add_cubemap_from_raw(irradiance_map.clone()).unwrap(),
+            prefiltered_environment_map: asset_database_write
+                .add_cubemap_from_raw(prefiltered_environment_map.clone()).unwrap(),
+            environment_brdf_lut: asset_database_write
+                .add_cubemap_from_raw(environment_brdf_lut.clone()).unwrap(),
         });
-
-        // world
-        //     .entity_named("DamagedHelmet")
-        //     .set(components::Transform {
-        //         translation: Vec3::ZERO,
-        //         rotation: Quat::from_rotation_x((90f32).to_radians()),
-        //         scale: Vec3::ONE,
-        //     })
-        //     .set(components::Mesh {
-        //         vertex_buffer: damaged_helmet_mesh.0,
-        //         index_buffer: damaged_helmet_mesh.1,
-        //     })
-        //     .set(Material {
-        //         diffuse: Some(diffuse.clone()),
-        //         metallic_roughness: Some(metallic_roughness.clone()),
-        //         ambient_oclussion: Some(ambient_oclussion.clone()),
-        //         emissive: Some(emissive.clone()),
-        //         normal: Some(normal.clone()),
-        //     });
+        drop(asset_database_write);
 
         App {
             _instance: instance,
@@ -557,7 +521,7 @@ impl App {
 
             //self.camera.position += self.camera_move_state.speed;
 
-            self.renderer.draw(&self.camera, &self.world);
+            self.renderer.draw(&self.camera);
 
             //::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }

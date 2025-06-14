@@ -1,5 +1,7 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
+use bimap::BiHashMap;
+use glam::{UVec2, Vec3, Vec4};
 use gltf::{mesh::util::ReadIndices, Gltf};
 use image::EncodableLayout;
 use vulkano::{
@@ -11,14 +13,59 @@ use vulkano::{
 
 use super::{loaders::texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer}, vertex::Vertex};
 
+#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+pub struct MeshId(u32);
+
+pub struct Mesh {
+    pub vertex_buffer: Subbuffer<[Vertex]>,
+    pub index_buffer: Subbuffer<[u32]>,
+}
+
+#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+pub struct TextureId(u32);
+
+pub struct Texture {
+    pub texture: Arc<ImageView>,
+}
+
+#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+pub struct CubemapId(u32);
+
+pub struct Cubemap {
+    pub cubemap: Arc<ImageView>,
+}
+
+#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+pub struct MaterialId(u32);
+
+pub struct Material {
+    pub color_factor: Vec4,
+    pub diffuse: Option<TextureId>,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub metallic_roughness: Option<TextureId>,
+    pub ambient_oclussion: Option<TextureId>,
+    pub emissive_factor: Vec3,
+    pub emissive: Option<TextureId>,
+    pub normal: Option<TextureId>,
+}
+
 pub struct AssetDatabase {
     queue: Arc<Queue>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     memory_allocator: Arc<StandardMemoryAllocator>,
 
-    meshes: HashMap<String, (Subbuffer<[Vertex]>, Subbuffer<[u32]>)>,
-    textures: HashMap<String, Arc<ImageView>>,
-    cubemaps: HashMap<String, Arc<ImageView>>,
+    mesh_names: BiHashMap<String, MeshId>,
+    meshes: Vec<Mesh>,
+
+    texture_names: BiHashMap<String, TextureId>,
+    textures: Vec<Texture>,
+    
+    cubemap_names: BiHashMap<String, CubemapId>,
+    cubemaps: Vec<Cubemap>,
+    
+    material_names: BiHashMap<String, MaterialId>,
+    materials: Vec<Material>,
 }
 
 impl AssetDatabase {
@@ -32,18 +79,22 @@ impl AssetDatabase {
             queue,
             command_buffer_allocator,
             memory_allocator,
-            meshes: HashMap::new(),
-            textures: HashMap::new(),
-            cubemaps: HashMap::new(),
+            mesh_names: BiHashMap::new(),
+            meshes: Vec::new(),
+            texture_names: BiHashMap::new(),
+            textures: Vec::new(),
+            cubemap_names: BiHashMap::new(),
+            cubemaps: Vec::new(),
+            material_names: BiHashMap::new(),
+            materials: Vec::new(),
         }
     }
 
-    pub fn load_mesh_from_buffers(
+    pub fn add_mesh_from_buffers(
         &mut self,
         vertices: Vec<Vertex>,
         indices: Vec<u32>,
-        name: impl AsRef<str>,
-    ) -> Result<(Subbuffer<[Vertex]>, Subbuffer<[u32]>), String> {
+    ) -> Result<MeshId, String> {
         let vertex_count = vertices.len();
         let index_count = indices.len();
 
@@ -134,19 +185,36 @@ impl AssetDatabase {
             .wait(None)
             .unwrap();
 
-        self.meshes.insert(
-            name.as_ref().to_string(),
-            (vertex_buffer.clone(), index_buffer.clone()),
-        );
+        let mesh_id = MeshId(self.meshes.len() as u32);
+        self.meshes.push(Mesh {
+            vertex_buffer,
+            index_buffer,
+        });
 
-        Ok((vertex_buffer, index_buffer))
+        Ok(mesh_id)
+    }
+    
+    pub fn add_named_mesh_from_buffers(
+        &mut self,
+        vertices: Vec<Vertex>,
+        indices: Vec<u32>,
+        name: impl AsRef<str>,
+    ) -> Result<MeshId, String> {
+        if let Some(mesh_id) = self.mesh_names.get_by_left(name.as_ref()) {
+            Ok(mesh_id.clone())
+        } else {
+            let result = self.add_mesh_from_buffers(vertices, indices);
+            if result.is_ok() {
+                self.mesh_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+            }
+            result
+        }
     }
 
-    pub fn load_mesh(
+    pub fn add_mesh_from_path(
         &mut self,
         path: impl AsRef<Path>,
-        name: impl AsRef<str>,
-    ) -> Result<(Subbuffer<[Vertex]>, Subbuffer<[u32]>), String> {
+    ) -> Result<MeshId, String> {
         let path = path.as_ref();
         let gltf = Gltf::open(path).map_err(|gltf_error| {
             format!(
@@ -219,38 +287,121 @@ impl AssetDatabase {
             ReadIndices::U32(iter) => iter.collect(),
         };
 
-        self.load_mesh_from_buffers(vertices, indices, name)
+        self.add_mesh_from_buffers(vertices, indices)
     }
-
-    pub fn load_texture(
+    
+    pub fn add_named_mesh_from_path(
         &mut self,
         path: impl AsRef<Path>,
         name: impl AsRef<str>,
-    ) -> Result<Arc<ImageView>, String> {
-        let format = Format::R8G8B8A8_UNORM;
-        let image = image::open(path).unwrap().into_rgba8();
+    ) -> Result<MeshId, String> {
+        if let Some(mesh_id) = self.mesh_names.get_by_left(name.as_ref()) {
+            Ok(mesh_id.clone())
+        } else {
+            let result = self.add_mesh_from_path(path);
+            if result.is_ok() {
+                self.mesh_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+            }
+            result
+        }
+    }
+
+    pub fn add_texture_from_buffer(
+        &mut self,
+        format: Format,
+        dimensions: UVec2,
+        pixel_data: &[u8],
+    ) -> Result<TextureId, String> {
         let texture = load_texture_from_buffer(
             self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
             self.queue.clone(),
             format,
-            image.dimensions().into(),
-            &image,
+            dimensions.into(),
+            pixel_data,
         )?;
 
-        self.textures.insert(
-            name.as_ref().to_string(),
-            texture.clone(),
-        );
+        let texture_id = TextureId(self.textures.len() as u32);
+        self.textures.push(Texture { texture });
 
-        Ok(texture)
+        Ok(texture_id)
+    }
+    
+    pub fn add_named_texture_from_buffer(
+        &mut self,
+        format: Format,
+        dimensions: UVec2,
+        pixel_data: &[u8],
+        name: impl AsRef<str>,
+    ) -> Result<TextureId, String> {
+        if let Some(texture_id) = self.texture_names.get_by_left(name.as_ref()) {
+            Ok(texture_id.clone())
+        } else {
+            let result = self.add_texture_from_buffer(format, dimensions, pixel_data);
+            if result.is_ok() {
+                self.texture_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+            }
+            result
+        }
     }
 
-    pub fn load_cubemap(
+    pub fn add_texture_from_path(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<TextureId, String> {
+        let format = Format::R8G8B8A8_UNORM;
+        let image = image::open(path).unwrap().into_rgba8();
+        self.add_texture_from_buffer(format, image.dimensions().into(), &image)
+    }
+    
+    pub fn add_named_texture_from_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        name: impl AsRef<str>,
+    ) -> Result<TextureId, String> {
+        if let Some(texture_id) = self.texture_names.get_by_left(name.as_ref()) {
+            Ok(texture_id.clone())
+        } else {
+            let result = self.add_texture_from_path(path);
+            if result.is_ok() {
+                self.texture_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+            }
+            result
+        }
+    }
+
+    pub fn add_cubemap_from_raw(
+        &mut self,
+        cubemap: Arc<ImageView>,
+    ) -> Result<CubemapId, String> {
+        let cubemap_id = CubemapId(self.cubemaps.len() as u32);
+        self.cubemaps.push(Cubemap { cubemap });
+
+        Ok(cubemap_id)
+    }
+
+    pub fn add_cubemap_from_buffer(
+        &mut self,
+        format: Format,
+        dimensions: UVec2,
+        pixel_data: &[u8],
+    ) -> Result<CubemapId, String> {
+        let cubemap = load_cubemap_from_buffer(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.queue.clone(),
+            format,
+            dimensions.into(),
+            pixel_data,
+        )?;
+        
+        self.add_cubemap_from_raw(cubemap)
+    }
+
+    pub fn add_cubemap_from_path(
         &mut self,
         paths: [impl AsRef<Path>; 6],
-        name: impl AsRef<str>,
-    ) -> Result<Arc<ImageView>, String> {
+    ) -> Result<CubemapId, String> {
         let format = match image::open(paths[0].as_ref()).unwrap().color() {
             image::ColorType::Rgb8 => Format::R8G8B8A8_SRGB,
             image::ColorType::Rgba8 => Format::R8G8B8A8_SRGB,
@@ -262,76 +413,72 @@ impl AssetDatabase {
         };
         // let format = Format::R8G8B8A8_SRGB;
 
-        let cubemap;
+        let mut data = Vec::new();
+        let mut dimensions = UVec2::ZERO;
         if format == Format::R16G16B16A16_UNORM {
-            let mut data = Vec::new();
-            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba16();
-                dimensions = face.dimensions();
+                dimensions = face.dimensions().into();
                 data.extend_from_slice(face.as_bytes());
             }
-            
-            cubemap = load_cubemap_from_buffer(
-                self.memory_allocator.clone(),
-                self.command_buffer_allocator.clone(),
-                self.queue.clone(),
-                format,
-                dimensions.into(),
-                &data,
-            )?;
         } else if format == Format::R32G32B32A32_SFLOAT {
-            let mut data = Vec::new();
-            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba32f();
-                dimensions = face.dimensions();
+                dimensions = face.dimensions().into();
                 data.extend_from_slice(face.as_bytes());
             }
-            
-            cubemap = load_cubemap_from_buffer(
-                self.memory_allocator.clone(),
-                self.command_buffer_allocator.clone(),
-                self.queue.clone(),
-                format,
-                dimensions.into(),
-                &data,
-            )?;
         } else {
-            let mut data = Vec::new();
-            let mut dimensions = (0, 0);
             for path in paths {
                 let face = image::open(path).unwrap().into_rgba8();
-                dimensions = face.dimensions();
+                dimensions = face.dimensions().into();
                 data.extend_from_slice(face.as_bytes());
             }
             
-            cubemap = load_cubemap_from_buffer(
-                self.memory_allocator.clone(),
-                self.command_buffer_allocator.clone(),
-                self.queue.clone(),
-                format,
-                dimensions.into(),
-                &data,
-            )?;
         }
-        self.cubemaps.insert(
-            name.as_ref().to_string(),
-            cubemap.clone(),
-        );
 
-        Ok(cubemap)
+        self.add_cubemap_from_buffer(format, dimensions, &data)
     }
 
-    pub fn get_mesh(&self, name: &str) -> Option<(Subbuffer<[Vertex]>, Subbuffer<[u32]>)> {
-        self.meshes.get(name).cloned()
+    pub fn add_material(
+        &mut self,
+        color_factor: Vec4,
+        diffuse: Option<TextureId>,
+        metallic_factor: f32,
+        roughness_factor: f32,
+        metallic_roughness: Option<TextureId>,
+        ambient_oclussion: Option<TextureId>,
+        emissive_factor: Vec3,
+        emissive: Option<TextureId>,
+        normal: Option<TextureId>,
+    ) -> Result<MaterialId, String> {
+        let material_id = MaterialId(self.materials.len() as u32);
+        self.materials.push(Material {
+            color_factor,
+            diffuse,
+            metallic_factor,
+            roughness_factor,
+            metallic_roughness,
+            ambient_oclussion,
+            emissive_factor,
+            emissive,
+            normal,
+        });
+        Ok(material_id)
     }
 
-    pub fn get_texture(&self, name: &str) -> Option<Arc<ImageView>> {
-        self.textures.get(name).cloned()
+    pub fn get_mesh(&self, mesh_id: MeshId) -> Option<&Mesh> {
+        self.meshes.get(mesh_id.0 as usize)
     }
 
-    pub fn get_cubemap(&self, name: &str) -> Option<Arc<ImageView>> {
-        self.cubemaps.get(name).cloned()
+    pub fn get_texture(&self, texture_id: TextureId) -> Option<&Texture> {
+        self.textures.get(texture_id.0 as usize)
+    }
+
+    pub fn get_cubemap(&self, cubemap_id: CubemapId) -> Option<&Cubemap> {
+        self.cubemaps.get(cubemap_id.0 as usize)
+    }
+    
+    pub fn get_material(&self, material_id: MaterialId) -> Option<&Material> {
+        self.materials.get(material_id.0 as usize)
     }
 }

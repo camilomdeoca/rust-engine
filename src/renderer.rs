@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat3, Mat4, Vec3};
@@ -57,11 +57,10 @@ use vulkano::{
 
 use crate::{
     assets::{
-        loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::load_texture_from_buffer},
-        vertex::Vertex,
+        database::AssetDatabase, loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::load_texture_from_buffer}, vertex::Vertex
     },
     camera::Camera,
-    ecs::components::{self, Material, Mesh, Transform},
+    ecs::components::{self, MaterialComponent, MeshComponent, Transform},
 };
 
 struct DefaultMaterialTextures {
@@ -79,6 +78,9 @@ pub struct Renderer {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
+
+    asset_database: Arc<RwLock<AssetDatabase>>,
+
     render_pass: Arc<RenderPass>,
     swapchain: Arc<Swapchain>,
     framebuffers: Vec<Arc<Framebuffer>>,
@@ -91,6 +93,13 @@ pub struct Renderer {
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
     recreate_swapchain: bool,
+    environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
+    meshes_with_materials_query: Query<(
+        &'static MeshComponent,
+        &'static MaterialComponent,
+        &'static Transform
+    )>,
+    world: World,
     fences: Vec<Option<
         Arc<
             FenceSignalFuture<
@@ -247,11 +256,6 @@ fn window_size_dependent_setup(
             .immutable_samplers = vec![sampler];
 
         // Frame descriptor set (bound during the whole frame)
-        layout_create_info.set_layouts[1]
-            .bindings
-            .get_mut(&0)
-            .unwrap()
-            .descriptor_type = DescriptorType::UniformBuffer;
 
         // Material descriptor set (rebound for each material)
         layout_create_info.set_layouts[2]
@@ -408,7 +412,9 @@ impl Renderer {
         window: Arc<Window>,
         device: Arc<Device>,
         queue: Arc<Queue>,
+        asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
+        world: World,
     ) -> Self {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
@@ -599,6 +605,15 @@ impl Renderer {
         let frames_in_flight = images.len();
         let fences = vec![None; frames_in_flight];
 
+        let environment_cubemap_query = world
+            .query::<&components::EnvironmentCubemap>()
+            .term_at(0)
+            .singleton()
+            .build();
+
+        let meshes_with_materials_query = world
+            .new_query::<(&MeshComponent, &MaterialComponent, &Transform)>();
+
         Self {
             window,
             device,
@@ -607,6 +622,7 @@ impl Renderer {
             descriptor_set_allocator,
             command_buffer_allocator,
             uniform_buffer_allocator,
+            asset_database,
             render_pass,
             swapchain,
             framebuffers,
@@ -618,6 +634,9 @@ impl Renderer {
             skybox_pipeline,
             cube_vertex_buffer,
             cube_index_buffer,
+            environment_cubemap_query,
+            meshes_with_materials_query,
+            world,
             fences,
             recreate_swapchain: false,
             previous_fence_index: 0,
@@ -625,7 +644,7 @@ impl Renderer {
         }
     }
 
-    pub fn draw(&mut self, camera: &Camera, world: &World) {
+    pub fn draw(&mut self, camera: &Camera) {
         let window_size = self.window.size();
         if window_size.0 == 0 || window_size.1 == 0 {
             return;
@@ -712,7 +731,7 @@ impl Renderer {
             )
             .unwrap();
 
-        self.draw_meshes(&mut builder, &camera, &world);
+        self.draw_meshes(&mut builder, &camera);
 
         builder
             .next_subpass(
@@ -724,7 +743,7 @@ impl Renderer {
             )
             .unwrap();
 
-        self.draw_skybox(&mut builder, &camera, &world);
+        self.draw_skybox(&mut builder, &camera);
 
         builder.end_render_pass(Default::default()).unwrap();
 
@@ -759,16 +778,12 @@ impl Renderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
-        world: &World,
     ) {
         let mut irradiance_map = None;
         let mut prefiltered_environment_map = None;
         let mut environment_brdf_lut = None;
-        world
-            .query::<&components::EnvironmentCubemap>()
-            .term_at(0)
-            .singleton()
-            .build()
+
+        self.environment_cubemap_query
             .each(|env_cubemap| {
                 irradiance_map = Some(env_cubemap.irradiance_map.clone());
                 prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
@@ -778,17 +793,19 @@ impl Renderer {
         let prefiltered_environment_map = prefiltered_environment_map.unwrap();
         let environment_brdf_lut = environment_brdf_lut.unwrap();
 
+        let asset_database_read = self.asset_database.read().unwrap();
         let environment_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.mesh_pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::image_view(1, irradiance_map.clone()),
-                WriteDescriptorSet::image_view(2, prefiltered_environment_map.clone()),
-                WriteDescriptorSet::image_view(3, environment_brdf_lut.clone()),
+                WriteDescriptorSet::image_view(1, asset_database_read.get_cubemap(irradiance_map).unwrap().cubemap.clone()),
+                WriteDescriptorSet::image_view(2, asset_database_read.get_cubemap(prefiltered_environment_map).unwrap().cubemap.clone()),
+                WriteDescriptorSet::image_view(3, asset_database_read.get_cubemap(environment_brdf_lut).unwrap().cubemap.clone()),
             ],
             [],
         )
         .unwrap();
+        drop(asset_database_read);
 
         let frame_uniform_buffer = {
             let aspect_ratio =
@@ -883,11 +900,7 @@ impl Renderer {
         // maybe save it in the renderer so it isnt allocated every frame
         let mut material_uniforms = Vec::with_capacity(max_material_uniforms_per_uniform_buffer as usize);
 
-        world.each::<(
-            &Mesh,
-            Option<&components::Material>,
-            &Transform,
-        )>(|(mesh, material, transform)| {
+        self.meshes_with_materials_query.each(|(mesh_component, material, transform)| {
             let model_matrix = Mat4::from_scale_rotation_translation(
                 transform.scale,
                 transform.rotation,
@@ -921,17 +934,23 @@ impl Renderer {
                 .unwrap();
             }
 
-            let material = material.cloned().unwrap_or(Material::default());
+            let asset_database_read = self.asset_database.read().unwrap();
+            let material = asset_database_read.get_material(material.material_id.clone()).unwrap();
 
-            let diffuse = material.diffuse
+            let diffuse = material.diffuse.clone()
+                .map(|texture_id| asset_database_read.get_texture(texture_id).unwrap().texture.clone())
                 .unwrap_or(self.default_material_textures.diffuse.clone());
-            let metallic_roughness = material.metallic_roughness
+            let metallic_roughness = material.metallic_roughness.clone()
+                .map(|texture_id| asset_database_read.get_texture(texture_id).unwrap().texture.clone())
                 .unwrap_or(self.default_material_textures.metallic_roughness.clone());
-            let ambient_oclussion = material.ambient_oclussion
+            let ambient_oclussion = material.ambient_oclussion.clone()
+                .map(|texture_id| asset_database_read.get_texture(texture_id).unwrap().texture.clone())
                 .unwrap_or(self.default_material_textures.ambient_oclussion.clone());
-            let emissive = material.emissive
+            let emissive = material.emissive.clone()
+                .map(|texture_id| asset_database_read.get_texture(texture_id).unwrap().texture.clone())
                 .unwrap_or(self.default_material_textures.emissive.clone());
-            let normal = material.normal
+            let normal = material.normal.clone()
+                .map(|texture_id| asset_database_read.get_texture(texture_id).unwrap().texture.clone())
                 .unwrap_or(self.default_material_textures.normal.clone());
 
             let material_descriptor_set = DescriptorSet::new(
@@ -970,6 +989,8 @@ impl Renderer {
                     .unwrap();
             }
 
+            let mesh = asset_database_read.get_mesh(mesh_component.mesh_id.clone()).unwrap();
+
             let model_uniform_buffer_offset = (model_index * model_uniforms_align) as u32;
             let material_uniform_buffer_offset = (material_index * material_uniforms_align) as u32;
             builder
@@ -1001,14 +1022,13 @@ impl Renderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
-        world: &World,
     ) {
         builder
             .bind_pipeline_graphics(self.skybox_pipeline.clone())
             .unwrap();
 
         let mut environment_map = None;
-        world
+        self.world
             .query::<&components::EnvironmentCubemap>()
             .term_at(0)
             .singleton()
@@ -1018,13 +1038,15 @@ impl Renderer {
             });
         let environment_map = environment_map.unwrap();
 
+        let asset_database_read = self.asset_database.read().unwrap();
         let environment_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.skybox_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view(1, environment_map.clone())],
+            [WriteDescriptorSet::image_view(1, asset_database_read.get_cubemap(environment_map).unwrap().cubemap.clone())],
             [],
         )
         .unwrap();
+        drop(asset_database_read);
 
         let frame_uniform_buffer = {
             let aspect_ratio =

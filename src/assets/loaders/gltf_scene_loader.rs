@@ -1,27 +1,20 @@
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{collections::HashMap, fs, path::Path, sync::{Arc, RwLock}};
 
 use flecs_ecs::core::World;
 use glam::{Quat, Vec3};
-use gltf::{buffer::Data, image::Source, mesh::util::ReadIndices, Gltf, Texture};
-use vulkano::{
-    command_buffer::allocator::CommandBufferAllocator, device::Queue, format::Format,
-    image::view::ImageView, memory::allocator::MemoryAllocator,
-};
+use gltf::{buffer::Data, image::Source, mesh::util::ReadIndices, Texture};
+use vulkano::format::Format;
 
 use crate::{
-    assets::{loaders::texture_loader::load_texture_from_buffer, vertex::Vertex},
-    ecs::components::{Material, Mesh, Transform},
+    assets::{database::{AssetDatabase, MaterialId, MeshId, TextureId}, vertex::Vertex},
+    ecs::components::{MaterialComponent, MeshComponent, Transform},
 };
 
-use super::mesh_loader::load_mesh_from_buffers;
-
 fn load_texture_from_gltf_texture(
-    memory_allocator: Arc<dyn MemoryAllocator>,
-    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: Arc<Queue>,
+    asset_database: Arc<RwLock<AssetDatabase>>,
     gltf_texture: &Texture,
     gltf_buffers: &Vec<Data>,
-) -> Arc<ImageView> {
+) -> TextureId {
     match gltf_texture.source().source() {
         Source::View { view, mime_type } => {
             let start = view.offset();
@@ -33,10 +26,7 @@ fn load_texture_from_gltf_texture(
             )
             .unwrap()
             .into_rgba8();
-            load_texture_from_buffer(
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                queue.clone(),
+            asset_database.write().unwrap().add_texture_from_buffer(
                 Format::R8G8B8A8_UNORM,
                 image.dimensions().into(),
                 &image,
@@ -49,10 +39,8 @@ fn load_texture_from_gltf_texture(
 
 pub fn load_gltf_scene(
     path: impl AsRef<Path>,
-    world: &World,
-    memory_allocator: Arc<dyn MemoryAllocator>,
-    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: Arc<Queue>,
+    world: World,
+    asset_database: Arc<RwLock<AssetDatabase>>,
 ) -> Result<(), String> {
     let path = path.as_ref();
     let file_data = fs::read(&path).unwrap();
@@ -61,7 +49,9 @@ pub fn load_gltf_scene(
     let base_path = path.parent().unwrap_or_else(|| Path::new("./"));
     let gltf_buffers = gltf::import_buffers(&gltf.document, Some(base_path), gltf.blob).unwrap();
 
-    let mut textures = <HashMap<_, Arc<ImageView>>>::default();
+    let mut textures = <HashMap<_, TextureId>>::default();
+    let mut materials = <HashMap<_, MaterialId>>::default();
+    let mut meshes = <HashMap<_, MeshId>>::default();
 
     //let (gltf, gltf_buffers, _images) = gltf::import(&path).unwrap();
 
@@ -80,62 +70,69 @@ pub fn load_gltf_scene(
 
         for primitive in mesh.primitives() {
             println!(
-                "        Material {}",
+                "        Material {} {}",
                 primitive.material().name().unwrap(),
+                if materials.contains_key(&primitive.material().index().unwrap()) {
+                    "(Repeated)"
+                } else {
+                    ""
+                },
             );
-            let reader = primitive.reader(|buffer| Some(&gltf_buffers[buffer.index()]));
+            let mesh_id = if let Some(mesh_id) = meshes.get(&(mesh.index(), primitive.index())) {
+                panic!("REPEATED MESH YAY"); // Change to println! once confirmed it happens
+                mesh_id.clone()
+            } else {
+                let reader = primitive.reader(|buffer| Some(&gltf_buffers[buffer.index()]));
 
-            let positions_iter = reader.read_positions().unwrap();
-            let normals_iter = reader.read_normals().unwrap();
-            let tangents_iter = reader.read_tangents();
-            // if tangents_iter.is_none() {
-            //     println!("        HAS_NO_TANGENTS");
-            //     continue;
-            // }
-            let tangents_iter = tangents_iter.unwrap();
-            let uvs_iter = reader.read_tex_coords(0).unwrap().into_f32();
+                let positions_iter = reader.read_positions().unwrap();
+                let normals_iter = reader.read_normals().unwrap();
+                let tangents_iter = reader.read_tangents();
+                // if tangents_iter.is_none() {
+                //     println!("        HAS_NO_TANGENTS");
+                //     continue;
+                // }
+                let tangents_iter = tangents_iter.unwrap();
+                let uvs_iter = reader.read_tex_coords(0).unwrap().into_f32();
 
-            let mut vertices = Vec::with_capacity(positions_iter.len());
+                let mut vertices = Vec::with_capacity(positions_iter.len());
 
-            for (((a_position, a_normal), a_tangent), a_uv) in positions_iter
-                .zip(normals_iter)
-                .zip(tangents_iter)
-                .zip(uvs_iter)
-            {
-                vertices.push(Vertex {
-                    a_position,
-                    a_normal,
-                    a_tangent: [a_tangent[0], a_tangent[1], a_tangent[2]],
-                    a_uv,
-                });
-            }
-            assert_eq!(vertices.capacity(), vertices.len());
+                for (((a_position, a_normal), a_tangent), a_uv) in positions_iter
+                    .zip(normals_iter)
+                    .zip(tangents_iter)
+                    .zip(uvs_iter)
+                {
+                    vertices.push(Vertex {
+                        a_position,
+                        a_normal,
+                        a_tangent: [a_tangent[0], a_tangent[1], a_tangent[2]],
+                        a_uv,
+                    });
+                }
+                assert_eq!(vertices.capacity(), vertices.len());
 
-            let indices_reader = reader.read_indices().unwrap();
+                let indices_reader = reader.read_indices().unwrap();
 
-            let indices: Vec<_> = match indices_reader {
-                ReadIndices::U8(iter) => iter.map(|index| index.into()).collect(),
-                ReadIndices::U16(iter) => iter.map(|index| index.into()).collect(),
-                ReadIndices::U32(iter) => iter.collect(),
+                let indices: Vec<_> = match indices_reader {
+                    ReadIndices::U8(iter) => iter.map(|index| index.into()).collect(),
+                    ReadIndices::U16(iter) => iter.map(|index| index.into()).collect(),
+                    ReadIndices::U32(iter) => iter.collect(),
+                };
+
+                let mut asset_database_write = asset_database.write().unwrap();
+                let mesh_id = asset_database_write.add_mesh_from_buffers(vertices, indices).unwrap();
+                
+                meshes.insert((mesh.index(), primitive.index()), mesh_id.clone());
+
+                mesh_id
             };
 
-            let (vertex_buffer, index_buffer) = load_mesh_from_buffers(
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                queue.clone(),
-                vertices,
-                indices,
-            )
-            .unwrap();
-
-            let mut get_texture_from_gltf_texture = |gltf_texture: &gltf::Texture| -> Arc<ImageView> {
-                if let Some(texture) = textures.get(&gltf_texture.index()) {
-                    texture.clone()
+            let mut get_texture_from_gltf_texture = |gltf_texture: &gltf::Texture| -> TextureId {
+                if let Some(texture_id) = textures.get(&gltf_texture.index()) {
+                    panic!("REPEATED TEXTURE YAY"); // Change to println! once confirmed it happens
+                    texture_id.clone()
                 } else {
                     let texture = load_texture_from_gltf_texture(
-                        memory_allocator.clone(),
-                        command_buffer_allocator.clone(),
-                        queue.clone(),
+                        asset_database.clone(),
                         &gltf_texture,
                         &gltf_buffers,
                     );
@@ -146,32 +143,53 @@ pub fn load_gltf_scene(
             };
 
             let gltf_material = primitive.material();
+            let material_id = if let Some(material_id) = materials.get(&gltf_material.index().unwrap()) {
+                material_id.clone()
+            } else {
+                let color_factor = gltf_material.pbr_metallic_roughness().base_color_factor().into();
+                let diffuse = gltf_material
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map(|texture_info| get_texture_from_gltf_texture(&texture_info.texture()));
 
-            let color_factor = gltf_material.pbr_metallic_roughness().base_color_factor().into();
-            let diffuse = gltf_material
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .map(|texture_info| get_texture_from_gltf_texture(&texture_info.texture()));
+                let metallic_factor = gltf_material.pbr_metallic_roughness().metallic_factor().into();
+                let roughness_factor = gltf_material.pbr_metallic_roughness().roughness_factor().into();
+                let metallic_roughness = gltf_material
+                    .pbr_metallic_roughness()
+                    .metallic_roughness_texture()
+                    .map(|texture_info| get_texture_from_gltf_texture(&texture_info.texture()));
 
-            let metallic_factor = gltf_material.pbr_metallic_roughness().metallic_factor().into();
-            let roughness_factor = gltf_material.pbr_metallic_roughness().roughness_factor().into();
-            let metallic_roughness = gltf_material
-                .pbr_metallic_roughness()
-                .metallic_roughness_texture()
-                .map(|texture_info| get_texture_from_gltf_texture(&texture_info.texture()));
+                let ambient_oclussion = gltf_material
+                    .occlusion_texture()
+                    .map(|occlusion_texture| get_texture_from_gltf_texture(&occlusion_texture.texture()));
 
-            let ambient_oclussion = gltf_material
-                .occlusion_texture()
-                .map(|occlusion_texture| get_texture_from_gltf_texture(&occlusion_texture.texture()));
+                let emissive_factor = gltf_material.emissive_factor().into();
+                let emissive = gltf_material
+                    .emissive_texture()
+                    .map(|emissive_texture| get_texture_from_gltf_texture(&emissive_texture.texture()));
 
-            let emissive_factor = gltf_material.emissive_factor().into();
-            let emissive = gltf_material
-                .emissive_texture()
-                .map(|emissive_texture| get_texture_from_gltf_texture(&emissive_texture.texture()));
+                let normal = gltf_material
+                    .normal_texture()
+                    .map(|normal_texture| get_texture_from_gltf_texture(&normal_texture.texture()));
 
-            let normal = gltf_material
-                .normal_texture()
-                .map(|normal_texture| get_texture_from_gltf_texture(&normal_texture.texture()));
+                let mut asset_database_write = asset_database.write().unwrap();
+                let material_id = asset_database_write.add_material(
+                    color_factor,
+                    diffuse,
+                    metallic_factor,
+                    roughness_factor,
+                    metallic_roughness,
+                    ambient_oclussion,
+                    emissive_factor,
+                    emissive,
+                    normal,
+                ).unwrap();
+                drop(asset_database_write);
+
+                materials.insert(gltf_material.index().unwrap(), material_id.clone());
+
+                material_id
+            };
 
             let (translation, rotation, scale) = node.transform().decomposed();
 
@@ -185,20 +203,11 @@ pub fn load_gltf_scene(
                         * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
                     scale: Vec3::from_array(scale),
                 })
-                .set(Mesh {
-                    vertex_buffer,
-                    index_buffer,
+                .set(MeshComponent {
+                    mesh_id,
                 })
-                .set(Material {
-                    color_factor,
-                    diffuse,
-                    metallic_factor,
-                    roughness_factor,
-                    metallic_roughness,
-                    ambient_oclussion,
-                    emissive_factor,
-                    emissive,
-                    normal,
+                .set(MaterialComponent {
+                    material_id,
                 });
         }
     }
