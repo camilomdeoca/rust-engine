@@ -24,6 +24,8 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
 layout(set = 2, binding = 0) uniform MaterialFactors {
     vec4 base_color_factor;
     vec3 emissive_factor;
+    float metallic_factor;
+    float roughness_factor;
 } material_factors;
 
 layout(set = 2, binding = 1) uniform texture2D diffuse;
@@ -81,6 +83,19 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
 
 void main()
 {
+    vec4 base_color = texture(sampler2D(diffuse, s), v_uv)
+                  * material_factors.base_color_factor;
+
+    if (base_color.a < 0.0001) discard; // TODO: draw transparent meshes after opaque
+
+    float metallic = texture(sampler2D(metallic_roughness, s), v_uv).b
+                     * material_factors.metallic_factor;
+    float roughness = texture(sampler2D(metallic_roughness, s), v_uv).g
+                      * material_factors.roughness_factor;
+    float ao = texture(sampler2D(ambient_oclussion, s), v_uv).r;
+    vec3 emissive = texture(sampler2D(emissive, s), v_uv).rgb
+                    * material_factors.emissive_factor.rgb;
+
     vec3 light_color = vec3(3000.0);
     vec3 N = texture(sampler2D(normal, s), v_uv).rgb;
     N = N * 2.0 - 1.0;
@@ -88,18 +103,10 @@ void main()
     vec3 V = normalize(-v_pos);
     vec3 R = reflect(-V, N);
     
-    vec3 albedo = texture(sampler2D(diffuse, s), v_uv).rgb
-                  * material_factors.base_color_factor.rgb;
-    float metallic = texture(sampler2D(metallic_roughness, s), v_uv).b;
-    float roughness = texture(sampler2D(metallic_roughness, s), v_uv).g;
-    float ao = texture(sampler2D(ambient_oclussion, s), v_uv).r;
-    vec3 emissive = texture(sampler2D(emissive, s), v_uv).rgb
-                    * material_factors.emissive_factor.rgb;
-
     // calculate reflectance at normal incidence; if dia-electric (like plastic) use F0 
     // of 0.04 and if it's a metal, use the albedo color as F0 (metallic workflow)    
     vec3 F0 = vec3(0.04); 
-    F0 = mix(F0, albedo, metallic);
+    F0 = mix(F0, base_color.rgb, metallic);
 
     // reflectance equation
     vec3 Lo = vec3(0.0);
@@ -135,7 +142,7 @@ void main()
         float NdotL = max(dot(N, L), 0.0);        
 
         // add to outgoing radiance Lo
-        Lo += (kD * albedo / PI + specular) * radiance * NdotL;  // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
+        Lo += (kD * base_color.rgb / PI + specular) * radiance * NdotL;  // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
     }
 
     vec3 F = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
@@ -147,7 +154,7 @@ void main()
     vec3 Nuvw = frame.inv_view * N;
     Nuvw.x *= -1.0;
     vec3 irradiance = texture(samplerCube(irradiance_map, s), Nuvw).rgb;
-    vec3 diffuse      = irradiance * albedo;
+    vec3 diffuse      = irradiance * base_color.rgb;
     
     // sample both the pre-filter map and the BRDF lut and combine them together as per the Split-Sum approximation to get the IBL specular part.
     const float MAX_REFLECTION_LOD = 4.0;
@@ -166,5 +173,5 @@ void main()
     // gamma correct
     color = pow(color, vec3(1.0/2.2)); 
 
-    f_color = vec4(color, 1.0);
+    f_color = vec4(color, base_color.a);
 }

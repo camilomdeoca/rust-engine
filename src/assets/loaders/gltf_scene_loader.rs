@@ -10,6 +10,30 @@ use crate::{
     ecs::components::{MaterialComponent, MeshComponent, Transform},
 };
 
+pub fn count_vertices_and_indices_in_gltf_scene(path: impl AsRef<Path>) -> (usize, usize) {
+    let path = path.as_ref();
+    let file_data = fs::read(&path).unwrap();
+    let gltf = gltf::Gltf::from_slice(&file_data).unwrap();
+    count_vertices_and_indices_in_gltf_document(&gltf.document)
+}
+
+fn count_vertices_and_indices_in_gltf_document(document: &gltf::Document) -> (usize, usize) {
+    let mut vertex_count = 0;
+    let mut index_count = 0;
+    for node in document.nodes() {
+        if node.mesh().is_none() {
+            continue;
+        }
+
+        for primitive in node.mesh().unwrap().primitives() {
+            vertex_count += primitive.get(&gltf::Semantic::Positions).unwrap().count();
+            index_count += primitive.indices().unwrap().count();
+        }
+    }
+
+    (vertex_count, index_count)
+}
+
 fn load_texture_from_gltf_texture(
     asset_database: Arc<RwLock<AssetDatabase>>,
     gltf_texture: &Texture,
@@ -53,6 +77,11 @@ pub fn load_gltf_scene(
     let mut materials = <HashMap<_, MaterialId>>::default();
     let mut meshes = <HashMap<_, MeshId>>::default();
 
+    let (vertex_count_2, index_count_2) = count_vertices_and_indices_in_gltf_document(&gltf.document);
+
+    let mut vertex_count = 0;
+    let mut index_count = 0;
+
     //let (gltf, gltf_buffers, _images) = gltf::import(&path).unwrap();
 
     for node in gltf.document.nodes() {
@@ -85,6 +114,7 @@ pub fn load_gltf_scene(
                 let reader = primitive.reader(|buffer| Some(&gltf_buffers[buffer.index()]));
 
                 let positions_iter = reader.read_positions().unwrap();
+                vertex_count += positions_iter.len();
                 let normals_iter = reader.read_normals().unwrap();
                 let tangents_iter = reader.read_tangents();
                 // if tangents_iter.is_none() {
@@ -117,6 +147,8 @@ pub fn load_gltf_scene(
                     ReadIndices::U16(iter) => iter.map(|index| index.into()).collect(),
                     ReadIndices::U32(iter) => iter.collect(),
                 };
+
+                index_count += indices.len();
 
                 let mut asset_database_write = asset_database.write().unwrap();
                 let mesh_id = asset_database_write.add_mesh_from_buffers(vertices, indices).unwrap();
@@ -211,6 +243,9 @@ pub fn load_gltf_scene(
                 });
         }
     }
+
+    assert_eq!(vertex_count, vertex_count_2);
+    assert_eq!(index_count, index_count_2);
 
     Ok(())
 }

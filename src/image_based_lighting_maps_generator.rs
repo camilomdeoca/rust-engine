@@ -38,7 +38,7 @@ use vulkano::{
     sync::GpuFuture, DeviceSize,
 };
 
-use crate::assets::{loaders::mesh_loader::load_mesh_from_buffers, vertex::Vertex};
+use crate::assets::{loaders::mesh_loader::{load_mesh_from_buffers, load_mesh_from_buffers_into_new_buffers}, vertex::Vertex};
 
 pub struct ImageBasedLightingMapsGenerator {
     device: Arc<Device>,
@@ -364,7 +364,7 @@ impl ImageBasedLightingMapsGenerator {
             },
         );
 
-        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers(
+        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),
@@ -430,7 +430,7 @@ impl ImageBasedLightingMapsGenerator {
         )
         .unwrap();
 
-        let (quad_vertex_buffer, quad_index_buffer) = load_mesh_from_buffers(
+        let (quad_vertex_buffer, quad_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),

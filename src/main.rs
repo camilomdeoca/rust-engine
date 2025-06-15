@@ -14,7 +14,7 @@ mod image_based_lighting_maps_generator;
 mod renderer;
 mod profile;
 
-use assets::{database::AssetDatabase, loaders::gltf_scene_loader::load_gltf_scene};
+use assets::{database::AssetDatabase, loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene}};
 use camera::Camera;
 use ecs::components::{self, EnvironmentCubemap};
 use flecs_ecs::prelude::*;
@@ -43,7 +43,7 @@ use vulkano::{
             DebugUtilsMessengerCreateInfo,
         },
         Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
-    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, VulkanLibrary
+    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, DeviceSize, VulkanLibrary
 };
 
 fn main() {
@@ -55,7 +55,7 @@ struct App {
     _instance: Arc<Instance>,
     world: World,
     asset_database: Arc<RwLock<AssetDatabase>>,
-    renderer: Renderer,
+    renderer: Arc<RwLock<Renderer>>,
     camera: Camera,
     sdl_context: Sdl,
     _debug_callback: Arc<DebugUtilsMessenger>,
@@ -222,6 +222,7 @@ impl App {
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
+            ext_descriptor_indexing: true,
             ..DeviceExtensions::empty()
         };
 
@@ -253,11 +254,21 @@ impl App {
 
         let world = World::new();
 
+
+        let (vertex_count, index_count) = count_vertices_and_indices_in_gltf_scene(
+            "assets/meshes/Bistro_with_tangents_all.glb"
+        );
+
         let asset_database = Arc::new(RwLock::new(
-            AssetDatabase::new(queue.clone(), memory_allocator.clone())
+            AssetDatabase::new(
+                queue.clone(),
+                memory_allocator.clone(),
+                vertex_count as DeviceSize,
+                index_count as DeviceSize,
+            )
         ));
 
-        let renderer = Renderer::new(
+        let renderer = Arc::new(RwLock::new(Renderer::new(
             instance.clone(),
             window.clone(),
             device.clone(),
@@ -265,7 +276,11 @@ impl App {
             asset_database.clone(),
             memory_allocator.clone(),
             world.clone(),
-        );
+        )));
+
+        {
+            asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
+        }
         println!("Initialized renderer");
 
         load_gltf_scene(
@@ -521,7 +536,7 @@ impl App {
 
             //self.camera.position += self.camera_move_state.speed;
 
-            self.renderer.draw(&self.camera);
+            self.renderer.write().unwrap().draw(&self.camera);
 
             //::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }

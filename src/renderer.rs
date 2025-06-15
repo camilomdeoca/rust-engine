@@ -57,7 +57,7 @@ use vulkano::{
 
 use crate::{
     assets::{
-        database::AssetDatabase, loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::load_texture_from_buffer}, vertex::Vertex
+        database::{AssetDatabase, AssetDatabaseChangeObserver}, loaders::{mesh_loader::{load_mesh_from_buffers, load_mesh_from_buffers_into_new_buffers}, texture_loader::load_texture_from_buffer}, vertex::Vertex
     },
     camera::Camera,
     ecs::components::{self, MaterialComponent, MeshComponent, Transform},
@@ -406,6 +406,9 @@ where
     }
 }
 
+impl AssetDatabaseChangeObserver for Renderer {
+}
+
 impl Renderer {
     pub fn new(
         instance: Arc<Instance>,
@@ -530,7 +533,7 @@ impl Renderer {
             &skybox_fs,
         );
 
-        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers(
+        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             queue.clone(),
@@ -978,6 +981,8 @@ impl Renderer {
             material_uniforms.push(mesh_shaders::fs::MaterialFactors {
                 base_color_factor: material.color_factor.into(),
                 emissive_factor: material.emissive_factor.into(),
+                metallic_factor: material.metallic_factor.into(),
+                roughness_factor: material.roughness_factor.into(),
             });
 
             if material_uniforms.len() >= max_material_uniforms_per_uniform_buffer as usize {
@@ -1006,12 +1011,19 @@ impl Renderer {
                     ),
                 )
                 .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .bind_vertex_buffers(
+                    0,
+                    asset_database_read.vertex_buffer().clone()
+                        .slice(mesh.vertex_offset as DeviceSize..(mesh.vertex_offset + mesh.vertex_count) as DeviceSize),
+                )
                 .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
+                .bind_index_buffer(
+                    asset_database_read.index_buffer().clone()
+                        .slice(mesh.first_index as DeviceSize..(mesh.first_index + mesh.index_count) as DeviceSize),
+                )
                 .unwrap();
 
-            unsafe { builder.draw_indexed(mesh.index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
+            unsafe { builder.draw_indexed(mesh.index_count, 1, 0, 0, 0) }.unwrap();
         });
 
         write_aligned_into_buffer(&material_uniforms, material_uniforms_align, materials_uniform_buffer.clone());
