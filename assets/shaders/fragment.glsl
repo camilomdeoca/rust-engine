@@ -1,38 +1,65 @@
-#version 450
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(location = 0) in vec3 v_pos;
 layout(location = 1) in vec2 v_uv;
-layout(location = 2) in mat3 v_TBN;
-layout(location = 5) in vec3 v_light_pos;
+layout(location = 2) flat in int v_draw_id;
+layout(location = 3) in mat3 v_TBN;
+layout(location = 6) in vec3 v_light_pos;
 
 layout(location = 0) out vec4 f_color;
 
 // Environment descriptor
-layout(set = 0, binding = 0) uniform sampler s;
-layout(set = 0, binding = 1) uniform textureCube irradiance_map;
-layout(set = 0, binding = 2) uniform textureCube prefiltered_environment_map;
-layout(set = 0, binding = 3) uniform texture2D environment_brdf_lut;
+layout(set = 3, binding = 0) uniform sampler s;
+layout(set = 3, binding = 1) uniform textureCube irradiance_map;
+layout(set = 3, binding = 2) uniform textureCube prefiltered_environment_map;
+layout(set = 3, binding = 3) uniform texture2D environment_brdf_lut;
+layout(set = 3, binding = 4) uniform texture2D textures[];
 
 // Frame descriptor set
-layout(set = 1, binding = 0) uniform FrameUniforms {
+layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view;
     mat3 inv_view;
     mat4 proj;
 } frame;
 
+const uint UINT_MAX = 4294967295;
+
 // Material descriptor
-layout(set = 2, binding = 0) uniform MaterialFactors {
+struct Material {
     vec4 base_color_factor;
-    vec3 emissive_factor;
+    uint base_color_texture_id;
     float metallic_factor;
     float roughness_factor;
-} material_factors;
+    uint metallic_roughness_texture_id;
+    uint ambient_oclussion_texture_id;
+    vec3 emissive_factor;
+    uint emissive_texture_id;
+    uint normal_texture_id;
+    uint pad[3];
+};
 
-layout(set = 2, binding = 1) uniform texture2D diffuse;
-layout(set = 2, binding = 2) uniform texture2D metallic_roughness;
-layout(set = 2, binding = 3) uniform texture2D ambient_oclussion;
-layout(set = 2, binding = 4) uniform texture2D emissive;
-layout(set = 2, binding = 5) uniform texture2D normal;
+layout(std430, set = 1, binding = 0) readonly buffer MaterialBuffer {
+    Material data[];
+} materials_buffer;
+
+// Model descriptor set
+struct EntityData {
+    mat4 transform;
+    uint material;
+    uint pad[3];
+};
+
+layout(std430, set = 2, binding = 0) readonly buffer EntityDataBuffer {
+    EntityData data[];
+} entity_data_buffer;
+
+// layout(set = 2, binding = 1) uniform texture2D diffuse;
+// layout(set = 2, binding = 2) uniform texture2D metallic_roughness;
+// layout(set = 2, binding = 3) uniform texture2D ambient_oclussion;
+// layout(set = 2, binding = 4) uniform texture2D emissive;
+// layout(set = 2, binding = 5) uniform texture2D normal;
 
 const float PI = 3.14159265359;
 // ----------------------------------------------------------------------------
@@ -83,21 +110,88 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
 
 void main()
 {
-    vec4 base_color = texture(sampler2D(diffuse, s), v_uv)
-                  * material_factors.base_color_factor;
+    vec4 base_color;
+    float metallic, roughness;
+    float ao;
+    vec3 emissive;
+    vec3 N;
+
+    uint material_id = entity_data_buffer.data[v_draw_id].material;
+    Material material = materials_buffer.data[material_id];
+
+    if (material.base_color_texture_id != UINT_MAX)
+    {
+        base_color =
+            texture(
+                nonuniformEXT(sampler2D(textures[material.base_color_texture_id], s)),
+                v_uv
+            )
+            * material.base_color_factor;
+    }
+    else
+    {
+        base_color = material.base_color_factor;
+    }
 
     if (base_color.a < 0.0001) discard; // TODO: draw transparent meshes after opaque
 
-    float metallic = texture(sampler2D(metallic_roughness, s), v_uv).b
-                     * material_factors.metallic_factor;
-    float roughness = texture(sampler2D(metallic_roughness, s), v_uv).g
-                      * material_factors.roughness_factor;
-    float ao = texture(sampler2D(ambient_oclussion, s), v_uv).r;
-    vec3 emissive = texture(sampler2D(emissive, s), v_uv).rgb
-                    * material_factors.emissive_factor.rgb;
+    if (material.metallic_roughness_texture_id != UINT_MAX)
+    {
+        vec2 aux =
+            texture(
+                nonuniformEXT(sampler2D(textures[material.metallic_roughness_texture_id], s)),
+                v_uv
+            ).gb;
+
+        metallic = aux.g * material.metallic_factor;
+        roughness = aux.r * material.roughness_factor;
+    }
+    else
+    {
+        metallic = material.metallic_factor;
+        roughness = material.roughness_factor;
+    }
+
+    if (material.ambient_oclussion_texture_id != UINT_MAX)
+    {
+        ao =
+            texture(
+                nonuniformEXT(sampler2D(textures[material.ambient_oclussion_texture_id], s)),
+                v_uv
+            ).r;
+    }
+    else
+    {
+        ao = 1.0;
+    }
+
+    if (material.emissive_texture_id != UINT_MAX)
+    {
+        emissive =
+            texture(
+                nonuniformEXT(sampler2D(textures[material.emissive_texture_id], s)),
+                v_uv
+            ).rgb
+            * material.emissive_factor.rgb;
+    }
+    else
+    {
+        emissive = material.emissive_factor.rgb;
+    }
 
     vec3 light_color = vec3(3000.0);
-    vec3 N = texture(sampler2D(normal, s), v_uv).rgb;
+    if (material.normal_texture_id != UINT_MAX)
+    {
+        N =
+            texture(
+                nonuniformEXT(sampler2D(textures[material.normal_texture_id], s)),
+                v_uv
+            ).rgb;
+    }
+    else
+    {
+        N = vec3(0.0, 0.0, 1.0);
+    }
     N = N * 2.0 - 1.0;
     N = normalize(v_TBN * N);
     vec3 V = normalize(-v_pos);

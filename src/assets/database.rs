@@ -2,19 +2,17 @@ use std::{path::Path, sync::{Arc, RwLock}};
 
 use bimap::BiHashMap;
 use glam::{UVec2, Vec3, Vec4};
-use gltf::{mesh::util::ReadIndices, Gltf};
 use image::EncodableLayout;
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        CopyBufferInfo, PrimaryCommandBufferAbstract,
-    }, device::Queue, format::Format, image::view::ImageView, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, sync::GpuFuture, DeviceSize
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::
+        allocator::StandardCommandBufferAllocator
+    , device::Queue, format::Format, image::view::ImageView, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, DeviceSize
 };
 
 use super::{loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer}}, vertex::Vertex};
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct MeshId(u32);
+pub struct MeshId(pub u32);
 
 pub struct Mesh {
     pub index_count: u32,
@@ -25,21 +23,21 @@ pub struct Mesh {
 }
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct TextureId(u32);
+pub struct TextureId(pub u32);
 
 pub struct Texture {
     pub texture: Arc<ImageView>,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct CubemapId(u32);
+pub struct CubemapId(pub u32);
 
 pub struct Cubemap {
     pub cubemap: Arc<ImageView>,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct MaterialId(u32);
+pub struct MaterialId(pub u32);
 
 pub struct Material {
     pub color_factor: Vec4,
@@ -91,17 +89,17 @@ impl AssetDatabase {
         index_buffer_len: DeviceSize,
     ) -> Self {
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            queue.device().clone(),
-            Default::default(),
+            &queue.device(),
+            &Default::default(),
         ));
 
         let vertex_buffer = Buffer::new_slice(
-            memory_allocator.clone(),
-            BufferCreateInfo {
+            &memory_allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
@@ -110,12 +108,12 @@ impl AssetDatabase {
         .unwrap();
 
         let index_buffer = Buffer::new_slice(
-            memory_allocator.clone(),
-            BufferCreateInfo {
+            &memory_allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
@@ -153,6 +151,14 @@ impl AssetDatabase {
         self.index_buffer.clone()
     }
 
+    pub fn textures(&self) -> &Vec<Texture> {
+        &self.textures
+    }
+    
+    pub fn materials(&self) -> &Vec<Material> {
+        &self.materials
+    }
+
     pub fn add_mesh_from_buffers(
         &mut self,
         vertices: Vec<Vertex>,
@@ -166,9 +172,9 @@ impl AssetDatabase {
             acc.max((mesh.first_index + mesh.index_count) as DeviceSize)
         });
         load_mesh_from_buffers(
-            self.memory_allocator.clone(),
+            &self.memory_allocator,
             self.command_buffer_allocator.clone(),
-            self.queue.clone(),
+            &self.queue,
             vertices.iter().cloned(),
             indices.iter().cloned(),
             self.vertex_buffer.clone().slice(vertex_buffer_offset..),
@@ -228,7 +234,7 @@ impl AssetDatabase {
         pixel_data: &[u8],
     ) -> Result<TextureId, String> {
         let texture = load_texture_from_buffer(
-            self.memory_allocator.clone(),
+            &self.memory_allocator,
             self.command_buffer_allocator.clone(),
             self.queue.clone(),
             format,
@@ -303,7 +309,7 @@ impl AssetDatabase {
         pixel_data: &[u8],
     ) -> Result<CubemapId, String> {
         let cubemap = load_cubemap_from_buffer(
-            self.memory_allocator.clone(),
+            &self.memory_allocator,
             self.command_buffer_allocator.clone(),
             self.queue.clone(),
             format,

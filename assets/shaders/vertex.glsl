@@ -1,4 +1,4 @@
-#version 450
+#version 460
 
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
@@ -7,23 +7,31 @@ layout(location = 3) in vec2 a_uv;
 
 layout(location = 0) out vec3 v_pos;
 layout(location = 1) out vec2 v_uv;
-layout(location = 2) out mat3 v_TBN;
-layout(location = 5) out vec3 v_light_pos;
+layout(location = 2) flat out int v_draw_id;
+layout(location = 3) out mat3 v_TBN;
+layout(location = 6) out vec3 v_light_pos;
 
 // Frame descriptor set
-layout(set = 1, binding = 0) uniform FrameUniforms {
+layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view;
     mat3 inv_view;
     mat4 proj;
 } uniforms;
 
 // Model descriptor set
-layout(set = 3, binding = 0) uniform ModelUniforms {
+struct EntityData {
     mat4 transform;
-} model;
+    uint material;
+    uint pad[3];
+};
+
+layout(std430, set = 2, binding = 0) readonly buffer EntityDataBuffer {
+    EntityData data[];
+} entity_data_buffer;
 
 void main() {
-    mat4 view_model = uniforms.view * model.transform;
+    mat4 view_model = uniforms.view * entity_data_buffer.data[gl_DrawID].transform;
+    v_draw_id = gl_DrawID;
 
     vec3 T = normalize(vec3(view_model * vec4(a_tangent, 0.0)));
     vec3 N = normalize(vec3(view_model * vec4(a_normal, 0.0)));

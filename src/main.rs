@@ -28,11 +28,10 @@ use sdl2::{
     video::Window,
     Sdl,
 };
-use std::sync::{Arc, RwLock};
+use std::{sync::{Arc, RwLock}, time::Instant};
 use vulkano::{
     device::{
-        physical::{PhysicalDevice, PhysicalDeviceType},
-        Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
+        physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo, QueueFlags
     }, format::Format, image::{
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
@@ -162,10 +161,10 @@ impl App {
             ..InstanceExtensions::from_iter(window.vulkan_instance_extensions().unwrap())
         };
 
-        let required_layers = vec!["VK_LAYER_KHRONOS_validation".to_string()];
+        let required_layers = vec!["VK_LAYER_KHRONOS_validation"];
 
         // Validate that required layers are available
-        let available_layers_names: Vec<String> = library
+        let available_layers_names: Vec<_> = library
             .layer_properties()
             .unwrap()
             .map(|layer_properties| layer_properties.name().to_string())
@@ -173,7 +172,7 @@ impl App {
 
         if let Some(not_found_layer_name) = required_layers
             .iter()
-            .find(|required_layer_name| !available_layers_names.contains(required_layer_name))
+            .find(|required_layer_name| !available_layers_names.contains(&required_layer_name.to_string()))
         {
             panic!(
                 "Required validation layer: \"{}\" is missing.",
@@ -183,13 +182,13 @@ impl App {
 
         // Now creating the instance.
         let instance = Instance::new(
-            library,
-            InstanceCreateInfo {
+            &library,
+            &InstanceCreateInfo {
                 // Enable enumerating devices that use non-conformant Vulkan implementations.
                 // (e.g. MoltenVK)
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions: required_extensions,
-                enabled_layers: required_layers,
+                enabled_extensions: &required_extensions,
+                enabled_layers: &required_layers,
                 ..Default::default()
             },
         )
@@ -199,11 +198,11 @@ impl App {
         //
         // NOTE: If you let this debug_callback binding fall out of scope then the callback will stop
         // providing events.
-        let debug_callback = Arc::new(
+        let _debug_callback = Arc::new(
             unsafe {
                 DebugUtilsMessenger::new(
-                    instance.clone(),
-                    DebugUtilsMessengerCreateInfo {
+                    &instance,
+                    &DebugUtilsMessengerCreateInfo {
                         message_severity: DebugUtilsMessageSeverity::ERROR
                             | DebugUtilsMessageSeverity::WARNING
                             | DebugUtilsMessageSeverity::INFO
@@ -211,8 +210,8 @@ impl App {
                         message_type: DebugUtilsMessageType::GENERAL
                             | DebugUtilsMessageType::VALIDATION
                             | DebugUtilsMessageType::PERFORMANCE,
-                        ..DebugUtilsMessengerCreateInfo::user_callback(
-                            DebugUtilsMessengerCallback::new(debug_messenger_callback),
+                        ..DebugUtilsMessengerCreateInfo::new(
+                            &DebugUtilsMessengerCallback::new(debug_messenger_callback),
                         )
                     },
                 )
@@ -222,8 +221,19 @@ impl App {
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
+            khr_shader_draw_parameters: true,
             ext_descriptor_indexing: true,
             ..DeviceExtensions::empty()
+        };
+
+        let device_features = DeviceFeatures {
+            descriptor_binding_partially_bound: true,
+            descriptor_binding_variable_descriptor_count: true,
+            runtime_descriptor_array: true,
+            shader_sampled_image_array_non_uniform_indexing: true,
+            shader_draw_parameters: true,
+            multi_draw_indirect: true,
+            ..Default::default()
         };
 
         let (physical_device, queue_family_index) =
@@ -236,13 +246,14 @@ impl App {
         );
 
         let (device, mut queues) = Device::new(
-            physical_device,
-            DeviceCreateInfo {
-                enabled_extensions: device_extensions,
-                queue_create_infos: vec![QueueCreateInfo {
+            &physical_device,
+            &DeviceCreateInfo {
+                enabled_extensions: &device_extensions,
+                queue_create_infos: &[QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
                 }],
+                enabled_features: &device_features,
                 ..Default::default()
             },
         )
@@ -250,13 +261,14 @@ impl App {
 
         let queue = queues.next().unwrap();
 
-        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let memory_allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));
 
         let world = World::new();
 
 
         let (vertex_count, index_count) = count_vertices_and_indices_in_gltf_scene(
-            "assets/meshes/Bistro_with_tangents_all.glb"
+            "assets/meshes/Bistro_with_tangents_all.glb",
+            //"assets/meshes/DamagedHelmet.glb",
         );
 
         let asset_database = Arc::new(RwLock::new(
@@ -267,32 +279,18 @@ impl App {
                 index_count as DeviceSize,
             )
         ));
-
-        let renderer = Arc::new(RwLock::new(Renderer::new(
-            instance.clone(),
-            window.clone(),
-            device.clone(),
-            queue.clone(),
-            asset_database.clone(),
-            memory_allocator.clone(),
-            world.clone(),
-        )));
-
-        {
-            asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
-        }
-        println!("Initialized renderer");
-
+        
         load_gltf_scene(
             "assets/meshes/Bistro_with_tangents_all.glb",
+            //"assets/meshes/DamagedHelmet.glb",
             world.clone(),
             asset_database.clone(),
         ).unwrap();
         println!("Loaded scene");
 
         let irradiance_map_image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
+            &memory_allocator,
+            &ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
                 extent: [32, 32, 1],
@@ -303,14 +301,14 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            AllocationCreateInfo::default(),
+            &AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created irradiance map image");
 
         let irradiance_map = ImageView::new(
-            irradiance_map_image.clone(),
-            ImageViewCreateInfo {
+            &irradiance_map_image,
+            &ImageViewCreateInfo {
                 view_type: ImageViewType::Cube,
                 ..ImageViewCreateInfo::from_image(&irradiance_map_image.clone())
             },
@@ -318,8 +316,8 @@ impl App {
         .unwrap();
 
         let prefiltered_environment_map_image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
+            &memory_allocator,
+            &ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
                 extent: [512, 512, 1],
@@ -331,14 +329,14 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            AllocationCreateInfo::default(),
+            &AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created prefiltered environment image");
 
         let prefiltered_environment_map = ImageView::new(
-            prefiltered_environment_map_image.clone(),
-            ImageViewCreateInfo {
+            &prefiltered_environment_map_image,
+            &ImageViewCreateInfo {
                 view_type: ImageViewType::Cube,
                 ..ImageViewCreateInfo::from_image(&prefiltered_environment_map_image.clone())
             },
@@ -346,8 +344,8 @@ impl App {
         .unwrap();
 
         let environment_brdf_lut_image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
+            &memory_allocator,
+            &ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16_SFLOAT,
                 extent: [512, 512, 1],
@@ -356,14 +354,14 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            AllocationCreateInfo::default(),
+            &AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created environment brdf lut");
 
         let environment_brdf_lut = ImageView::new(
-            environment_brdf_lut_image.clone(),
-            ImageViewCreateInfo {
+            &environment_brdf_lut_image,
+            &ImageViewCreateInfo {
                 view_type: ImageViewType::Dim2d,
                 ..ImageViewCreateInfo::from_image(&environment_brdf_lut_image.clone())
             },
@@ -414,6 +412,21 @@ impl App {
         });
         drop(asset_database_write);
 
+        let renderer = Arc::new(RwLock::new(Renderer::new(
+            instance.clone(),
+            window.clone(),
+            device.clone(),
+            queue.clone(),
+            asset_database.clone(),
+            memory_allocator.clone(),
+            world.clone(),
+        )));
+
+        {
+            asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
+        }
+        println!("Initialized renderer");
+
         App {
             _instance: instance,
             world,
@@ -424,7 +437,7 @@ impl App {
                 fov: 90f32.to_radians(),
             },
             sdl_context,
-            _debug_callback: debug_callback,
+            _debug_callback,
             renderer,
         }
     }
@@ -432,6 +445,8 @@ impl App {
     fn run(&mut self) {
         let mut event_pump = self.sdl_context.event_pump().unwrap();
         let mut captured = false;
+
+        let mut start_frame_instant = Instant::now();
 
         'running: loop {
             for event in event_pump.poll_iter() {
@@ -537,6 +552,9 @@ impl App {
             //self.camera.position += self.camera_move_state.speed;
 
             self.renderer.write().unwrap().draw(&self.camera);
+
+            println!("{} FPS", 1.0 / start_frame_instant.elapsed().as_secs_f32());
+            start_frame_instant = Instant::now();
 
             //::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }

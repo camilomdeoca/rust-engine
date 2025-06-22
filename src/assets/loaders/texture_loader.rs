@@ -9,12 +9,12 @@ use vulkano::{
     device::Queue,
     format::Format,
     image::{view::{ImageView, ImageViewCreateInfo, ImageViewType}, Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage},
-    memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter},
+    memory::allocator::{AllocationCreateInfo, MemoryAllocatePreference, MemoryAllocator, MemoryTypeFilter},
     sync::GpuFuture,
 };
 
 pub fn load_texture_from_buffer(
-    memory_allocator: Arc<dyn MemoryAllocator>,
+    memory_allocator: &Arc<impl MemoryAllocator + ?Sized>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
     format: Format,
@@ -35,7 +35,7 @@ pub fn load_texture_from_buffer(
 }
 
 pub fn load_cubemap_from_buffer(
-    memory_allocator: Arc<dyn MemoryAllocator>,
+    memory_allocator: &Arc<impl MemoryAllocator + ?Sized>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
     format: Format,
@@ -56,7 +56,7 @@ pub fn load_cubemap_from_buffer(
 }
 
 fn load_texture_from_buffer_impl<I>(
-    memory_allocator: Arc<dyn MemoryAllocator>,
+    memory_allocator: &Arc<impl MemoryAllocator + ?Sized>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
     format: Format,
@@ -78,12 +78,12 @@ where
     .unwrap();
 
     let staging_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
+        &memory_allocator,
+        &BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
-        AllocationCreateInfo {
+        &AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
@@ -93,8 +93,8 @@ where
     .unwrap();
 
     let image = Image::new(
-        memory_allocator.clone(),
-        ImageCreateInfo {
+        &memory_allocator,
+        &ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format,
             extent: [extent[0], extent[1], 1],
@@ -103,7 +103,10 @@ where
             usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
             ..Default::default()
         },
-        AllocationCreateInfo::default(),
+        &AllocationCreateInfo {
+            allocate_preference: MemoryAllocatePreference::AlwaysAllocate,
+            ..Default::default()
+        },
     )
     .expect(
         format!(
@@ -114,7 +117,7 @@ where
     );
 
     builder
-        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+        .copy_buffer_to_image(CopyBufferToImageInfo::new(
             staging_buffer,
             image.clone(),
         ))
@@ -124,7 +127,7 @@ where
         view_type,
         ..ImageViewCreateInfo::from_image(&image)
     };
-    let image_view = ImageView::new(image, image_view_create_info).unwrap();
+    let image_view = ImageView::new(&image, &image_view_create_info).unwrap();
 
     let command_buffer = builder.build().unwrap();
 
