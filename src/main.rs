@@ -20,6 +20,7 @@ use ecs::components::{self, EnvironmentCubemap};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
+use profile::ProfileTimer;
 use renderer::Renderer;
 use sdl2::{
     event::{Event, WindowEvent},
@@ -30,8 +31,8 @@ use sdl2::{
 };
 use std::{sync::{Arc, RwLock}, time::Instant};
 use vulkano::{
-    device::{
-        physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo, QueueFlags
+    command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage}, device::{
+        physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags
     }, format::Format, image::{
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
@@ -42,7 +43,7 @@ use vulkano::{
             DebugUtilsMessengerCreateInfo,
         },
         Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
-    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, DeviceSize, VulkanLibrary
+    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, render_pass::Framebuffer, swapchain::{acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo}, sync::{self, GpuFuture}, DeviceSize, Validated, VulkanError, VulkanLibrary
 };
 
 fn main() {
@@ -52,12 +53,24 @@ fn main() {
 
 struct App {
     _instance: Arc<Instance>,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+
     world: World,
     asset_database: Arc<RwLock<AssetDatabase>>,
     renderer: Arc<RwLock<Renderer>>,
     camera: Camera,
     sdl_context: Sdl,
     _debug_callback: Arc<DebugUtilsMessenger>,
+
+    swapchain: Arc<Swapchain>,
+    framebuffers_for_3d_renderer: Vec<Arc<Framebuffer>>,
+    recreate_swapchain: bool,
+    fences: Vec<Option<Box<dyn GpuFuture>>>,
+    previous_fence_index: u32,
+    window: Arc<Window>, // The window has to be dropped after the fences for some reason :)
+                         // Probably a SDL2 issue
 }
 
 // DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessengerCallbackData<'_>
@@ -193,7 +206,7 @@ impl App {
             },
         )
         .unwrap();
-
+        
         // After creating the instance we must register the debug callback.
         //
         // NOTE: If you let this debug_callback binding fall out of scope then the callback will stop
@@ -262,6 +275,46 @@ impl App {
         let queue = queues.next().unwrap();
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));
+        
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+            &device,
+            &Default::default(),
+        ));
+
+        let surface = unsafe { Surface::from_window_ref(&instance, &window) }.unwrap();
+        
+        let window_size = window.size();
+
+        let (swapchain, images) = {
+            let surface_capabilities = device
+                .physical_device()
+                .surface_capabilities(&surface, &Default::default())
+                .unwrap();
+
+            let (image_format, _) = device
+                .physical_device()
+                .surface_formats(&surface, &Default::default())
+                .unwrap()[0];
+
+            Swapchain::new(
+                &device,
+                &surface,
+                &SwapchainCreateInfo {
+                    min_image_count: surface_capabilities.min_image_count.max(2),
+                    image_format,
+                    present_mode: PresentMode::Fifo,
+                    image_extent: window_size.into(),
+                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    composite_alpha: surface_capabilities
+                        .supported_composite_alpha
+                        .into_iter()
+                        .next()
+                        .unwrap(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
 
         let world = World::new();
 
@@ -412,15 +465,21 @@ impl App {
         });
         drop(asset_database_write);
 
-        let renderer = Arc::new(RwLock::new(Renderer::new(
-            instance.clone(),
-            window.clone(),
-            device.clone(),
-            queue.clone(),
-            asset_database.clone(),
-            memory_allocator.clone(),
-            world.clone(),
-        )));
+        let (renderer, framebuffers_for_3d_renderer) = {
+            let (renderer, framebuffers) = Renderer::new(
+                device.clone(),
+                queue.clone(),
+                asset_database.clone(),
+                memory_allocator.clone(),
+                world.clone(),
+                &images,
+            );
+            (Arc::new(RwLock::new(renderer)), framebuffers)
+        };
+
+        let frames_in_flight = images.len();
+        let mut fences = vec![];
+        for _ in 0..frames_in_flight { fences.push(None); }
 
         {
             asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
@@ -429,6 +488,9 @@ impl App {
 
         App {
             _instance: instance,
+            device,
+            queue,
+            command_buffer_allocator,
             world,
             asset_database,
             camera: Camera {
@@ -439,6 +501,13 @@ impl App {
             sdl_context,
             _debug_callback,
             renderer,
+
+            swapchain,
+            framebuffers_for_3d_renderer,
+            recreate_swapchain: false,
+            fences,
+            previous_fence_index: 0,
+            window,
         }
     }
 
@@ -493,7 +562,7 @@ impl App {
                         win_event: WindowEvent::Resized(..),
                         ..
                     } => {
-                        //self.rcx.recreate_swapchain = true;
+                        //self.recreate_swapchain = true;
                     }
                     _ => {}
                 }
@@ -548,10 +617,92 @@ impl App {
                 }
             }
 
+            if self.recreate_swapchain {
+                let window_size = self.window.size();
+                let images;
+                (self.swapchain, images) = self
+                    .swapchain
+                    .recreate(&SwapchainCreateInfo {
+                        image_extent: window_size.into(),
+                        ..self.swapchain.create_info()
+                    })
+                    .expect("Failed to recreate swapchain");
+                self.framebuffers_for_3d_renderer = self.renderer.write().unwrap().resize(images);
+                self.recreate_swapchain = false;
+            }
 
-            //self.camera.position += self.camera_move_state.speed;
+            let (image_index, suboptimal, acquire_future) =
+                match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
+                    Ok(r) => r,
+                    Err(VulkanError::OutOfDate) => {
+                        self.recreate_swapchain = true;
+                        continue;
+                    }
+                    Err(e) => panic!("failed to acquire next image: {e}"),
+                };
 
-            self.renderer.write().unwrap().draw(&self.camera);
+            if suboptimal { self.recreate_swapchain = true; }
+
+            let timer = ProfileTimer::start("cleanup_finished");
+            let previous_future = match self.fences[self.previous_fence_index as usize].take() {
+                // Create a NowFuture
+                None => {
+                    let mut now = sync::now(self.device.clone());
+                    now.cleanup_finished();
+
+                    now.boxed()
+                }
+                // Use the existing FenceSignalFuture
+                Some(mut fence) => {
+                    fence.cleanup_finished();
+                    fence.boxed()
+                },
+            };
+            drop(timer);
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                self.command_buffer_allocator.clone(),
+                self.queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
+            self.renderer.write().unwrap()
+                .draw(
+                    &mut builder,
+                    &self.framebuffers_for_3d_renderer[image_index as usize],
+                    &self.camera
+                );
+
+            let timer = ProfileTimer::start("build");
+            let command_buffer = builder.build().unwrap();
+            drop(timer);
+
+            let timer = ProfileTimer::start("present");
+            let future = previous_future
+                .join(acquire_future)
+                .then_execute(self.queue.clone(), command_buffer)
+                .unwrap()
+                .then_swapchain_present(
+                    self.queue.clone(),
+                    SwapchainPresentInfo::new(self.swapchain.clone(), image_index),
+                )
+                .then_signal_fence_and_flush();
+            drop(timer);
+
+            self.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
+                Ok(value) => Some(value.boxed()),
+                Err(VulkanError::OutOfDate) => {
+                    self.recreate_swapchain = true;
+                    None
+                }
+                Err(e) => {
+                    println!("failed to flush future: {e}");
+                    None
+                }
+            };
+            
+            self.previous_fence_index = image_index;
 
             println!("{} FPS", 1.0 / start_frame_instant.elapsed().as_secs_f32());
             start_frame_instant = Instant::now();

@@ -47,6 +47,6 @@ impl<'a> ProfileTimer<'a> {
 
 impl Drop for ProfileTimer<'_> {
     fn drop(&mut self) {
-        println!("{:20}: {:>10} ns", self.label, self.start_time.elapsed().as_nanos());
+        //println!("{:20}: {:>10} ns", self.label, self.start_time.elapsed().as_nanos());
     }
 }

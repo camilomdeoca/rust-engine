@@ -1,20 +1,38 @@
-use std::{sync::{Arc, RwLock}, u32};
+use std::{
+    sync::{Arc, RwLock},
+    u32,
+};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat3, Mat4, Vec3};
-use sdl2::video::Window;
 use vulkano::{
     buffer::{
-        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}, Buffer, BufferCreateInfo, BufferUsage, Subbuffer
-    }, command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo
-    }, descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, layout::{DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType}, DescriptorSet, WriteDescriptorSet,
-    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{
+        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
+        Buffer, BufferCreateInfo, BufferUsage, Subbuffer,
+    },
+    command_buffer::{
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
+        DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
+        SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+    },
+    descriptor_set::{
+        allocator::StandardDescriptorSetAllocator,
+        layout::{
+            DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding,
+            DescriptorSetLayoutCreateInfo, DescriptorType,
+        },
+        DescriptorSet, WriteDescriptorSet,
+    },
+    device::{Device, DeviceOwned, Queue},
+    format::Format,
+    image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
         view::ImageView,
         Image, ImageCreateInfo, ImageType, ImageUsage,
-    }, instance::Instance, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, padded::Padded, pipeline::{
+    },
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    padded::Padded,
+    pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
@@ -24,28 +42,30 @@ use vulkano::{
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        }, layout::{push_constant_ranges_from_stages, PipelineLayoutCreateInfo}, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::{EntryPoint, ShaderStages}, swapchain::{
-        acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo
-    }, sync::{
-        self, future::{FenceSignalFuture, JoinFuture}, GpuFuture
-    }, DeviceSize, Validated, VulkanError
+        },
+        layout::{push_constant_ranges_from_stages, PipelineLayoutCreateInfo},
+        GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    shader::{EntryPoint, ShaderStages},
+    DeviceSize,
 };
 
 use crate::{
     assets::{
-        database::{AssetDatabase, AssetDatabaseChangeObserver}, loaders::{mesh_loader::{load_mesh_from_buffers, load_mesh_from_buffers_into_new_buffers}, texture_loader::load_texture_from_buffer}, vertex::Vertex
+        database::{AssetDatabase, AssetDatabaseChangeObserver},
+        loaders::mesh_loader::load_mesh_from_buffers_into_new_buffers,
+        vertex::Vertex,
     },
     camera::Camera,
-    ecs::components::{self, MaterialComponent, MeshComponent, Transform}, profile::ProfileTimer,
+    ecs::components::{self, MaterialComponent, MeshComponent, Transform},
+    profile::ProfileTimer,
 };
 
 pub struct Renderer {
-    device: Arc<Device>,
-    queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
     storage_buffer_allocator: SubbufferAllocator,
     indirect_buffer_allocator: SubbufferAllocator,
@@ -53,8 +73,6 @@ pub struct Renderer {
     asset_database: Arc<RwLock<AssetDatabase>>,
 
     render_pass: Arc<RenderPass>,
-    swapchain: Arc<Swapchain>,
-    framebuffers: Vec<Arc<Framebuffer>>,
     mesh_vs: EntryPoint,
     mesh_fs: EntryPoint,
     mesh_pipeline: Arc<GraphicsPipeline>,
@@ -63,10 +81,10 @@ pub struct Renderer {
     skybox_pipeline: Arc<GraphicsPipeline>,
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
-    recreate_swapchain: bool,
 
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
 
+    sampler: Arc<Sampler>,
     environment_descriptor_set: Arc<DescriptorSet>,
     materials_descriptor_set: Arc<DescriptorSet>,
 
@@ -74,17 +92,12 @@ pub struct Renderer {
     meshes_with_materials_query: Query<(
         &'static MeshComponent,
         &'static MaterialComponent,
-        &'static Transform
+        &'static Transform,
     )>,
     world: World,
-    fences: Vec<Option<Box<dyn GpuFuture>>>,
-    previous_fence_index: u32,
-    window: Arc<Window>, // The window has to be dropped after the fences for some reason :)
-                         // Probably a SDL2 issue
 }
 
 fn window_size_dependent_setup(
-    window_size: [u32; 2],
     images: &[Arc<Image>],
     render_pass: &Arc<RenderPass>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
@@ -92,6 +105,7 @@ fn window_size_dependent_setup(
     mesh_fs: &EntryPoint,
     skybox_vs: &EntryPoint,
     skybox_fs: &EntryPoint,
+    sampler: &Arc<Sampler>,
 ) -> (
     Vec<Arc<Framebuffer>>,
     (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>),
@@ -132,11 +146,11 @@ fn window_size_dependent_setup(
 
     let viewport = Viewport {
         offset: [0.0, 0.0],
-        extent: window_size.map(|e| e as f32),
+        extent: [images[0].extent()[0] as f32, images[0].extent()[1] as f32],
         min_depth: 0.0,
         max_depth: 1.0,
     };
-    
+
     let properties = device.physical_device().properties();
 
     let mesh_pipeline = {
@@ -150,13 +164,11 @@ fn window_size_dependent_setup(
                 &DescriptorSetLayout::new(
                     &device,
                     &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
-                            },
-                        ],
+                        bindings: &[DescriptorSetLayoutBinding {
+                            binding: 0,
+                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
+                        }],
                         ..Default::default()
                     },
                 )
@@ -166,13 +178,11 @@ fn window_size_dependent_setup(
                 &DescriptorSetLayout::new(
                     &device,
                     &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
-                            },
-                        ],
+                        bindings: &[DescriptorSetLayoutBinding {
+                            binding: 0,
+                            stages: ShaderStages::FRAGMENT,
+                            ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
+                        }],
                         ..Default::default()
                     },
                 )
@@ -182,13 +192,11 @@ fn window_size_dependent_setup(
                 &DescriptorSetLayout::new(
                     &device,
                     &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
-                            },
-                        ],
+                        bindings: &[DescriptorSetLayoutBinding {
+                            binding: 0,
+                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                            ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
+                        }],
                         ..Default::default()
                     },
                 )
@@ -202,19 +210,7 @@ fn window_size_dependent_setup(
                             DescriptorSetLayoutBinding {
                                 binding: 0,
                                 stages: ShaderStages::FRAGMENT,
-                                immutable_samplers: &[
-                                    &Sampler::new(
-                                        &device,
-                                        &SamplerCreateInfo {
-                                            mag_filter: Filter::Linear,
-                                            min_filter: Filter::Linear,
-                                            max_lod: LOD_CLAMP_NONE,
-                                            address_mode: [SamplerAddressMode::Repeat; 3],
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .unwrap(),
-                                ],
+                                immutable_samplers: &[&sampler],
                                 ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
                             },
                             // irradiance_map
@@ -238,9 +234,8 @@ fn window_size_dependent_setup(
                             // textures
                             DescriptorSetLayoutBinding {
                                 binding: 4,
-                                binding_flags:
-                                    DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT |
-                                    DescriptorBindingFlags::PARTIALLY_BOUND,
+                                binding_flags: DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+                                    | DescriptorBindingFlags::PARTIALLY_BOUND,
                                 stages: ShaderStages::FRAGMENT,
                                 descriptor_count: properties.max_descriptor_set_sampled_images - 3,
                                 ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
@@ -306,18 +301,7 @@ fn window_size_dependent_setup(
                             DescriptorSetLayoutBinding {
                                 binding: 0,
                                 stages: ShaderStages::FRAGMENT,
-                                immutable_samplers: &[
-                                    &Sampler::new(
-                                        &device,
-                                        &SamplerCreateInfo {
-                                            mag_filter: Filter::Linear,
-                                            min_filter: Filter::Linear,
-                                            address_mode: [SamplerAddressMode::Repeat; 3],
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .unwrap(),
-                                ],
+                                immutable_samplers: &[&sampler],
                                 ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
                             },
                             // irradiance_map
@@ -335,13 +319,11 @@ fn window_size_dependent_setup(
                 &DescriptorSetLayout::new(
                     &device,
                     &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
-                            },
-                        ],
+                        bindings: &[DescriptorSetLayoutBinding {
+                            binding: 0,
+                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
+                        }],
                         ..Default::default()
                     },
                 )
@@ -392,19 +374,18 @@ fn window_size_dependent_setup(
     (framebuffers, (mesh_pipeline, skybox_pipeline))
 }
 
-impl AssetDatabaseChangeObserver for Renderer {
-}
+impl AssetDatabaseChangeObserver for Renderer {}
 
+///
 impl Renderer {
     pub fn new(
-        instance: Arc<Instance>,
-        window: Arc<Window>,
         device: Arc<Device>,
         queue: Arc<Queue>,
         asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
-    ) -> Self {
+        images: &[Arc<Image>],
+    ) -> (Self, Vec<Arc<Framebuffer>>) {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             &device,
             &Default::default(),
@@ -424,7 +405,7 @@ impl Renderer {
                 ..Default::default()
             },
         );
-        
+
         let storage_buffer_allocator = SubbufferAllocator::new(
             &memory_allocator,
             &SubbufferAllocatorCreateInfo {
@@ -445,45 +426,11 @@ impl Renderer {
             },
         );
 
-        let surface = unsafe { Surface::from_window_ref(&instance, &window) }.unwrap();
-        let window_size = window.size();
-
-        let (swapchain, images) = {
-            let surface_capabilities = device
-                .physical_device()
-                .surface_capabilities(&surface, &Default::default())
-                .unwrap();
-
-            let (image_format, _) = device
-                .physical_device()
-                .surface_formats(&surface, &Default::default())
-                .unwrap()[0];
-
-            Swapchain::new(
-                &device,
-                &surface,
-                &SwapchainCreateInfo {
-                    min_image_count: surface_capabilities.min_image_count.max(2),
-                    image_format,
-                    present_mode: PresentMode::Fifo,
-                    image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
-                    composite_alpha: surface_capabilities
-                        .supported_composite_alpha
-                        .into_iter()
-                        .next()
-                        .unwrap(),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        };
-
         let render_pass = vulkano::ordered_passes_renderpass!(
             &device,
             attachments: {
                 color: {
-                    format: swapchain.image_format(),
+                    format: images[0].format(),
                     samples: 1,
                     load_op: Clear,
                     store_op: Store,
@@ -529,8 +476,19 @@ impl Renderer {
             .entry_point("main")
             .unwrap();
 
+        let sampler = Sampler::new(
+            &device,
+            &SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                max_lod: LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
         let (framebuffers, (mesh_pipeline, skybox_pipeline)) = window_size_dependent_setup(
-            <[u32; 2]>::from(window_size),
             &images,
             &render_pass,
             &memory_allocator,
@@ -538,6 +496,7 @@ impl Renderer {
             &mesh_fs,
             &skybox_vs,
             &skybox_fs,
+            &sampler,
         );
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
@@ -606,30 +565,24 @@ impl Renderer {
         )
         .unwrap();
 
-        let frames_in_flight = images.len();
-        let mut fences = vec![];
-        for _ in 0..frames_in_flight { fences.push(None); }
-
-
         let environment_cubemap_query = world
             .query::<&components::EnvironmentCubemap>()
             .term_at(0)
             .singleton()
             .build();
 
-        let meshes_with_materials_query = world
-            .new_query::<(&MeshComponent, &MaterialComponent, &Transform)>();
+        let meshes_with_materials_query =
+            world.new_query::<(&MeshComponent, &MaterialComponent, &Transform)>();
 
         let mut irradiance_map = None;
         let mut prefiltered_environment_map = None;
         let mut environment_brdf_lut = None;
 
-        environment_cubemap_query
-            .each(|env_cubemap| {
-                irradiance_map = Some(env_cubemap.irradiance_map.clone());
-                prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
-                environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
-            });
+        environment_cubemap_query.each(|env_cubemap| {
+            irradiance_map = Some(env_cubemap.irradiance_map.clone());
+            prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
+            environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
+        });
         let irradiance_map = irradiance_map.unwrap();
         let prefiltered_environment_map = prefiltered_environment_map.unwrap();
         let environment_brdf_lut = environment_brdf_lut.unwrap();
@@ -641,38 +594,68 @@ impl Renderer {
             mesh_pipeline.layout().set_layouts()[3].clone(),
             asset_database_read.textures().len() as u32,
             [
-                WriteDescriptorSet::image_view(1, asset_database_read.get_cubemap(irradiance_map).unwrap().cubemap.clone()),
-                WriteDescriptorSet::image_view(2, asset_database_read.get_cubemap(prefiltered_environment_map).unwrap().cubemap.clone()),
-                WriteDescriptorSet::image_view(3, asset_database_read.get_cubemap(environment_brdf_lut).unwrap().cubemap.clone()),
-                WriteDescriptorSet::image_view_array(4, 0, asset_database_read.textures().iter().map(|texture| texture.texture.clone())),
+                WriteDescriptorSet::image_view(
+                    1,
+                    asset_database_read
+                        .get_cubemap(irradiance_map)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    2,
+                    asset_database_read
+                        .get_cubemap(prefiltered_environment_map)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    3,
+                    asset_database_read
+                        .get_cubemap(environment_brdf_lut)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view_array(
+                    4,
+                    0,
+                    asset_database_read
+                        .textures()
+                        .iter()
+                        .map(|texture| texture.texture.clone()),
+                ),
             ],
             [],
         )
         .unwrap();
 
-        println!("sizeof MATERIAL {}", size_of::<mesh_shaders::fs::Material>());
+        println!(
+            "sizeof MATERIAL {}",
+            size_of::<mesh_shaders::fs::Material>()
+        );
         assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
 
-        let materials_iter = asset_database_read.materials()
-            .iter().map(|material| {
-                let diffuse = material.diffuse.clone().map(|id| id.0);
-                let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
-                let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
-                let emissive = material.emissive.clone().map(|id| id.0);
-                let normal = material.normal.clone().map(|id| id.0);
-                mesh_shaders::fs::Material {
-                    base_color_factor: material.color_factor.into(),
-                    emissive_factor: material.emissive_factor.into(),
-                    metallic_factor: material.metallic_factor.into(),
-                    roughness_factor: material.roughness_factor.into(),
-                    base_color_texture_id: diffuse.unwrap_or(u32::MAX),
-                    metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
-                    ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
-                    emissive_texture_id: emissive.unwrap_or(u32::MAX),
-                    normal_texture_id: normal.unwrap_or(u32::MAX),
-                    pad: [0; 3],
-                }
-            });
+        let materials_iter = asset_database_read.materials().iter().map(|material| {
+            let diffuse = material.diffuse.clone().map(|id| id.0);
+            let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
+            let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
+            let emissive = material.emissive.clone().map(|id| id.0);
+            let normal = material.normal.clone().map(|id| id.0);
+            mesh_shaders::fs::Material {
+                base_color_factor: material.color_factor.into(),
+                emissive_factor: material.emissive_factor.into(),
+                metallic_factor: material.metallic_factor.into(),
+                roughness_factor: material.roughness_factor.into(),
+                base_color_texture_id: diffuse.unwrap_or(u32::MAX),
+                metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
+                ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
+                emissive_texture_id: emissive.unwrap_or(u32::MAX),
+                normal_texture_id: normal.unwrap_or(u32::MAX),
+                pad: [0; 3],
+            }
+        });
 
         let materials_storage_buffer = Buffer::from_iter(
             &memory_allocator,
@@ -685,7 +668,7 @@ impl Renderer {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            materials_iter
+            materials_iter,
         )
         .unwrap();
         drop(asset_database_read);
@@ -693,29 +676,27 @@ impl Renderer {
         let materials_descriptor_set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
             mesh_pipeline.layout().set_layouts()[1].clone(),
-            [
-                WriteDescriptorSet::buffer(0, materials_storage_buffer.clone()),
-            ],
+            [WriteDescriptorSet::buffer(
+                0,
+                materials_storage_buffer.clone(),
+            )],
             [],
         )
         .unwrap();
-        
-        println!("VARIABLE_DESCRIPTOR_COUNT: {:#?}", environment_descriptor_set.variable_descriptor_count());
 
-        Self {
-            window,
-            device,
-            queue,
+        println!(
+            "VARIABLE_DESCRIPTOR_COUNT: {:#?}",
+            environment_descriptor_set.variable_descriptor_count()
+        );
+
+        let renderer = Self {
             memory_allocator,
             descriptor_set_allocator,
-            command_buffer_allocator,
             uniform_buffer_allocator,
             storage_buffer_allocator,
             indirect_buffer_allocator,
             asset_database,
             render_pass,
-            swapchain,
-            framebuffers,
             mesh_vs,
             mesh_fs,
             skybox_vs,
@@ -724,99 +705,49 @@ impl Renderer {
             skybox_pipeline,
             cube_vertex_buffer,
             cube_index_buffer,
+            sampler,
             environment_descriptor_set,
             materials_descriptor_set,
             materials_storage_buffer,
             environment_cubemap_query,
             meshes_with_materials_query,
             world,
-            fences,
-            recreate_swapchain: false,
-            previous_fence_index: 0,
-        }
+        };
+
+        (renderer, framebuffers)
     }
 
-    pub fn draw(&mut self, camera: &Camera) {
-        let window_size = self.window.size();
-        if window_size.0 == 0 || window_size.1 == 0 {
-            return;
-        }
+    pub fn resize(&mut self, images: Vec<Arc<Image>>) -> Vec<Arc<Framebuffer>> {
+        let framebuffers;
 
-        if self.recreate_swapchain {
-            let (new_swapchain, new_images) = self
-                .swapchain
-                .recreate(&SwapchainCreateInfo {
-                    image_extent: window_size.into(),
-                    ..self.swapchain.create_info()
-                })
-                .expect("Failed to recreate swapchain");
+        (framebuffers, (self.mesh_pipeline, self.skybox_pipeline)) = window_size_dependent_setup(
+            &images,
+            &self.render_pass,
+            &self.memory_allocator,
+            &self.mesh_vs,
+            &self.mesh_fs,
+            &self.skybox_vs,
+            &self.skybox_fs,
+            &self.sampler,
+        );
 
-            self.swapchain = new_swapchain;
+        framebuffers
+    }
 
-            (
-                self.framebuffers,
-                (self.mesh_pipeline, self.skybox_pipeline),
-            ) = window_size_dependent_setup(
-                window_size.into(),
-                &new_images,
-                &self.render_pass,
-                &self.memory_allocator,
-                &self.mesh_vs,
-                &self.mesh_fs,
-                &self.skybox_vs,
-                &self.skybox_fs,
-            );
-
-            self.recreate_swapchain = false;
-        }
-
-        let (image_index, suboptimal, acquire_future) =
-            match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
-                Ok(r) => r,
-                Err(VulkanError::OutOfDate) => {
-                    self.recreate_swapchain = true;
-                    return;
-                }
-                Err(e) => panic!("failed to acquire next image: {e}"),
-            };
-
-        if suboptimal {
-            self.recreate_swapchain = true;
-        }
-
-        let timer = ProfileTimer::start("cleanup_finished");
-        let previous_future = match self.fences[self.previous_fence_index as usize].take() {
-            // Create a NowFuture
-            None => {
-                let mut now = sync::now(self.device.clone());
-                now.cleanup_finished();
-
-                now.boxed()
-            }
-            // Use the existing FenceSignalFuture
-            Some(mut fence) => {
-                fence.cleanup_finished();
-                fence.boxed()
-            },
-        };
-        drop(timer);
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.command_buffer_allocator.clone(),
-            self.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
+    /// Returns true if the swapchain needs to be recreated
+    pub fn draw(
+        &mut self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        framebuffer: &Arc<Framebuffer>,
+        camera: &Camera,
+    ) {
         let timer = ProfileTimer::start("begin_render_pass");
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into()), Some(1f32.into())],
 
-                    ..RenderPassBeginInfo::framebuffer(
-                        self.framebuffers[image_index as usize].clone(),
-                    )
+                    ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo {
                     contents: SubpassContents::Inline,
@@ -826,8 +757,10 @@ impl Renderer {
             .unwrap();
         drop(timer);
 
+        let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
+
         let timer = ProfileTimer::start("draw_meshes");
-        self.draw_meshes(&mut builder, &camera);
+        self.draw_meshes(builder, &camera, aspect_ratio);
         drop(timer);
 
         let timer = ProfileTimer::start("next_subpass");
@@ -843,53 +776,21 @@ impl Renderer {
         drop(timer);
 
         let timer = ProfileTimer::start("draw_skybox");
-        self.draw_skybox(&mut builder, &camera);
+        self.draw_skybox(builder, &camera, aspect_ratio);
         drop(timer);
 
         let timer = ProfileTimer::start("end_render_pass");
         builder.end_render_pass(Default::default()).unwrap();
         drop(timer);
-
-        let timer = ProfileTimer::start("build");
-        let command_buffer = builder.build().unwrap();
-        drop(timer);
-
-        let timer = ProfileTimer::start("present");
-        let future = previous_future
-            .join(acquire_future)
-            .then_execute(self.queue.clone(), command_buffer)
-            .unwrap()
-            .then_swapchain_present(
-                self.queue.clone(),
-                SwapchainPresentInfo::new(self.swapchain.clone(), image_index),
-            )
-            .then_signal_fence_and_flush();
-        drop(timer);
-
-        self.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
-            Ok(value) => Some(value.boxed()),
-            Err(VulkanError::OutOfDate) => {
-                self.recreate_swapchain = true;
-                None
-            }
-            Err(e) => {
-                println!("failed to flush future: {e}");
-                None
-            }
-        };
-        
-        self.previous_fence_index = image_index;
     }
 
     fn draw_meshes(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
+        aspect_ratio: f32,
     ) {
         let frame_uniform_buffer = {
-            let aspect_ratio =
-                self.swapchain.image_extent()[0] as f32 / self.swapchain.image_extent()[1] as f32;
-
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
             let view = Mat4::look_to_rh(
@@ -925,63 +826,66 @@ impl Renderer {
         let mut indirect_commands = vec![];
 
         let asset_database_read = self.asset_database.read().unwrap();
-        self.meshes_with_materials_query.each(|(mesh_component, material, transform)| {
-            let model_matrix = Mat4::from_scale_rotation_translation(
-                transform.scale,
-                transform.rotation,
-                transform.translation,
-            );
+        self.meshes_with_materials_query
+            .each(|(mesh_component, material, transform)| {
+                let model_matrix = Mat4::from_scale_rotation_translation(
+                    transform.scale,
+                    transform.rotation,
+                    transform.translation,
+                );
 
-            entities_data.push(mesh_shaders::vs::EntityData {
-                transform: model_matrix.to_cols_array_2d(),
-                material: material.material_id.0,
-                pad: [0; 3],
+                entities_data.push(mesh_shaders::vs::EntityData {
+                    transform: model_matrix.to_cols_array_2d(),
+                    material: material.material_id.0,
+                    pad: [0; 3],
+                });
+
+                let mesh = asset_database_read
+                    .get_mesh(mesh_component.mesh_id.clone())
+                    .unwrap();
+                indirect_commands.push(DrawIndexedIndirectCommand {
+                    index_count: mesh.index_count,
+                    instance_count: 1,
+                    first_index: mesh.first_index,
+                    vertex_offset: mesh.vertex_offset,
+                    first_instance: 0,
+                });
             });
-
-            let mesh = asset_database_read.get_mesh(mesh_component.mesh_id.clone()).unwrap();
-            indirect_commands.push(DrawIndexedIndirectCommand {
-                index_count: mesh.index_count,
-                instance_count: 1,
-                first_index: mesh.first_index,
-                vertex_offset: mesh.vertex_offset,
-                first_instance: 0,
-            });
-
-        });
         drop(asset_database_read);
-        println!("DrawCommands: {}", indirect_commands.len());
-        println!("EntityDatas: {}", entities_data.len());
 
-        let indirect_buffer = self.indirect_buffer_allocator
+        let indirect_buffer = self
+            .indirect_buffer_allocator
             .allocate_slice(indirect_commands.len() as DeviceSize)
             .unwrap();
         indirect_buffer
             .write()
             .unwrap()
             .copy_from_slice(&indirect_commands);
-        
-        let entity_data_storage_buffer = self.storage_buffer_allocator
+
+        let entity_data_storage_buffer = self
+            .storage_buffer_allocator
             .allocate_slice(entities_data.len() as DeviceSize)
             .unwrap();
         entity_data_storage_buffer
             .write()
             .unwrap()
             .copy_from_slice(&entities_data);
-        
+
         let entity_data_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.mesh_pipeline.layout().set_layouts()[2].clone(),
-            [
-                WriteDescriptorSet::buffer(0, entity_data_storage_buffer.clone()),
-            ],
+            [WriteDescriptorSet::buffer(
+                0,
+                entity_data_storage_buffer.clone(),
+            )],
             [],
         )
         .unwrap();
-        
+
         builder
             .bind_pipeline_graphics(self.mesh_pipeline.clone())
             .unwrap();
-        
+
         builder
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
@@ -994,7 +898,11 @@ impl Renderer {
                     self.environment_descriptor_set.clone(),
                 ),
             )
-            .unwrap();
+            .map_err(|err| {
+                println!("{}", err);
+                println!("{:#?}", *self.mesh_pipeline.layout().set_layouts()[3]);
+                println!("{:#?}", self.environment_descriptor_set.layout());
+            }).unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();
         builder
@@ -1004,16 +912,14 @@ impl Renderer {
             .unwrap();
         drop(asset_database_read);
 
-        unsafe {
-            builder
-                .draw_indexed_indirect(indirect_buffer)
-        }.unwrap();
+        unsafe { builder.draw_indexed_indirect(indirect_buffer) }.unwrap();
     }
 
     fn draw_skybox(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
+        aspect_ratio: f32,
     ) {
         builder
             .bind_pipeline_graphics(self.skybox_pipeline.clone())
@@ -1034,16 +940,20 @@ impl Renderer {
         let environment_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.skybox_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view(1, asset_database_read.get_cubemap(environment_map).unwrap().cubemap.clone())],
+            [WriteDescriptorSet::image_view(
+                1,
+                asset_database_read
+                    .get_cubemap(environment_map)
+                    .unwrap()
+                    .cubemap
+                    .clone(),
+            )],
             [],
         )
         .unwrap();
         drop(asset_database_read);
 
         let frame_uniform_buffer = {
-            let aspect_ratio =
-                self.swapchain.image_extent()[0] as f32 / self.swapchain.image_extent()[1] as f32;
-
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) // Correction for vulkan's
                                                                    // inverted y
                 * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
