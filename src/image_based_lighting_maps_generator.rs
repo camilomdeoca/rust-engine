@@ -5,15 +5,24 @@ use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         BufferUsage, Subbuffer,
-    }, command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo
-    }, descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, layout::{DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType}, DescriptorBufferInfo, DescriptorSet, WriteDescriptorSet
-    }, device::{Device, Queue}, format::Format, image::{
+    },
+    command_buffer::{
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
+        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+    },
+    descriptor_set::{
+        allocator::StandardDescriptorSetAllocator, layout::DescriptorType, DescriptorBufferInfo,
+        DescriptorSet, WriteDescriptorSet,
+    },
+    device::{Device, Queue},
+    format::Format,
+    image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageSubresourceRange,
-    }, memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
+    },
+    memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::InputAssemblyState,
@@ -22,11 +31,19 @@ use vulkano::{
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        }, layout::{push_constant_ranges_from_stages, PipelineLayoutCreateInfo}, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::ShaderStages, sync::GpuFuture, DeviceSize
+        },
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    sync::GpuFuture,
+    DeviceSize,
 };
 
-use crate::assets::{loaders::mesh_loader::load_mesh_from_buffers_into_new_buffers, vertex::Vertex};
+use crate::assets::{
+    loaders::mesh_loader::load_mesh_from_buffers_into_new_buffers, vertex::Vertex,
+};
 
 pub struct ImageBasedLightingMapsGenerator {
     device: Arc<Device>,
@@ -52,7 +69,7 @@ fn create_irradiance_map_generation_pipeline(
     dst_image_format: Format,
 ) -> (Arc<RenderPass>, Arc<GraphicsPipeline>) {
     let render_pass = vulkano::ordered_passes_renderpass!(
-        &device,
+        device.clone(),
         attachments: {
             color: {
                 format: dst_image_format,
@@ -71,99 +88,76 @@ fn create_irradiance_map_generation_pipeline(
     )
     .unwrap();
 
-    let vs = cubemap_vs::load(&device)
+    let vs = cubemap_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
-    let fs = irradiance_map_generation_fs::load(&device)
+    let fs = irradiance_map_generation_fs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
 
     let mesh_pipeline_stages = [
-        PipelineShaderStageCreateInfo::new(&vs),
-        PipelineShaderStageCreateInfo::new(&fs),
+        PipelineShaderStageCreateInfo::new(vs.clone()),
+        PipelineShaderStageCreateInfo::new(fs.clone()),
     ];
-    let layout_create_info = PipelineLayoutCreateInfo {
-        set_layouts: &[
-            // Env descriptor set (rebound when the skybox changes, not too often)
-            &DescriptorSetLayout::new(
-                &device,
-                &DescriptorSetLayoutCreateInfo {
-                    bindings: &[
-                        // Sampler
-                        DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::FRAGMENT,
-                            immutable_samplers: &[
-                                &Sampler::new(
-                                    &device,
-                                    &SamplerCreateInfo {
-                                        mag_filter: Filter::Linear,
-                                        min_filter: Filter::Linear,
-                                        address_mode: [SamplerAddressMode::Repeat; 3],
-                                        ..Default::default()
-                                    },
-                                )
-                                .unwrap(),
-                            ],
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
-                        },
-                        // cubemap
-                        DescriptorSetLayoutBinding {
-                            binding: 1,
-                            stages: ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-            // Frame descriptor set (bound during the whole frame)
-            &DescriptorSetLayout::new(
-                &device,
-                &DescriptorSetLayoutCreateInfo {
-                    bindings: &[
-                        DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::VERTEX,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBufferDynamic)
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        ],
-        push_constant_ranges: &push_constant_ranges_from_stages(&mesh_pipeline_stages),
-        ..Default::default()
-    };
+    let mut layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
 
-    let layout = PipelineLayout::new(&device, &layout_create_info).unwrap();
+    let sampler = Sampler::new(
+        device.clone(),
+        SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::Repeat; 3],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Env descriptor set (rebound when the skybox changes, not too often)
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .immutable_samplers = vec![sampler];
 
-    let sub_pass = Subpass::new(&render_pass, 0).unwrap();
+    // Frame descriptor set (bound during the whole frame)
+    layout_create_info.set_layouts[1]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .descriptor_type = DescriptorType::UniformBufferDynamic;
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let sub_pass = Subpass::from(render_pass.clone(), 0).unwrap();
 
     let pipeline = GraphicsPipeline::new(
-        &device,
+        device.clone(),
         None,
-        &GraphicsPipelineCreateInfo {
-            stages: &mesh_pipeline_stages,
-            vertex_input_state: Some(&Vertex::per_vertex().definition(&vs).unwrap()),
-            input_assembly_state: Some(&InputAssemblyState::default()),
-            viewport_state: Some(&ViewportState::default()),
-            rasterization_state: Some(&RasterizationState {
+        GraphicsPipelineCreateInfo {
+            stages: mesh_pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(&vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::None,
                 ..Default::default()
             }),
-            multisample_state: Some(&MultisampleState::default()),
-            color_blend_state: Some(&ColorBlendState {
-                attachments: &[ColorBlendAttachmentState::default()],
-                ..Default::default()
-            }),
-            dynamic_state: &[DynamicState::Viewport],
-            subpass: Some((&sub_pass).into()),
-            ..GraphicsPipelineCreateInfo::new(&layout)
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                sub_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(sub_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
     .unwrap();
@@ -175,7 +169,7 @@ fn create_environment_brdf_lut_generation_pipeline(
     device: Arc<Device>,
 ) -> (Arc<RenderPass>, Arc<GraphicsPipeline>) {
     let render_pass = vulkano::ordered_passes_renderpass!(
-        &device,
+        device.clone(),
         attachments: {
             color: {
                 format: Format::R16G16_SFLOAT,
@@ -194,49 +188,52 @@ fn create_environment_brdf_lut_generation_pipeline(
     )
     .unwrap();
 
-    let vs = environment_brdf_lut_generation::vs::load(&device)
+    let vs = environment_brdf_lut_generation::vs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
-    let fs = environment_brdf_lut_generation::fs::load(&device)
+    let fs = environment_brdf_lut_generation::fs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
 
     let mesh_pipeline_stages = [
-        PipelineShaderStageCreateInfo::new(&vs),
-        PipelineShaderStageCreateInfo::new(&fs),
+        PipelineShaderStageCreateInfo::new(vs.clone()),
+        PipelineShaderStageCreateInfo::new(fs.clone()),
     ];
-    let layout_create_info = PipelineLayoutCreateInfo {
-        set_layouts: &[],
-        push_constant_ranges: &push_constant_ranges_from_stages(&mesh_pipeline_stages),
-        ..Default::default()
-    };
+    let layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
 
-    let layout = PipelineLayout::new(&device, &layout_create_info).unwrap();
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
 
-    let sub_pass = Subpass::new(&render_pass, 0).unwrap();
+    let sub_pass = Subpass::from(render_pass.clone(), 0).unwrap();
 
     let pipeline = GraphicsPipeline::new(
-        &device,
+        device.clone(),
         None,
-        &GraphicsPipelineCreateInfo {
-            stages: &mesh_pipeline_stages,
-            vertex_input_state: Some(&Vertex::per_vertex().definition(&vs).unwrap()),
-            input_assembly_state: Some(&InputAssemblyState::default()),
-            viewport_state: Some(&ViewportState::default()),
-            rasterization_state: Some(&RasterizationState {
+        GraphicsPipelineCreateInfo {
+            stages: mesh_pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(&vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::None,
                 ..Default::default()
             }),
-            multisample_state: Some(&MultisampleState::default()),
-            color_blend_state: Some(&ColorBlendState {
-                attachments: &[ColorBlendAttachmentState::default()],
-                ..Default::default()
-            }),
-            dynamic_state: &[DynamicState::Viewport],
-            subpass: Some((&sub_pass).into()),
-            ..GraphicsPipelineCreateInfo::new(&layout)
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                sub_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(sub_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
     .unwrap();
@@ -249,7 +246,7 @@ fn create_prefiltered_environment_map_generation_pipeline(
     dst_image_format: Format,
 ) -> (Arc<RenderPass>, Arc<GraphicsPipeline>) {
     let render_pass = vulkano::ordered_passes_renderpass!(
-        &device,
+        device.clone(),
         attachments: {
             color: {
                 format: dst_image_format,
@@ -268,99 +265,76 @@ fn create_prefiltered_environment_map_generation_pipeline(
     )
     .unwrap();
 
-    let vs = cubemap_vs::load(&device)
+    let vs = cubemap_vs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
-    let fs = prefiltered_environment_map_generation_fs::load(&device)
+    let fs = prefiltered_environment_map_generation_fs::load(device.clone())
         .unwrap()
         .entry_point("main")
         .unwrap();
 
     let mesh_pipeline_stages = [
-        PipelineShaderStageCreateInfo::new(&vs),
-        PipelineShaderStageCreateInfo::new(&fs),
+        PipelineShaderStageCreateInfo::new(vs.clone()),
+        PipelineShaderStageCreateInfo::new(fs.clone()),
     ];
-    let layout_create_info = PipelineLayoutCreateInfo {
-        set_layouts: &[
-            // Env descriptor set (rebound when the skybox changes, not too often)
-            &DescriptorSetLayout::new(
-                &device,
-                &DescriptorSetLayoutCreateInfo {
-                    bindings: &[
-                        // Sampler
-                        DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::FRAGMENT,
-                            immutable_samplers: &[
-                                &Sampler::new(
-                                    &device,
-                                    &SamplerCreateInfo {
-                                        mag_filter: Filter::Linear,
-                                        min_filter: Filter::Linear,
-                                        address_mode: [SamplerAddressMode::Repeat; 3],
-                                        ..Default::default()
-                                    },
-                                )
-                                .unwrap(),
-                            ],
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
-                        },
-                        // cubemap
-                        DescriptorSetLayoutBinding {
-                            binding: 1,
-                            stages: ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-            // Frame descriptor set (bound during the whole frame)
-            &DescriptorSetLayout::new(
-                &device,
-                &DescriptorSetLayoutCreateInfo {
-                    bindings: &[
-                        DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::VERTEX,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBufferDynamic)
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        ],
-        push_constant_ranges: &push_constant_ranges_from_stages(&mesh_pipeline_stages),
-        ..Default::default()
-    };
+    let mut layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
 
-    let layout = PipelineLayout::new(&device, &layout_create_info).unwrap();
+    let sampler = Sampler::new(
+        device.clone(),
+        SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::Repeat; 3],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Env descriptor set (rebound when the skybox changes, not too often)
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .immutable_samplers = vec![sampler];
 
-    let sub_pass = Subpass::new(&render_pass, 0).unwrap();
+    // Frame descriptor set (bound during the whole frame)
+    layout_create_info.set_layouts[1]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .descriptor_type = DescriptorType::UniformBufferDynamic;
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let sub_pass = Subpass::from(render_pass.clone(), 0).unwrap();
 
     let pipeline = GraphicsPipeline::new(
-        &device,
+        device.clone(),
         None,
-        &GraphicsPipelineCreateInfo {
-            stages: &mesh_pipeline_stages,
-            vertex_input_state: Some(&Vertex::per_vertex().definition(&vs).unwrap()),
-            input_assembly_state: Some(&InputAssemblyState::default()),
-            viewport_state: Some(&ViewportState::default()),
-            rasterization_state: Some(&RasterizationState {
+        GraphicsPipelineCreateInfo {
+            stages: mesh_pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(&vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::None,
                 ..Default::default()
             }),
-            multisample_state: Some(&MultisampleState::default()),
-            color_blend_state: Some(&ColorBlendState {
-                attachments: &[ColorBlendAttachmentState::default()],
-                ..Default::default()
-            }),
-            dynamic_state: &[DynamicState::Viewport],
-            subpass: Some((&sub_pass).into()),
-            ..GraphicsPipelineCreateInfo::new(&layout)
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                sub_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(sub_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
     .unwrap();
@@ -376,18 +350,18 @@ impl ImageBasedLightingMapsGenerator {
         dst_image_format: Format,
     ) -> Self {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            &device,
-            &Default::default(),
+            device.clone(),
+            Default::default(),
         ));
 
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            &device,
-            &Default::default(),
+            device.clone(),
+            Default::default(),
         ));
 
         let uniform_buffer_allocator = SubbufferAllocator::new(
-            &memory_allocator,
-            &SubbufferAllocatorCreateInfo {
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
@@ -396,7 +370,7 @@ impl ImageBasedLightingMapsGenerator {
         );
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
-            &memory_allocator,
+            memory_allocator.clone(),
             command_buffer_allocator.clone(),
             &queue,
             vec![
@@ -462,7 +436,7 @@ impl ImageBasedLightingMapsGenerator {
         .unwrap();
 
         let (quad_vertex_buffer, quad_index_buffer) = load_mesh_from_buffers_into_new_buffers(
-            &memory_allocator,
+            memory_allocator.clone(),
             command_buffer_allocator.clone(),
             &queue,
             vec![
@@ -553,7 +527,7 @@ impl ImageBasedLightingMapsGenerator {
             [],
         )
         .unwrap();
-        
+
         let min_dynamic_align = self
             .device
             .physical_device()
@@ -561,11 +535,13 @@ impl ImageBasedLightingMapsGenerator {
             .min_uniform_buffer_offset_alignment
             .as_devicesize();
 
-        let align =
-            (size_of::<cubemap_vs::FrameUniforms>() as DeviceSize + min_dynamic_align - 1)
-                & !(min_dynamic_align - 1);
+        let align = (size_of::<cubemap_vs::FrameUniforms>() as DeviceSize + min_dynamic_align - 1)
+            & !(min_dynamic_align - 1);
 
-        let uniform_buffer = self.uniform_buffer_allocator.allocate_slice(6 * align).unwrap();
+        let uniform_buffer = self
+            .uniform_buffer_allocator
+            .allocate_slice(6 * align)
+            .unwrap();
         for (view_proj_index, view_proj) in view_projs.iter().enumerate() {
             *uniform_buffer
                 .clone()
@@ -574,8 +550,8 @@ impl ImageBasedLightingMapsGenerator {
                 .index(0)
                 .write()
                 .unwrap() = cubemap_vs::FrameUniforms {
-                    view_proj: view_proj.to_cols_array_2d(),
-                };
+                view_proj: view_proj.to_cols_array_2d(),
+            };
         }
 
         let frame_descriptor_set = DescriptorSet::new(
@@ -588,8 +564,7 @@ impl ImageBasedLightingMapsGenerator {
                 0,
                 DescriptorBufferInfo {
                     buffer: uniform_buffer.clone(),
-                    offset: 0,
-                    range: size_of::<cubemap_vs::FrameUniforms>() as DeviceSize,
+                    range: 0..size_of::<cubemap_vs::FrameUniforms>() as DeviceSize,
                 },
             )],
             [],
@@ -600,18 +575,18 @@ impl ImageBasedLightingMapsGenerator {
             let image_view_create_info = ImageViewCreateInfo {
                 view_type: ImageViewType::Dim2d,
                 subresource_range: ImageSubresourceRange {
-                    base_array_layer: view_proj_index as u32,
-                    layer_count: 1,
+                    array_layers: view_proj_index as u32..view_proj_index as u32 + 1,
                     ..irradiance_map_image.subresource_range()
                 },
                 ..ImageViewCreateInfo::from_image(&irradiance_map_image)
             };
-            let image_view = ImageView::new(&irradiance_map_image, &image_view_create_info).unwrap();
+            let image_view =
+                ImageView::new(irradiance_map_image.clone(), image_view_create_info).unwrap();
 
             let framebuffer = Framebuffer::new(
-                &self.irradiance_map_generation_render_pass,
-                &FramebufferCreateInfo {
-                    attachments: &[&image_view],
+                self.irradiance_map_generation_render_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![image_view],
                     ..Default::default()
                 },
             )
@@ -634,8 +609,7 @@ impl ImageBasedLightingMapsGenerator {
                             framebuffer.extent()[0] as f32,
                             framebuffer.extent()[1] as f32,
                         ],
-                        min_depth: 0.0,
-                        max_depth: 1.0,
+                        depth_range: 0.0..=1.0,
                     }]
                     .into_iter()
                     .collect(),
@@ -696,7 +670,7 @@ impl ImageBasedLightingMapsGenerator {
             [],
         )
         .unwrap();
-        
+
         let min_dynamic_align = self
             .device
             .physical_device()
@@ -704,11 +678,13 @@ impl ImageBasedLightingMapsGenerator {
             .min_uniform_buffer_offset_alignment
             .as_devicesize();
 
-        let align =
-            (size_of::<cubemap_vs::FrameUniforms>() as DeviceSize + min_dynamic_align - 1)
-                & !(min_dynamic_align - 1);
+        let align = (size_of::<cubemap_vs::FrameUniforms>() as DeviceSize + min_dynamic_align - 1)
+            & !(min_dynamic_align - 1);
 
-        let uniform_buffer = self.uniform_buffer_allocator.allocate_slice(6 * align).unwrap();
+        let uniform_buffer = self
+            .uniform_buffer_allocator
+            .allocate_slice(6 * align)
+            .unwrap();
         for (view_proj_index, view_proj) in view_projs.iter().enumerate() {
             *uniform_buffer
                 .clone()
@@ -717,8 +693,8 @@ impl ImageBasedLightingMapsGenerator {
                 .index(0)
                 .write()
                 .unwrap() = cubemap_vs::FrameUniforms {
-                    view_proj: view_proj.to_cols_array_2d(),
-                };
+                view_proj: view_proj.to_cols_array_2d(),
+            };
         }
 
         let frame_descriptor_set = DescriptorSet::new(
@@ -731,8 +707,7 @@ impl ImageBasedLightingMapsGenerator {
                 0,
                 DescriptorBufferInfo {
                     buffer: uniform_buffer.clone(),
-                    offset: 0,
-                    range: size_of::<cubemap_vs::FrameUniforms>() as DeviceSize,
+                    range: 0..size_of::<cubemap_vs::FrameUniforms>() as DeviceSize,
                 },
             )],
             [],
@@ -744,17 +719,15 @@ impl ImageBasedLightingMapsGenerator {
                 let image_view_create_info = ImageViewCreateInfo {
                     view_type: ImageViewType::Dim2d,
                     subresource_range: ImageSubresourceRange {
-                        base_array_layer: view_proj_index as u32,
-                        layer_count: 1,
-                        base_mip_level: mip_level,
-                        level_count: 1,
+                        array_layers: view_proj_index as u32..view_proj_index as u32 + 1,
+                        mip_levels: mip_level..mip_level + 1,
                         ..prefiltered_environment_map_image.subresource_range()
                     },
                     ..ImageViewCreateInfo::from_image(&prefiltered_environment_map_image)
                 };
                 let image_view = ImageView::new(
-                    &prefiltered_environment_map_image,
-                    &image_view_create_info,
+                    prefiltered_environment_map_image.clone(),
+                    image_view_create_info,
                 )
                 .unwrap();
 
@@ -763,9 +736,10 @@ impl ImageBasedLightingMapsGenerator {
                     prefiltered_environment_map_image.extent()[1] / 2u32.pow(mip_level),
                 ];
                 let framebuffer = Framebuffer::new(
-                    &self.prefiltered_environment_map_generation_render_pass,
-                    &FramebufferCreateInfo {
-                        attachments: &[&image_view],
+                    self.prefiltered_environment_map_generation_render_pass
+                        .clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![image_view],
                         extent,
                         ..Default::default()
                     },
@@ -789,14 +763,15 @@ impl ImageBasedLightingMapsGenerator {
                                 framebuffer.extent()[0] as f32,
                                 framebuffer.extent()[1] as f32,
                             ],
-                            min_depth: 0.0,
-                            max_depth: 1.0,
+                            depth_range: 0.0..=1.0,
                         }]
                         .into_iter()
                         .collect(),
                     )
                     .unwrap()
-                    .bind_pipeline_graphics(self.prefiltered_environment_map_generation_pipeline.clone())
+                    .bind_pipeline_graphics(
+                        self.prefiltered_environment_map_generation_pipeline.clone(),
+                    )
                     .unwrap();
 
                 builder
@@ -809,7 +784,9 @@ impl ImageBasedLightingMapsGenerator {
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        self.prefiltered_environment_map_generation_pipeline.layout().clone(),
+                        self.prefiltered_environment_map_generation_pipeline
+                            .layout()
+                            .clone(),
                         0,
                         (
                             environment_descriptor_set.clone(),
@@ -818,14 +795,15 @@ impl ImageBasedLightingMapsGenerator {
                     )
                     .unwrap();
 
-                let roughness = mip_level as f32 / (prefiltered_environment_map_image.mip_levels() - 1) as f32;
+                let roughness =
+                    mip_level as f32 / (prefiltered_environment_map_image.mip_levels() - 1) as f32;
                 builder
                     .push_constants(
-                        self.prefiltered_environment_map_generation_pipeline.layout().clone(),
+                        self.prefiltered_environment_map_generation_pipeline
+                            .layout()
+                            .clone(),
                         0,
-                        prefiltered_environment_map_generation_fs::RoughnessData {
-                            roughness,
-                        }
+                        prefiltered_environment_map_generation_fs::RoughnessData { roughness },
                     )
                     .unwrap();
 
@@ -836,7 +814,7 @@ impl ImageBasedLightingMapsGenerator {
             }
         }
     }
-    
+
     fn generate_environment_brdf_lut(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
@@ -846,12 +824,13 @@ impl ImageBasedLightingMapsGenerator {
             view_type: ImageViewType::Dim2d,
             ..ImageViewCreateInfo::from_image(&environment_brdf_lut_image)
         };
-        let image_view = ImageView::new(&environment_brdf_lut_image, &image_view_create_info).unwrap();
+        let image_view =
+            ImageView::new(environment_brdf_lut_image, image_view_create_info).unwrap();
 
         let framebuffer = Framebuffer::new(
-            &self.environment_brdf_lut_generation_render_pass,
-            &FramebufferCreateInfo {
-                attachments: &[&image_view],
+            self.environment_brdf_lut_generation_render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![image_view],
                 ..Default::default()
             },
         )
@@ -874,8 +853,7 @@ impl ImageBasedLightingMapsGenerator {
                         framebuffer.extent()[0] as f32,
                         framebuffer.extent()[1] as f32,
                     ],
-                    min_depth: 0.0,
-                    max_depth: 1.0,
+                    depth_range: 0.0..=1.0,
                 }]
                 .into_iter()
                 .collect(),
@@ -890,8 +868,7 @@ impl ImageBasedLightingMapsGenerator {
             .bind_index_buffer(self.quad_index_buffer.clone())
             .unwrap();
 
-        unsafe { builder.draw_indexed(self.quad_index_buffer.len() as u32, 1, 0, 0, 0) }
-            .unwrap();
+        unsafe { builder.draw_indexed(self.quad_index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
 
         builder.end_render_pass(Default::default()).unwrap();
     }
@@ -912,7 +889,11 @@ impl ImageBasedLightingMapsGenerator {
         .unwrap();
 
         self.generate_maps(&mut builder, environment_map.clone(), irradiance_map_image);
-        self.generate_prefiltered_environment_map(&mut builder, environment_map.clone(), prefiltered_environment_map_image);
+        self.generate_prefiltered_environment_map(
+            &mut builder,
+            environment_map.clone(),
+            prefiltered_environment_map_image,
+        );
         self.generate_environment_brdf_lut(&mut builder, environment_brdf_lut_image);
 
         let command_buffer = builder.build().unwrap();

@@ -1,15 +1,28 @@
-use std::{path::Path, sync::{Arc, RwLock}};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use bimap::BiHashMap;
 use glam::{UVec2, Vec3, Vec4};
 use image::EncodableLayout;
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::
-        allocator::StandardCommandBufferAllocator
-    , device::Queue, format::Format, image::view::ImageView, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, DeviceSize
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
+    command_buffer::allocator::StandardCommandBufferAllocator,
+    device::Queue,
+    format::Format,
+    image::view::ImageView,
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    DeviceSize,
 };
 
-use super::{loaders::{mesh_loader::load_mesh_from_buffers, texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer}}, vertex::Vertex};
+use super::{
+    loaders::{
+        mesh_loader::load_mesh_from_buffers,
+        texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer},
+    },
+    vertex::Vertex,
+};
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct MeshId(pub u32);
@@ -18,7 +31,7 @@ pub struct Mesh {
     pub index_count: u32,
     pub first_index: u32,
     pub vertex_count: u32, // not needed for rendering but for knowing where to write next mesh in
-                           // vertex_buffer 
+    // vertex_buffer
     pub vertex_offset: u32,
 }
 
@@ -68,10 +81,10 @@ pub struct AssetDatabase {
 
     texture_names: BiHashMap<String, TextureId>,
     textures: Vec<Texture>,
-    
+
     cubemap_names: BiHashMap<String, CubemapId>,
     cubemaps: Vec<Cubemap>,
-    
+
     material_names: BiHashMap<String, MaterialId>,
     materials: Vec<Material>,
 
@@ -89,17 +102,17 @@ impl AssetDatabase {
         index_buffer_len: DeviceSize,
     ) -> Self {
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            &queue.device(),
-            &Default::default(),
+            queue.device().clone(),
+            Default::default(),
         ));
 
         let vertex_buffer = Buffer::new_slice(
-            &memory_allocator,
-            &BufferCreateInfo {
+            memory_allocator.clone(),
+            BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
-            &AllocationCreateInfo {
+            AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
@@ -108,12 +121,12 @@ impl AssetDatabase {
         .unwrap();
 
         let index_buffer = Buffer::new_slice(
-            &memory_allocator,
-            &BufferCreateInfo {
+            memory_allocator.clone(),
+            BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
-            &AllocationCreateInfo {
+            AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
@@ -139,14 +152,17 @@ impl AssetDatabase {
         }
     }
 
-    pub fn add_asset_database_change_observer(&mut self, observer: Arc<RwLock<dyn AssetDatabaseChangeObserver>>) {
+    pub fn add_asset_database_change_observer(
+        &mut self,
+        observer: Arc<RwLock<dyn AssetDatabaseChangeObserver>>,
+    ) {
         self.asset_database_change_observers.push(observer);
     }
 
     pub fn vertex_buffer(&self) -> Subbuffer<[Vertex]> {
         self.vertex_buffer.clone()
     }
-    
+
     pub fn index_buffer(&self) -> Subbuffer<[u32]> {
         self.index_buffer.clone()
     }
@@ -154,7 +170,7 @@ impl AssetDatabase {
     pub fn textures(&self) -> &Vec<Texture> {
         &self.textures
     }
-    
+
     pub fn materials(&self) -> &Vec<Material> {
         &self.materials
     }
@@ -167,12 +183,12 @@ impl AssetDatabase {
         let vertex_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
             acc.max((mesh.vertex_offset + mesh.vertex_count) as DeviceSize)
         });
-        
+
         let index_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
             acc.max((mesh.first_index + mesh.index_count) as DeviceSize)
         });
         load_mesh_from_buffers(
-            &self.memory_allocator,
+            self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
             &self.queue,
             vertices.iter().cloned(),
@@ -188,14 +204,17 @@ impl AssetDatabase {
             vertex_count: vertices.len() as u32,
             vertex_offset: vertex_buffer_offset as u32,
         });
-        
+
         for observer in &self.asset_database_change_observers {
-            observer.write().unwrap().on_mesh_add(mesh_id.clone(), self.meshes.last().unwrap());
+            observer
+                .write()
+                .unwrap()
+                .on_mesh_add(mesh_id.clone(), self.meshes.last().unwrap());
         }
 
         Ok(mesh_id)
     }
-    
+
     pub fn add_named_mesh_from_buffers(
         &mut self,
         vertices: Vec<Vertex>,
@@ -207,21 +226,22 @@ impl AssetDatabase {
         } else {
             let result = self.add_mesh_from_buffers(vertices, indices);
             if result.is_ok() {
-                self.mesh_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+                self.mesh_names
+                    .insert(name.as_ref().to_string(), result.clone().unwrap());
             }
             result
         }
     }
 
-    pub fn add_texture_from_raw(
-        &mut self,
-        texture: Arc<ImageView>,
-    ) -> Result<TextureId, String> {
+    pub fn add_texture_from_raw(&mut self, texture: Arc<ImageView>) -> Result<TextureId, String> {
         let texture_id = TextureId(self.textures.len() as u32);
         self.textures.push(Texture { texture });
 
         for observer in &self.asset_database_change_observers {
-            observer.write().unwrap().on_texture_add(texture_id.clone(), self.textures.last().unwrap());
+            observer
+                .write()
+                .unwrap()
+                .on_texture_add(texture_id.clone(), self.textures.last().unwrap());
         }
 
         Ok(texture_id)
@@ -234,7 +254,7 @@ impl AssetDatabase {
         pixel_data: &[u8],
     ) -> Result<TextureId, String> {
         let texture = load_texture_from_buffer(
-            &self.memory_allocator,
+            self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
             self.queue.clone(),
             format,
@@ -244,7 +264,7 @@ impl AssetDatabase {
 
         self.add_texture_from_raw(texture)
     }
-    
+
     pub fn add_named_texture_from_buffer(
         &mut self,
         format: Format,
@@ -257,21 +277,19 @@ impl AssetDatabase {
         } else {
             let result = self.add_texture_from_buffer(format, dimensions, pixel_data);
             if result.is_ok() {
-                self.texture_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+                self.texture_names
+                    .insert(name.as_ref().to_string(), result.clone().unwrap());
             }
             result
         }
     }
 
-    pub fn add_texture_from_path(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<TextureId, String> {
+    pub fn add_texture_from_path(&mut self, path: impl AsRef<Path>) -> Result<TextureId, String> {
         let format = Format::R8G8B8A8_UNORM;
         let image = image::open(path).unwrap().into_rgba8();
         self.add_texture_from_buffer(format, image.dimensions().into(), &image)
     }
-    
+
     pub fn add_named_texture_from_path(
         &mut self,
         path: impl AsRef<Path>,
@@ -282,21 +300,22 @@ impl AssetDatabase {
         } else {
             let result = self.add_texture_from_path(path);
             if result.is_ok() {
-                self.texture_names.insert(name.as_ref().to_string(), result.clone().unwrap());
+                self.texture_names
+                    .insert(name.as_ref().to_string(), result.clone().unwrap());
             }
             result
         }
     }
 
-    pub fn add_cubemap_from_raw(
-        &mut self,
-        cubemap: Arc<ImageView>,
-    ) -> Result<CubemapId, String> {
+    pub fn add_cubemap_from_raw(&mut self, cubemap: Arc<ImageView>) -> Result<CubemapId, String> {
         let cubemap_id = CubemapId(self.cubemaps.len() as u32);
         self.cubemaps.push(Cubemap { cubemap });
-        
+
         for observer in &self.asset_database_change_observers {
-            observer.write().unwrap().on_cubemap_add(cubemap_id.clone(), self.cubemaps.last().unwrap());
+            observer
+                .write()
+                .unwrap()
+                .on_cubemap_add(cubemap_id.clone(), self.cubemaps.last().unwrap());
         }
 
         Ok(cubemap_id)
@@ -309,14 +328,14 @@ impl AssetDatabase {
         pixel_data: &[u8],
     ) -> Result<CubemapId, String> {
         let cubemap = load_cubemap_from_buffer(
-            &self.memory_allocator,
+            self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
             self.queue.clone(),
             format,
             dimensions.into(),
             pixel_data,
         )?;
-        
+
         self.add_cubemap_from_raw(cubemap)
     }
 
@@ -355,7 +374,6 @@ impl AssetDatabase {
                 dimensions = face.dimensions().into();
                 data.extend_from_slice(face.as_bytes());
             }
-            
         }
 
         self.add_cubemap_from_buffer(format, dimensions, &data)
@@ -387,7 +405,10 @@ impl AssetDatabase {
         });
 
         for observer in &self.asset_database_change_observers {
-            observer.write().unwrap().on_material_add(material_id.clone(), self.materials.last().unwrap());
+            observer
+                .write()
+                .unwrap()
+                .on_material_add(material_id.clone(), self.materials.last().unwrap());
         }
 
         Ok(material_id)
@@ -404,7 +425,7 @@ impl AssetDatabase {
     pub fn get_cubemap(&self, cubemap_id: CubemapId) -> Option<&Cubemap> {
         self.cubemaps.get(cubemap_id.0 as usize)
     }
-    
+
     pub fn get_material(&self, material_id: MaterialId) -> Option<&Material> {
         self.materials.get(material_id.0 as usize)
     }

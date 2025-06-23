@@ -12,7 +12,7 @@ use vulkano::{
 };
 
 pub fn load_mesh_from_buffers<VI, II, Vertex>(
-    memory_allocator: &Arc<impl MemoryAllocator + ?Sized>,
+    memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: &Arc<Queue>,
     vertices: VI,
@@ -28,12 +28,12 @@ where
     Vertex: vulkano::pipeline::graphics::vertex_input::Vertex,
 {
     let staging_vertex_buffer = Buffer::from_iter(
-        &memory_allocator,
-        &BufferCreateInfo {
+        memory_allocator.clone(),
+        BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
-        &AllocationCreateInfo {
+        AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
@@ -43,12 +43,12 @@ where
     .unwrap();
 
     let staging_index_buffer = Buffer::from_iter(
-        &memory_allocator,
-        &BufferCreateInfo {
+        memory_allocator.clone(),
+        BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
-        &AllocationCreateInfo {
+        AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
@@ -68,12 +68,12 @@ where
     .unwrap();
 
     builder
-        .copy_buffer(CopyBufferInfo::new(
+        .copy_buffer(CopyBufferInfo::buffers(
             staging_vertex_buffer,
             vertex_buffer,
         ))
         .unwrap()
-        .copy_buffer(CopyBufferInfo::new(
+        .copy_buffer(CopyBufferInfo::buffers(
             staging_index_buffer,
             index_buffer,
         ))
@@ -93,7 +93,7 @@ where
 }
 
 pub fn load_mesh_from_buffers_into_new_buffers<VI, II, Vertex>(
-    memory_allocator: &Arc<impl MemoryAllocator + ?Sized>,
+    memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: &Arc<Queue>,
     vertices: VI,
@@ -110,12 +110,12 @@ where
     let indices = indices.into_iter();
 
     let vertex_buffer = Buffer::new_slice(
-        &memory_allocator,
-        &BufferCreateInfo {
+        memory_allocator.clone(),
+        BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
             ..Default::default()
         },
-        &AllocationCreateInfo {
+        AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
@@ -124,12 +124,12 @@ where
     .unwrap();
 
     let index_buffer = Buffer::new_slice(
-        &memory_allocator,
-        &BufferCreateInfo {
+        memory_allocator.clone(),
+        BufferCreateInfo {
             usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
             ..Default::default()
         },
-        &AllocationCreateInfo {
+        AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
@@ -138,9 +138,9 @@ where
     .unwrap();
 
     load_mesh_from_buffers(
-        &memory_allocator,
+        memory_allocator,
         command_buffer_allocator,
-        &queue,
+        queue,
         vertices,
         indices,
         vertex_buffer.clone(),

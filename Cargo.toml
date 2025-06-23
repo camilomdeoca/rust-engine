@@ -17,12 +17,10 @@ image = "0.25.6"
 memory-stats = "1.2.0"
 
 [dependencies.vulkano]
-#version = "0.35.1"
-git = "https://github.com/vulkano-rs/vulkano"
+version = "0.35.1"
 
 [dependencies.vulkano-shaders]
-#version = "0.35.0"
-git = "https://github.com/vulkano-rs/vulkano"
+version = "0.35.0"
 
 [dependencies.sdl2]
 version = "0.37"

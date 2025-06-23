@@ -174,7 +174,7 @@ impl App {
             ..InstanceExtensions::from_iter(window.vulkan_instance_extensions().unwrap())
         };
 
-        let required_layers = vec!["VK_LAYER_KHRONOS_validation"];
+        let required_layers = vec!["VK_LAYER_KHRONOS_validation".to_string()];
 
         // Validate that required layers are available
         let available_layers_names: Vec<_> = library
@@ -195,13 +195,13 @@ impl App {
 
         // Now creating the instance.
         let instance = Instance::new(
-            &library,
-            &InstanceCreateInfo {
+            library,
+            InstanceCreateInfo {
                 // Enable enumerating devices that use non-conformant Vulkan implementations.
                 // (e.g. MoltenVK)
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions: &required_extensions,
-                enabled_layers: &required_layers,
+                enabled_extensions: required_extensions,
+                enabled_layers: required_layers,
                 ..Default::default()
             },
         )
@@ -214,8 +214,8 @@ impl App {
         let _debug_callback = Arc::new(
             unsafe {
                 DebugUtilsMessenger::new(
-                    &instance,
-                    &DebugUtilsMessengerCreateInfo {
+                    instance.clone(),
+                    DebugUtilsMessengerCreateInfo {
                         message_severity: DebugUtilsMessageSeverity::ERROR
                             | DebugUtilsMessageSeverity::WARNING
                             | DebugUtilsMessageSeverity::INFO
@@ -223,8 +223,8 @@ impl App {
                         message_type: DebugUtilsMessageType::GENERAL
                             | DebugUtilsMessageType::VALIDATION
                             | DebugUtilsMessageType::PERFORMANCE,
-                        ..DebugUtilsMessengerCreateInfo::new(
-                            &DebugUtilsMessengerCallback::new(debug_messenger_callback),
+                        ..DebugUtilsMessengerCreateInfo::user_callback(
+                            DebugUtilsMessengerCallback::new(debug_messenger_callback),
                         )
                     },
                 )
@@ -259,14 +259,14 @@ impl App {
         );
 
         let (device, mut queues) = Device::new(
-            &physical_device,
-            &DeviceCreateInfo {
-                enabled_extensions: &device_extensions,
-                queue_create_infos: &[QueueCreateInfo {
+            physical_device,
+            DeviceCreateInfo {
+                enabled_extensions: device_extensions,
+                queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
                 }],
-                enabled_features: &device_features,
+                enabled_features: device_features,
                 ..Default::default()
             },
         )
@@ -274,32 +274,32 @@ impl App {
 
         let queue = queues.next().unwrap();
 
-        let memory_allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));
+        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            &device,
-            &Default::default(),
+            device.clone(),
+            Default::default(),
         ));
 
-        let surface = unsafe { Surface::from_window_ref(&instance, &window) }.unwrap();
+        let surface = unsafe { Surface::from_window_ref(instance.clone(), &window) }.unwrap();
         
         let window_size = window.size();
 
         let (swapchain, images) = {
             let surface_capabilities = device
                 .physical_device()
-                .surface_capabilities(&surface, &Default::default())
+                .surface_capabilities(&surface, Default::default())
                 .unwrap();
 
             let (image_format, _) = device
                 .physical_device()
-                .surface_formats(&surface, &Default::default())
+                .surface_formats(&surface, Default::default())
                 .unwrap()[0];
 
             Swapchain::new(
-                &device,
-                &surface,
-                &SwapchainCreateInfo {
+                device.clone(),
+                surface.clone(),
+                SwapchainCreateInfo {
                     min_image_count: surface_capabilities.min_image_count.max(2),
                     image_format,
                     present_mode: PresentMode::Fifo,
@@ -342,8 +342,8 @@ impl App {
         println!("Loaded scene");
 
         let irradiance_map_image = Image::new(
-            &memory_allocator,
-            &ImageCreateInfo {
+            memory_allocator.clone(),
+            ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
                 extent: [32, 32, 1],
@@ -354,23 +354,23 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            &AllocationCreateInfo::default(),
+            AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created irradiance map image");
 
         let irradiance_map = ImageView::new(
-            &irradiance_map_image,
-            &ImageViewCreateInfo {
+            irradiance_map_image.clone(),
+            ImageViewCreateInfo {
                 view_type: ImageViewType::Cube,
-                ..ImageViewCreateInfo::from_image(&irradiance_map_image.clone())
+                ..ImageViewCreateInfo::from_image(&irradiance_map_image)
             },
         )
         .unwrap();
 
         let prefiltered_environment_map_image = Image::new(
-            &memory_allocator,
-            &ImageCreateInfo {
+            memory_allocator.clone(),
+            ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16B16A16_SFLOAT,
                 extent: [512, 512, 1],
@@ -382,23 +382,23 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            &AllocationCreateInfo::default(),
+            AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created prefiltered environment image");
 
         let prefiltered_environment_map = ImageView::new(
-            &prefiltered_environment_map_image,
-            &ImageViewCreateInfo {
+            prefiltered_environment_map_image.clone(),
+            ImageViewCreateInfo {
                 view_type: ImageViewType::Cube,
-                ..ImageViewCreateInfo::from_image(&prefiltered_environment_map_image.clone())
+                ..ImageViewCreateInfo::from_image(&prefiltered_environment_map_image)
             },
         )
         .unwrap();
 
         let environment_brdf_lut_image = Image::new(
-            &memory_allocator,
-            &ImageCreateInfo {
+            memory_allocator.clone(),
+            ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R16G16_SFLOAT,
                 extent: [512, 512, 1],
@@ -407,16 +407,16 @@ impl App {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            &AllocationCreateInfo::default(),
+            AllocationCreateInfo::default(),
         )
         .unwrap();
         println!("Created environment brdf lut");
 
         let environment_brdf_lut = ImageView::new(
-            &environment_brdf_lut_image,
-            &ImageViewCreateInfo {
+            environment_brdf_lut_image.clone(),
+            ImageViewCreateInfo {
                 view_type: ImageViewType::Dim2d,
-                ..ImageViewCreateInfo::from_image(&environment_brdf_lut_image.clone())
+                ..ImageViewCreateInfo::from_image(&environment_brdf_lut_image)
             },
         )
         .unwrap();
@@ -562,7 +562,7 @@ impl App {
                         win_event: WindowEvent::Resized(..),
                         ..
                     } => {
-                        //self.recreate_swapchain = true;
+                        self.recreate_swapchain = true;
                     }
                     _ => {}
                 }
@@ -622,7 +622,7 @@ impl App {
                 let images;
                 (self.swapchain, images) = self
                     .swapchain
-                    .recreate(&SwapchainCreateInfo {
+                    .recreate(SwapchainCreateInfo {
                         image_extent: window_size.into(),
                         ..self.swapchain.create_info()
                     })
@@ -685,7 +685,7 @@ impl App {
                 .unwrap()
                 .then_swapchain_present(
                     self.queue.clone(),
-                    SwapchainPresentInfo::new(self.swapchain.clone(), image_index),
+                    SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
                 )
                 .then_signal_fence_and_flush();
             drop(timer);
@@ -701,7 +701,7 @@ impl App {
                     None
                 }
             };
-            
+
             self.previous_fence_index = image_index;
 
             println!("{} FPS", 1.0 / start_frame_instant.elapsed().as_secs_f32());

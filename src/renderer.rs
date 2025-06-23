@@ -9,30 +9,21 @@ use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         Buffer, BufferCreateInfo, BufferUsage, Subbuffer,
-    },
-    command_buffer::{
+    }, command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
         DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
         SubpassBeginInfo, SubpassContents, SubpassEndInfo,
-    },
-    descriptor_set::{
+    }, descriptor_set::{
         allocator::StandardDescriptorSetAllocator,
         layout::{
-            DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding,
-            DescriptorSetLayoutCreateInfo, DescriptorType,
+            DescriptorBindingFlags, DescriptorType,
         },
         DescriptorSet, WriteDescriptorSet,
-    },
-    device::{Device, DeviceOwned, Queue},
-    format::Format,
-    image::{
+    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
         view::ImageView,
         Image, ImageCreateInfo, ImageType, ImageUsage,
-    },
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    padded::Padded,
-    pipeline::{
+    }, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, padded::Padded, pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
@@ -43,13 +34,10 @@ use vulkano::{
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
         },
-        layout::{push_constant_ranges_from_stages, PipelineLayoutCreateInfo},
+        layout::PipelineDescriptorSetLayoutCreateInfo,
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
-    },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    shader::{EntryPoint, ShaderStages},
-    DeviceSize,
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, DeviceSize
 };
 
 use crate::{
@@ -113,16 +101,16 @@ fn window_size_dependent_setup(
     let device = memory_allocator.device();
 
     let depth_buffer = ImageView::new_default(
-        &Image::new(
-            &memory_allocator,
-            &ImageCreateInfo {
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::D16_UNORM,
                 extent: images[0].extent(),
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
                 ..Default::default()
             },
-            &AllocationCreateInfo::default(),
+            AllocationCreateInfo::default(),
         )
         .unwrap(),
     )
@@ -131,12 +119,12 @@ fn window_size_dependent_setup(
     let framebuffers = images
         .iter()
         .map(|image| {
-            let view = ImageView::new_default(&image).unwrap();
+            let view = ImageView::new_default(image.clone()).unwrap();
 
             Framebuffer::new(
-                &render_pass,
-                &FramebufferCreateInfo {
-                    attachments: &[&view, &depth_buffer],
+                render_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![view, depth_buffer.clone()],
                     ..Default::default()
                 },
             )
@@ -147,139 +135,72 @@ fn window_size_dependent_setup(
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: [images[0].extent()[0] as f32, images[0].extent()[1] as f32],
-        min_depth: 0.0,
-        max_depth: 1.0,
+        depth_range: 0.0..=1.0,
     };
 
     let properties = device.physical_device().properties();
 
     let mesh_pipeline = {
         let mesh_pipeline_stages = [
-            PipelineShaderStageCreateInfo::new(&mesh_vs),
-            PipelineShaderStageCreateInfo::new(&mesh_fs),
+            PipelineShaderStageCreateInfo::new(mesh_vs.clone()),
+            PipelineShaderStageCreateInfo::new(mesh_fs.clone()),
         ];
-        let layout_create_info = PipelineLayoutCreateInfo {
-            set_layouts: &[
-                // Frame descriptor set (bound during the whole frame)
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
-                        }],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-                // Material descriptor set TODO: put in environment descriptor set because rarely
-                // changes
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
-                        }],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-                // Model descriptor set (model transformations and material_ids, changes every
-                // frame)
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::StorageBuffer)
-                        }],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-                // Env descriptor set (rebound when the skybox changes, not too often)
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            // Sampler
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::FRAGMENT,
-                                immutable_samplers: &[&sampler],
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
-                            },
-                            // irradiance_map
-                            DescriptorSetLayoutBinding {
-                                binding: 1,
-                                stages: ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                            },
-                            // prefiltered_environment_map
-                            DescriptorSetLayoutBinding {
-                                binding: 2,
-                                stages: ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                            },
-                            // environment_brdf_lut
-                            DescriptorSetLayoutBinding {
-                                binding: 3,
-                                stages: ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                            },
-                            // textures
-                            DescriptorSetLayoutBinding {
-                                binding: 4,
-                                binding_flags: DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-                                    | DescriptorBindingFlags::PARTIALLY_BOUND,
-                                stages: ShaderStages::FRAGMENT,
-                                descriptor_count: properties.max_descriptor_set_sampled_images - 3,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                            },
-                        ],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-            ],
-            push_constant_ranges: &push_constant_ranges_from_stages(&mesh_pipeline_stages),
-            ..Default::default()
-        };
+        let mut layout_create_info =
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
+        
+        // Env descriptor set (rebound when the skybox changes, not too often)
+        layout_create_info.set_layouts[3]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .immutable_samplers = vec![sampler.clone()];
+        layout_create_info.set_layouts[3]
+            .bindings
+            .get_mut(&4)
+            .unwrap()
+            .descriptor_count = properties.max_descriptor_set_samplers - 3;
+        layout_create_info.set_layouts[3]
+            .bindings
+            .get_mut(&4)
+            .unwrap()
+            .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT | DescriptorBindingFlags::PARTIALLY_BOUND;
 
-        let layout = PipelineLayout::new(&device, &layout_create_info).unwrap();
+        let layout = PipelineLayout::new(
+            device.clone(),
+            layout_create_info
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap();
 
-        let mesh_pass = Subpass::new(&render_pass, 0).unwrap();
+        let mesh_pass = Subpass::from(render_pass.clone(), 0).unwrap();
 
         GraphicsPipeline::new(
-            &device,
+            device.clone(),
             None,
-            &GraphicsPipelineCreateInfo {
-                stages: &mesh_pipeline_stages,
-                vertex_input_state: Some(&Vertex::per_vertex().definition(mesh_vs).unwrap()),
-                input_assembly_state: Some(&InputAssemblyState::default()),
-                viewport_state: Some(&ViewportState {
-                    viewports: &[viewport.clone()],
+            GraphicsPipelineCreateInfo {
+                stages: mesh_pipeline_stages.into_iter().collect(),
+                vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs).unwrap()),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState {
+                    viewports: [viewport.clone()].into_iter().collect(),
                     ..Default::default()
                 }),
-                rasterization_state: Some(&RasterizationState {
+                rasterization_state: Some(RasterizationState {
                     cull_mode: CullMode::Back,
                     ..Default::default()
                 }),
-                depth_stencil_state: Some(&DepthStencilState {
+                depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState::simple()),
                     ..Default::default()
                 }),
-                multisample_state: Some(&MultisampleState::default()),
-                color_blend_state: Some(&ColorBlendState {
-                    attachments: &[ColorBlendAttachmentState::default()],
-                    ..Default::default()
-                }),
-                subpass: Some((&mesh_pass).into()),
-                ..GraphicsPipelineCreateInfo::new(&layout)
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    mesh_pass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                subpass: Some(mesh_pass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
         .unwrap()
@@ -287,85 +208,64 @@ fn window_size_dependent_setup(
 
     let skybox_pipeline = {
         let stages = [
-            PipelineShaderStageCreateInfo::new(&skybox_vs),
-            PipelineShaderStageCreateInfo::new(&skybox_fs),
+            PipelineShaderStageCreateInfo::new(skybox_vs.clone()),
+            PipelineShaderStageCreateInfo::new(skybox_fs.clone()),
         ];
-        let layout_create_info = PipelineLayoutCreateInfo {
-            set_layouts: &[
-                // Env descriptor set (rebound when the skybox changes, not too often)
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[
-                            // Sampler
-                            DescriptorSetLayoutBinding {
-                                binding: 0,
-                                stages: ShaderStages::FRAGMENT,
-                                immutable_samplers: &[&sampler],
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::Sampler)
-                            },
-                            // irradiance_map
-                            DescriptorSetLayoutBinding {
-                                binding: 1,
-                                stages: ShaderStages::FRAGMENT,
-                                ..DescriptorSetLayoutBinding::new(DescriptorType::SampledImage)
-                            },
-                        ],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-                // Frame descriptor set (bound during the whole frame)
-                &DescriptorSetLayout::new(
-                    &device,
-                    &DescriptorSetLayoutCreateInfo {
-                        bindings: &[DescriptorSetLayoutBinding {
-                            binding: 0,
-                            stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                            ..DescriptorSetLayoutBinding::new(DescriptorType::UniformBuffer)
-                        }],
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-            ],
-            push_constant_ranges: &push_constant_ranges_from_stages(&stages),
-            ..Default::default()
-        };
+        let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
 
-        let layout = PipelineLayout::new(&device, &layout_create_info).unwrap();
+        // Env descriptor set (rebound when the skybox changes, not too often)
+        layout_create_info.set_layouts[0]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .immutable_samplers = vec![sampler.clone()];
 
-        let skybox_pass = Subpass::new(&render_pass, 1).unwrap();
+        // Frame descriptor set (bound during the whole frame)
+        layout_create_info.set_layouts[1]
+            .bindings
+            .get_mut(&0)
+            .unwrap()
+            .descriptor_type = DescriptorType::UniformBuffer;
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            layout_create_info
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let skybox_pass = Subpass::from(render_pass.clone(), 1).unwrap();
 
         GraphicsPipeline::new(
-            &device,
+            device.clone(),
             None,
-            &GraphicsPipelineCreateInfo {
-                stages: &stages,
-                vertex_input_state: Some(&Vertex::per_vertex().definition(skybox_vs).unwrap()),
-                input_assembly_state: Some(&InputAssemblyState::default()),
-                viewport_state: Some(&ViewportState {
-                    viewports: &[viewport.clone()],
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs).unwrap()),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState {
+                    viewports: [viewport.clone()].into_iter().collect(),
                     ..Default::default()
                 }),
-                rasterization_state: Some(&RasterizationState {
+                rasterization_state: Some(RasterizationState {
                     cull_mode: CullMode::None,
                     ..Default::default()
                 }),
-                depth_stencil_state: Some(&DepthStencilState {
+                depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState {
                         write_enable: false,
                         compare_op: CompareOp::LessOrEqual,
                     }),
                     ..Default::default()
                 }),
-                multisample_state: Some(&MultisampleState::default()),
-                color_blend_state: Some(&ColorBlendState {
-                    attachments: &[ColorBlendAttachmentState::default()],
-                    ..Default::default()
-                }),
-                subpass: Some((&skybox_pass).into()),
-                ..GraphicsPipelineCreateInfo::new(&layout)
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    skybox_pass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                subpass: Some(skybox_pass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
         .unwrap()
@@ -387,18 +287,18 @@ impl Renderer {
         images: &[Arc<Image>],
     ) -> (Self, Vec<Arc<Framebuffer>>) {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            &device,
-            &Default::default(),
+            device.clone(),
+            Default::default(),
         ));
 
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            &device,
-            &Default::default(),
+            device.clone(),
+            Default::default(),
         ));
 
         let uniform_buffer_allocator = SubbufferAllocator::new(
-            &memory_allocator,
-            &SubbufferAllocatorCreateInfo {
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::UNIFORM_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
@@ -407,8 +307,8 @@ impl Renderer {
         );
 
         let storage_buffer_allocator = SubbufferAllocator::new(
-            &memory_allocator,
-            &SubbufferAllocatorCreateInfo {
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
@@ -417,8 +317,8 @@ impl Renderer {
         );
 
         let indirect_buffer_allocator = SubbufferAllocator::new(
-            &memory_allocator,
-            &SubbufferAllocatorCreateInfo {
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
@@ -427,7 +327,7 @@ impl Renderer {
         );
 
         let render_pass = vulkano::ordered_passes_renderpass!(
-            &device,
+            device.clone(),
             attachments: {
                 color: {
                     format: images[0].format(),
@@ -459,29 +359,29 @@ impl Renderer {
         )
         .unwrap();
 
-        let mesh_vs = mesh_shaders::vs::load(&device)
+        let mesh_vs = mesh_shaders::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let mesh_fs = mesh_shaders::fs::load(&device)
+        let mesh_fs = mesh_shaders::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let skybox_vs = skybox_shaders::vs::load(&device)
+        let skybox_vs = skybox_shaders::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let skybox_fs = skybox_shaders::fs::load(&device)
+        let skybox_fs = skybox_shaders::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
 
         let sampler = Sampler::new(
-            &device,
-            &SamplerCreateInfo {
+            device.clone(),
+            SamplerCreateInfo {
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
-                max_lod: LOD_CLAMP_NONE,
+                lod: 0.0..=LOD_CLAMP_NONE,
                 address_mode: [SamplerAddressMode::Repeat; 3],
                 ..Default::default()
             },
@@ -500,7 +400,7 @@ impl Renderer {
         );
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
-            &memory_allocator,
+            memory_allocator.clone(),
             command_buffer_allocator.clone(),
             &queue,
             vec![
@@ -658,12 +558,12 @@ impl Renderer {
         });
 
         let materials_storage_buffer = Buffer::from_iter(
-            &memory_allocator,
-            &BufferCreateInfo {
+            memory_allocator.clone(),
+            BufferCreateInfo {
                 usage: BufferUsage::STORAGE_BUFFER,
                 ..Default::default()
             },
-            &AllocationCreateInfo {
+            AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
