@@ -16,20 +16,14 @@ mod profile;
 
 use assets::{database::AssetDatabase, loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene}};
 use camera::Camera;
-use ecs::components::{self, EnvironmentCubemap};
+use ecs::components::EnvironmentCubemap;
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use profile::ProfileTimer;
 use renderer::Renderer;
-use sdl2::{
-    event::{Event, WindowEvent},
-    keyboard::{Keycode, Scancode},
-    mouse::MouseButton,
-    video::Window,
-    Sdl,
-};
-use std::{sync::{Arc, RwLock}, time::Instant};
+use winit::{application::ApplicationHandler, event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, RawKeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, raw_window_handle::HasDisplayHandle, window::{CursorGrabMode, Window, WindowId}};
+use std::{collections::HashMap, error::Error, sync::{Arc, RwLock}, time::Instant};
 use vulkano::{
     command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage}, device::{
         physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags
@@ -46,31 +40,39 @@ use vulkano::{
     }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, render_pass::Framebuffer, swapchain::{acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo}, sync::{self, GpuFuture}, DeviceSize, Validated, VulkanError, VulkanLibrary
 };
 
-fn main() {
-    let mut app = App::new();
-    app.run();
+fn main() -> Result<(), impl Error> {
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::new(&event_loop);
+
+    event_loop.run_app(&mut app)
 }
 
-struct App {
-    _instance: Arc<Instance>,
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-
-    world: World,
-    asset_database: Arc<RwLock<AssetDatabase>>,
-    renderer: Arc<RwLock<Renderer>>,
-    camera: Camera,
-    sdl_context: Sdl,
-    _debug_callback: Arc<DebugUtilsMessenger>,
-
+struct RenderingContext {
+    window: Arc<Window>,
     swapchain: Arc<Swapchain>,
     framebuffers_for_3d_renderer: Vec<Arc<Framebuffer>>,
     recreate_swapchain: bool,
     fences: Vec<Option<Box<dyn GpuFuture>>>,
     previous_fence_index: u32,
-    window: Arc<Window>, // The window has to be dropped after the fences for some reason :)
-                         // Probably a SDL2 issue
+    renderer: Arc<RwLock<Renderer>>,
+    start_frame_instant: Instant,
+    captured: bool,
+}
+
+struct App {
+    instance: Arc<Instance>,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+
+    world: World,
+    asset_database: Arc<RwLock<AssetDatabase>>,
+    camera: Camera,
+    _debug_callback: Arc<DebugUtilsMessenger>,
+
+    rendering_context: Option<RenderingContext>,
+    keys_state: HashMap<KeyCode, bool>,
 }
 
 // DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessengerCallbackData<'_>
@@ -120,7 +122,7 @@ fn debug_messenger_callback(
 fn select_physical_device(
     instance: Arc<Instance>,
     device_extensions: DeviceExtensions,
-    _window: Arc<Window>,
+    event_loop: &impl HasDisplayHandle,
 ) -> Result<(Arc<PhysicalDevice>, u32), &'static str> {
     return instance
         .enumerate_physical_devices()
@@ -135,9 +137,9 @@ fn select_physical_device(
                 .queue_family_properties()
                 .iter()
                 .enumerate()
-                .position(|(_i, queue)| {
+                .position(|(i, queue)| {
                     queue.queue_flags.intersects(QueueFlags::GRAPHICS)
-                    //&& candidate_physical_device.presentation_support(i as u32, &window).unwrap_or(false) // TODO: Make this work
+                    && candidate_physical_device.presentation_support(i as u32, event_loop).unwrap_or(false) // TODO: Make this work
                 })
                 .map(|i| (candidate_physical_device, i as u32))
         })
@@ -155,23 +157,12 @@ fn select_physical_device(
 }
 
 impl App {
-    fn new() -> Self {
-        let sdl_context = sdl2::init().unwrap();
-        let video_subsystem = sdl_context.video().unwrap();
+    fn new(event_loop: &EventLoop<()>) -> Self {
         let library = VulkanLibrary::new().unwrap();
-
-        let window = Arc::new(
-            video_subsystem
-                .window("Window name", 1280, 720)
-                .resizable()
-                .vulkan()
-                .build()
-                .unwrap(),
-        );
 
         let required_extensions = InstanceExtensions {
             ext_debug_utils: true,
-            ..InstanceExtensions::from_iter(window.vulkan_instance_extensions().unwrap())
+            ..Surface::required_extensions(event_loop).unwrap()
         };
 
         let required_layers = vec!["VK_LAYER_KHRONOS_validation".to_string()];
@@ -250,7 +241,7 @@ impl App {
         };
 
         let (physical_device, queue_family_index) =
-            select_physical_device(instance.clone(), device_extensions, window.clone()).unwrap();
+            select_physical_device(instance.clone(), device_extensions, event_loop).unwrap();
 
         println!(
             "Using device: {} (type: {:?})",
@@ -280,41 +271,6 @@ impl App {
             device.clone(),
             Default::default(),
         ));
-
-        let surface = unsafe { Surface::from_window_ref(instance.clone(), &window) }.unwrap();
-        
-        let window_size = window.size();
-
-        let (swapchain, images) = {
-            let surface_capabilities = device
-                .physical_device()
-                .surface_capabilities(&surface, Default::default())
-                .unwrap();
-
-            let (image_format, _) = device
-                .physical_device()
-                .surface_formats(&surface, Default::default())
-                .unwrap()[0];
-
-            Swapchain::new(
-                device.clone(),
-                surface.clone(),
-                SwapchainCreateInfo {
-                    min_image_count: surface_capabilities.min_image_count.max(2),
-                    image_format,
-                    present_mode: PresentMode::Fifo,
-                    image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
-                    composite_alpha: surface_capabilities
-                        .supported_composite_alpha
-                        .into_iter()
-                        .next()
-                        .unwrap(),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        };
 
         let world = World::new();
 
@@ -465,31 +421,16 @@ impl App {
         });
         drop(asset_database_write);
 
-        let (renderer, framebuffers_for_3d_renderer) = {
-            let (renderer, framebuffers) = Renderer::new(
-                device.clone(),
-                queue.clone(),
-                asset_database.clone(),
-                memory_allocator.clone(),
-                world.clone(),
-                &images,
-            );
-            (Arc::new(RwLock::new(renderer)), framebuffers)
-        };
-
-        let frames_in_flight = images.len();
-        let mut fences = vec![];
-        for _ in 0..frames_in_flight { fences.push(None); }
-
-        {
-            asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
-        }
+        // {
+        //     asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
+        // }
         println!("Initialized renderer");
 
         App {
-            _instance: instance,
+            instance,
             device,
             queue,
+            memory_allocator,
             command_buffer_allocator,
             world,
             asset_database,
@@ -498,216 +439,294 @@ impl App {
                 rotation: Quat::from_euler(EulerRot::YXZ, 0.0, 0.0, 0.0),
                 fov: 90f32.to_radians(),
             },
-            sdl_context,
             _debug_callback,
-            renderer,
+            rendering_context: None,
+            keys_state: HashMap::new(),
+        }
+    }
+}
 
-            swapchain,
-            framebuffers_for_3d_renderer,
-            recreate_swapchain: false,
-            fences,
-            previous_fence_index: 0,
-            window,
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.rendering_context.is_none() {
+            let window = Arc::new(
+                event_loop.create_window(Window::default_attributes()).unwrap()
+            );
+
+            let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
+            let window_size = window.inner_size();
+
+            let (swapchain, images) = {
+                let surface_capabilities = self.device
+                    .physical_device()
+                    .surface_capabilities(&surface, Default::default())
+                    .unwrap();
+
+                let (image_format, _) = self.device
+                    .physical_device()
+                    .surface_formats(&surface, Default::default())
+                    .unwrap()[0];
+
+                Swapchain::new(
+                    self.device.clone(),
+                    surface.clone(),
+                    SwapchainCreateInfo {
+                        min_image_count: surface_capabilities.min_image_count.max(2),
+                        image_format,
+                        present_mode: PresentMode::Fifo,
+                        image_extent: window_size.into(),
+                        image_usage: ImageUsage::COLOR_ATTACHMENT,
+                        composite_alpha: surface_capabilities
+                            .supported_composite_alpha
+                            .into_iter()
+                            .next()
+                            .unwrap(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            };
+
+            let (renderer, framebuffers_for_3d_renderer) = {
+                let (renderer, framebuffers) = Renderer::new(
+                    self.device.clone(),
+                    self.queue.clone(),
+                    self.asset_database.clone(),
+                    self.memory_allocator.clone(),
+                    self.world.clone(),
+                    &images,
+                );
+                (Arc::new(RwLock::new(renderer)), framebuffers)
+            };
+
+            let frames_in_flight = images.len();
+            let mut fences = vec![];
+            for _ in 0..frames_in_flight { fences.push(None); }
+
+            self.rendering_context = Some(
+                RenderingContext {
+                    window,
+                    swapchain,
+                    framebuffers_for_3d_renderer,
+                    recreate_swapchain: false,
+                    fences,
+                    previous_fence_index: 0,
+                    renderer,
+                    start_frame_instant: Instant::now(),
+                    captured: false,
+                }
+            );
         }
     }
 
-    fn run(&mut self) {
-        let mut event_pump = self.sdl_context.event_pump().unwrap();
-        let mut captured = false;
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        match event {
+            DeviceEvent::Key(RawKeyEvent {
+                physical_key: PhysicalKey::Code(KeyCode::KeyQ),
+                state: ElementState::Pressed,
+            }) => {
+                event_loop.exit()
+            }
+            DeviceEvent::Key(RawKeyEvent {
+                physical_key: PhysicalKey::Code(key_code),
+                state,
+            }) => {
+                self.keys_state.insert(key_code, state == ElementState::Pressed);
+            }
+            DeviceEvent::MouseMotion { delta } => {
+                if self.rendering_context.as_ref().unwrap().captured {
+                    let sensitivity = 0.5f32;
 
-        let mut start_frame_instant = Instant::now();
+                    let yaw = Quat::from_rotation_y(-delta.0 as f32 * sensitivity * 0.01);
+                    let pitch = Quat::from_rotation_x(-delta.1 as f32 * sensitivity * 0.01);
 
-        'running: loop {
-            for event in event_pump.poll_iter() {
-                match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Q),
-                        ..
-                    } => {
-                        break 'running;
-                    }
-                    Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => {
-                        captured = !captured;
-                        self.sdl_context.mouse().set_relative_mouse_mode(captured);
-                    }
-                    Event::MouseButtonDown {
-                        mouse_btn: MouseButton::Left,
-                        ..
-                    } => {
-                        captured = true;
-                        self.sdl_context.mouse().set_relative_mouse_mode(captured);
-                    }
-                    Event::MouseMotion {
-                        timestamp: _timestamp,
-                        window_id: _window_id,
-                        which: _which,
-                        mousestate: _mousestate,
-                        x: _x,
-                        y: _y,
-                        xrel,
-                        yrel,
-                    } if captured => {
-                        let sensitivity = 0.5f32;
-
-                        let yaw = Quat::from_rotation_y(-xrel as f32 * sensitivity * 0.01);
-                        let pitch = Quat::from_rotation_x(-yrel as f32 * sensitivity * 0.01);
-
-                        self.camera.rotation = yaw * self.camera.rotation * pitch;
-                    }
-                    Event::Window {
-                        win_event: WindowEvent::Resized(..),
-                        ..
-                    } => {
-                        self.recreate_swapchain = true;
-                    }
-                    _ => {}
+                    self.camera.rotation = yaw * self.camera.rotation * pitch;
                 }
             }
-
-            if captured {
-                let keyboard_state = event_pump.keyboard_state();
-                let speed = 5f32;
-                let forward = -(self.camera.rotation * Vec3::Z);
-                let right = self.camera.rotation * Vec3::X;
-                let mut direction = Vec3::ZERO;
-
-                if keyboard_state.is_scancode_pressed(Scancode::W) {
-                    direction += forward;
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::S) {
-                    direction -= forward;
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::A) {
-                    direction -= right;
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::D) {
-                    direction += right;
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::Space) {
-                    direction += Vec3::Y;
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::LShift) {
-                    direction -= Vec3::Y;
-                }
-
-                if direction.length_squared() > 0.0 {
-                    direction = direction.normalize();
-                }
-                self.camera.position += direction * speed * 0.01;
-
-                if keyboard_state.is_scancode_pressed(Scancode::Right) {
-                    self.world
-                        .lookup("DamagedHelmet")
-                        .get::<&mut components::Transform>(|transform| {
-                            transform.rotation =
-                                Quat::from_rotation_y(1f32.to_radians()) * transform.rotation;
-                        });
-                }
-                if keyboard_state.is_scancode_pressed(Scancode::Left) {
-                    self.world
-                        .lookup("DamagedHelmet")
-                        .get::<&mut components::Transform>(|transform| {
-                            transform.rotation =
-                                Quat::from_rotation_y(-1f32.to_radians()) * transform.rotation;
-                        });
-                }
+            DeviceEvent::MouseWheel { delta: _delta } => {
+                // TODO: zoom
             }
+            _ => {}
+        }
+    }
 
-            if self.recreate_swapchain {
-                let window_size = self.window.size();
-                let images;
-                (self.swapchain, images) = self
-                    .swapchain
-                    .recreate(SwapchainCreateInfo {
-                        image_extent: window_size.into(),
-                        ..self.swapchain.create_info()
-                    })
-                    .expect("Failed to recreate swapchain");
-                self.framebuffers_for_3d_renderer = self.renderer.write().unwrap().resize(images);
-                self.recreate_swapchain = false;
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let rcx = self.rendering_context.as_mut().unwrap();
+        match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::KeyQ),
+                    state: ElementState::Pressed,
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                event_loop.exit();
             }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                    state: ElementState::Pressed,
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                rcx.captured = !rcx.captured;
+                rcx.window.set_cursor_grab(if rcx.captured { CursorGrabMode::Confined } else { CursorGrabMode::None }).unwrap();
+                rcx.window.set_cursor_visible(!rcx.captured);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                rcx.captured = true;
+                rcx.window.set_cursor_grab(if rcx.captured { CursorGrabMode::Confined } else { CursorGrabMode::None }).unwrap();
+                rcx.window.set_cursor_visible(!rcx.captured);
+            }
+            WindowEvent::Resized(..) => {
+                rcx.recreate_swapchain = true;
+            }
+            WindowEvent::RedrawRequested => {
+                if rcx.captured {
+                    let speed = 5f32;
+                    let forward = -(self.camera.rotation * Vec3::Z);
+                    let right = self.camera.rotation * Vec3::X;
+                    let mut direction = Vec3::ZERO;
 
-            let (image_index, suboptimal, acquire_future) =
-                match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
-                    Ok(r) => r,
+                    if self.keys_state.get(&KeyCode::KeyW).cloned().unwrap_or(false) {
+                        direction += forward;
+                    }
+                    if self.keys_state.get(&KeyCode::KeyS).cloned().unwrap_or(false) {
+                        direction -= forward;
+                    }
+                    if self.keys_state.get(&KeyCode::KeyA).cloned().unwrap_or(false) {
+                        direction -= right;
+                    }
+                    if self.keys_state.get(&KeyCode::KeyD).cloned().unwrap_or(false) {
+                        direction += right;
+                    }
+                    if self.keys_state.get(&KeyCode::Space).cloned().unwrap_or(false) {
+                        direction += Vec3::Y;
+                    }
+                    if self.keys_state.get(&KeyCode::ShiftLeft).cloned().unwrap_or(false) {
+                        direction -= Vec3::Y;
+                    }
+
+                    if direction.length_squared() > 0.0 {
+                        direction = direction.normalize();
+                    }
+                    self.camera.position += direction * speed * 0.01;
+                }
+
+                if rcx.recreate_swapchain {
+                    let window_size = rcx.window.inner_size();
+                    let images;
+                    (rcx.swapchain, images) = rcx
+                        .swapchain
+                        .recreate(SwapchainCreateInfo {
+                            image_extent: window_size.into(),
+                            ..rcx.swapchain.create_info()
+                        })
+                        .expect("Failed to recreate swapchain");
+                    rcx.framebuffers_for_3d_renderer = rcx.renderer.write().unwrap().resize(images);
+                    rcx.recreate_swapchain = false;
+                }
+
+                let (image_index, suboptimal, acquire_future) =
+                    match acquire_next_image(rcx.swapchain.clone(), None).map_err(Validated::unwrap) {
+                        Ok(r) => r,
+                        Err(VulkanError::OutOfDate) => {
+                            rcx.recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("failed to acquire next image: {e}"),
+                    };
+
+                if suboptimal { rcx.recreate_swapchain = true; }
+
+                let timer = ProfileTimer::start("cleanup_finished");
+                let previous_future = match rcx.fences[rcx.previous_fence_index as usize].take() {
+                    // Create a NowFuture
+                    None => {
+                        let mut now = sync::now(self.device.clone());
+                        now.cleanup_finished();
+
+                        now.boxed()
+                    }
+                    // Use the existing FenceSignalFuture
+                    Some(mut fence) => {
+                        fence.cleanup_finished();
+                        fence.boxed()
+                    },
+                };
+                drop(timer);
+
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    self.command_buffer_allocator.clone(),
+                    self.queue.queue_family_index(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )
+                .unwrap();
+
+                rcx.renderer.write().unwrap()
+                    .draw(
+                        &mut builder,
+                        &rcx.framebuffers_for_3d_renderer[image_index as usize],
+                        &self.camera
+                    );
+
+                let timer = ProfileTimer::start("build");
+                let command_buffer = builder.build().unwrap();
+                drop(timer);
+
+                let timer = ProfileTimer::start("present");
+                let future = previous_future
+                    .join(acquire_future)
+                    .then_execute(self.queue.clone(), command_buffer)
+                    .unwrap()
+                    .then_swapchain_present(
+                        self.queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
+                    )
+                    .then_signal_fence_and_flush();
+                drop(timer);
+
+                rcx.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
+                    Ok(value) => Some(value.boxed()),
                     Err(VulkanError::OutOfDate) => {
-                        self.recreate_swapchain = true;
-                        continue;
+                        rcx.recreate_swapchain = true;
+                        None
                     }
-                    Err(e) => panic!("failed to acquire next image: {e}"),
+                    Err(e) => {
+                        println!("failed to flush future: {e}");
+                        None
+                    }
                 };
 
-            if suboptimal { self.recreate_swapchain = true; }
+                rcx.previous_fence_index = image_index;
 
-            let timer = ProfileTimer::start("cleanup_finished");
-            let previous_future = match self.fences[self.previous_fence_index as usize].take() {
-                // Create a NowFuture
-                None => {
-                    let mut now = sync::now(self.device.clone());
-                    now.cleanup_finished();
-
-                    now.boxed()
-                }
-                // Use the existing FenceSignalFuture
-                Some(mut fence) => {
-                    fence.cleanup_finished();
-                    fence.boxed()
-                },
-            };
-            drop(timer);
-
-            let mut builder = AutoCommandBufferBuilder::primary(
-                self.command_buffer_allocator.clone(),
-                self.queue.queue_family_index(),
-                CommandBufferUsage::OneTimeSubmit,
-            )
-            .unwrap();
-
-            self.renderer.write().unwrap()
-                .draw(
-                    &mut builder,
-                    &self.framebuffers_for_3d_renderer[image_index as usize],
-                    &self.camera
-                );
-
-            let timer = ProfileTimer::start("build");
-            let command_buffer = builder.build().unwrap();
-            drop(timer);
-
-            let timer = ProfileTimer::start("present");
-            let future = previous_future
-                .join(acquire_future)
-                .then_execute(self.queue.clone(), command_buffer)
-                .unwrap()
-                .then_swapchain_present(
-                    self.queue.clone(),
-                    SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
-                )
-                .then_signal_fence_and_flush();
-            drop(timer);
-
-            self.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
-                Ok(value) => Some(value.boxed()),
-                Err(VulkanError::OutOfDate) => {
-                    self.recreate_swapchain = true;
-                    None
-                }
-                Err(e) => {
-                    println!("failed to flush future: {e}");
-                    None
-                }
-            };
-
-            self.previous_fence_index = image_index;
-
-            println!("{} FPS", 1.0 / start_frame_instant.elapsed().as_secs_f32());
-            start_frame_instant = Instant::now();
-
-            //::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
+                println!("{} FPS", 1.0 / rcx.start_frame_instant.elapsed().as_secs_f32());
+                rcx.start_frame_instant = Instant::now();
+            }
+            _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.rendering_context.as_ref().unwrap().window.request_redraw();
     }
 }
