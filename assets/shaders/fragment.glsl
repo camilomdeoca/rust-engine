@@ -264,8 +264,10 @@ void main()
 
     // HDR tonemapping
     color = color / (color + vec3(1.0));
-    // gamma correct
-    color = pow(color, vec3(1.0/2.2)); 
+
+    // gamma correct TODO: Make it toggleable because egui expects no gamma correction but when
+    // rendering to the screen it needs to be working
+    //color = pow(color, vec3(1.0/2.2)); 
 
     f_color = vec4(color, base_color.a);
 }
