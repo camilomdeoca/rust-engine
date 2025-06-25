@@ -11,33 +11,67 @@ mod assets;
 mod camera;
 mod ecs;
 mod image_based_lighting_maps_generator;
-mod renderer;
 mod profile;
+mod renderer;
 
-use assets::{database::AssetDatabase, loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene}};
+use assets::{
+    database::AssetDatabase,
+    loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
+};
 use camera::Camera;
 use ecs::components::EnvironmentCubemap;
+use egui::{load::SizedTexture, ImageData, ImageSource, Vec2};
+use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use profile::ProfileTimer;
 use renderer::Renderer;
-use winit::{application::ApplicationHandler, event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, RawKeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, raw_window_handle::HasDisplayHandle, window::{CursorGrabMode, Window, WindowId}};
-use std::{collections::HashMap, error::Error, sync::{Arc, RwLock}, time::Instant};
+use std::{
+    collections::HashMap,
+    error::Error,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 use vulkano::{
-    command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage}, device::{
-        physical::{PhysicalDevice, PhysicalDeviceType}, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags
-    }, format::Format, image::{
+    command_buffer::{
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
+    },
+    device::{
+        physical::{PhysicalDevice, PhysicalDeviceType},
+        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo,
+        QueueFlags,
+    },
+    format::Format,
+    image::{
+        sampler::SamplerCreateInfo,
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
-    }, instance::{
+    },
+    instance::{
         debug::{
             DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
             DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData,
             DebugUtilsMessengerCreateInfo,
         },
         Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
-    }, memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator}, render_pass::Framebuffer, swapchain::{acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo}, sync::{self, GpuFuture}, DeviceSize, Validated, VulkanError, VulkanLibrary
+    },
+    memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
+    render_pass::Framebuffer,
+    swapchain::{
+        acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
+        SwapchainPresentInfo,
+    },
+    sync::{self, GpuFuture},
+    DeviceSize, Validated, VulkanError, VulkanLibrary,
+};
+use winit::{
+    application::ApplicationHandler,
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, RawKeyEvent, WindowEvent},
+    event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    raw_window_handle::HasDisplayHandle,
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 fn main() -> Result<(), impl Error> {
@@ -50,13 +84,17 @@ fn main() -> Result<(), impl Error> {
 struct RenderingContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
+    swapchain_image_views: Vec<Arc<ImageView>>,
+    image_views_for_framebuffers_3d_renderer: Vec<Arc<ImageView>>,
+    egui_texture_ids_for_image_views_for_framebuffers_3d_renderer: Vec<egui::TextureId>,
     framebuffers_for_3d_renderer: Vec<Arc<Framebuffer>>,
     recreate_swapchain: bool,
     fences: Vec<Option<Box<dyn GpuFuture>>>,
     previous_fence_index: u32,
     renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
-    captured: bool,
+    is_mouse_captured: bool,
+    gui: Gui,
 }
 
 struct App {
@@ -139,7 +177,9 @@ fn select_physical_device(
                 .enumerate()
                 .position(|(i, queue)| {
                     queue.queue_flags.intersects(QueueFlags::GRAPHICS)
-                    && candidate_physical_device.presentation_support(i as u32, event_loop).unwrap_or(false) // TODO: Make this work
+                        && candidate_physical_device
+                            .presentation_support(i as u32, event_loop)
+                            .unwrap_or(false) // TODO: Make this work
                 })
                 .map(|i| (candidate_physical_device, i as u32))
         })
@@ -174,10 +214,9 @@ impl App {
             .map(|layer_properties| layer_properties.name().to_string())
             .collect();
 
-        if let Some(not_found_layer_name) = required_layers
-            .iter()
-            .find(|required_layer_name| !available_layers_names.contains(&required_layer_name.to_string()))
-        {
+        if let Some(not_found_layer_name) = required_layers.iter().find(|required_layer_name| {
+            !available_layers_names.contains(&required_layer_name.to_string())
+        }) {
             panic!(
                 "Required validation layer: \"{}\" is missing.",
                 not_found_layer_name
@@ -197,7 +236,7 @@ impl App {
             },
         )
         .unwrap();
-        
+
         // After creating the instance we must register the debug callback.
         //
         // NOTE: If you let this debug_callback binding fall out of scope then the callback will stop
@@ -266,7 +305,7 @@ impl App {
         let queue = queues.next().unwrap();
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-        
+
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
             Default::default(),
@@ -274,27 +313,25 @@ impl App {
 
         let world = World::new();
 
-
         let (vertex_count, index_count) = count_vertices_and_indices_in_gltf_scene(
             "assets/meshes/Bistro_with_tangents_all.glb",
             //"assets/meshes/DamagedHelmet.glb",
         );
 
-        let asset_database = Arc::new(RwLock::new(
-            AssetDatabase::new(
-                queue.clone(),
-                memory_allocator.clone(),
-                vertex_count as DeviceSize,
-                index_count as DeviceSize,
-            )
-        ));
-        
+        let asset_database = Arc::new(RwLock::new(AssetDatabase::new(
+            queue.clone(),
+            memory_allocator.clone(),
+            vertex_count as DeviceSize,
+            index_count as DeviceSize,
+        )));
+
         load_gltf_scene(
             "assets/meshes/Bistro_with_tangents_all.glb",
             //"assets/meshes/DamagedHelmet.glb",
             world.clone(),
             asset_database.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         println!("Loaded scene");
 
         let irradiance_map_image = Image::new(
@@ -378,17 +415,16 @@ impl App {
         .unwrap();
 
         let environment_map_id = asset_database
-            .write().unwrap()
-            .add_cubemap_from_path(
-                [
-                    "assets/cubemaps/skybox/px.hdr",
-                    "assets/cubemaps/skybox/nx.hdr",
-                    "assets/cubemaps/skybox/py.hdr",
-                    "assets/cubemaps/skybox/ny.hdr",
-                    "assets/cubemaps/skybox/pz.hdr",
-                    "assets/cubemaps/skybox/nz.hdr",
-                ],
-            )
+            .write()
+            .unwrap()
+            .add_cubemap_from_path([
+                "assets/cubemaps/skybox/px.hdr",
+                "assets/cubemaps/skybox/nx.hdr",
+                "assets/cubemaps/skybox/py.hdr",
+                "assets/cubemaps/skybox/ny.hdr",
+                "assets/cubemaps/skybox/pz.hdr",
+                "assets/cubemaps/skybox/nz.hdr",
+            ])
             .unwrap();
         println!("Loaded skybox");
 
@@ -400,9 +436,13 @@ impl App {
         );
 
         irradiance_map_renderer.render_to_image(
-            asset_database.read().unwrap()
+            asset_database
+                .read()
+                .unwrap()
                 .get_cubemap(environment_map_id.clone())
-                .unwrap().cubemap.clone(),
+                .unwrap()
+                .cubemap
+                .clone(),
             irradiance_map_image.clone(),
             prefiltered_environment_map_image.clone(),
             environment_brdf_lut_image.clone(),
@@ -413,11 +453,14 @@ impl App {
         world.set(EnvironmentCubemap {
             environment_map: environment_map_id,
             irradiance_map: asset_database_write
-                .add_cubemap_from_raw(irradiance_map.clone()).unwrap(),
+                .add_cubemap_from_raw(irradiance_map.clone())
+                .unwrap(),
             prefiltered_environment_map: asset_database_write
-                .add_cubemap_from_raw(prefiltered_environment_map.clone()).unwrap(),
+                .add_cubemap_from_raw(prefiltered_environment_map.clone())
+                .unwrap(),
             environment_brdf_lut: asset_database_write
-                .add_cubemap_from_raw(environment_brdf_lut.clone()).unwrap(),
+                .add_cubemap_from_raw(environment_brdf_lut.clone())
+                .unwrap(),
         });
         drop(asset_database_write);
 
@@ -450,19 +493,23 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.rendering_context.is_none() {
             let window = Arc::new(
-                event_loop.create_window(Window::default_attributes()).unwrap()
+                event_loop
+                    .create_window(Window::default_attributes())
+                    .unwrap(),
             );
 
             let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
             let window_size = window.inner_size();
 
             let (swapchain, images) = {
-                let surface_capabilities = self.device
+                let surface_capabilities = self
+                    .device
                     .physical_device()
                     .surface_capabilities(&surface, Default::default())
                     .unwrap();
 
-                let (image_format, _) = self.device
+                let (image_format, _) = self
+                    .device
                     .physical_device()
                     .surface_formats(&surface, Default::default())
                     .unwrap()[0];
@@ -487,6 +534,40 @@ impl ApplicationHandler for App {
                 .unwrap()
             };
 
+            let frames_in_flight = images.len();
+
+            println!("FRAMES IN FLIGHT {frames_in_flight}");
+
+            let swapchain_image_views: Vec<_> = images
+                .iter()
+                .map(|image| ImageView::new_default(image.clone()).unwrap())
+                .collect();
+
+            // 3d Renderer doesnt render directly to the swapchain, it renders to a texture that
+            // later egui renders in a widget in the screen
+            let mut image_views_for_framebuffers_3d_renderer = Vec::with_capacity(frames_in_flight);
+            for _ in 0..frames_in_flight {
+                image_views_for_framebuffers_3d_renderer.push(
+                    ImageView::new_default(
+                        Image::new(
+                            self.memory_allocator.clone(),
+                            ImageCreateInfo {
+                                image_type: ImageType::Dim2d,
+                                format: Format::R8G8B8A8_UNORM,
+                                extent: [512, 512, 1],
+                                usage: ImageUsage::TRANSFER_DST
+                                    | ImageUsage::SAMPLED
+                                    | ImageUsage::COLOR_ATTACHMENT,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+
             let (renderer, framebuffers_for_3d_renderer) = {
                 let (renderer, framebuffers) = Renderer::new(
                     self.device.clone(),
@@ -494,28 +575,53 @@ impl ApplicationHandler for App {
                     self.asset_database.clone(),
                     self.memory_allocator.clone(),
                     self.world.clone(),
-                    &images,
+                    &image_views_for_framebuffers_3d_renderer,
                 );
                 (Arc::new(RwLock::new(renderer)), framebuffers)
             };
 
-            let frames_in_flight = images.len();
-            let mut fences = vec![];
-            for _ in 0..frames_in_flight { fences.push(None); }
-
-            self.rendering_context = Some(
-                RenderingContext {
-                    window,
-                    swapchain,
-                    framebuffers_for_3d_renderer,
-                    recreate_swapchain: false,
-                    fences,
-                    previous_fence_index: 0,
-                    renderer,
-                    start_frame_instant: Instant::now(),
-                    captured: false,
-                }
+            let mut gui = Gui::new(
+                &event_loop,
+                surface.clone(),
+                self.queue.clone(),
+                swapchain.image_format(),
+                GuiConfig {
+                    is_overlay: false,
+                    ..GuiConfig::default()
+                },
             );
+
+            let egui_texture_ids_for_image_views_for_framebuffers_3d_renderer =
+                image_views_for_framebuffers_3d_renderer
+                    .iter()
+                    .map(|image_view| {
+                        gui.register_user_image_view(
+                            image_view.clone(),
+                            SamplerCreateInfo::default(),
+                        )
+                    })
+                    .collect();
+
+            let mut fences = vec![];
+            for _ in 0..frames_in_flight {
+                fences.push(None);
+            }
+
+            self.rendering_context = Some(RenderingContext {
+                window,
+                swapchain,
+                swapchain_image_views,
+                image_views_for_framebuffers_3d_renderer,
+                framebuffers_for_3d_renderer,
+                egui_texture_ids_for_image_views_for_framebuffers_3d_renderer,
+                recreate_swapchain: false,
+                fences,
+                previous_fence_index: 0,
+                renderer,
+                start_frame_instant: Instant::now(),
+                is_mouse_captured: false,
+                gui,
+            });
         }
     }
 
@@ -529,17 +635,16 @@ impl ApplicationHandler for App {
             DeviceEvent::Key(RawKeyEvent {
                 physical_key: PhysicalKey::Code(KeyCode::KeyQ),
                 state: ElementState::Pressed,
-            }) => {
-                event_loop.exit()
-            }
+            }) => event_loop.exit(),
             DeviceEvent::Key(RawKeyEvent {
                 physical_key: PhysicalKey::Code(key_code),
                 state,
             }) => {
-                self.keys_state.insert(key_code, state == ElementState::Pressed);
+                self.keys_state
+                    .insert(key_code, state == ElementState::Pressed);
             }
             DeviceEvent::MouseMotion { delta } => {
-                if self.rendering_context.as_ref().unwrap().captured {
+                if self.rendering_context.as_ref().unwrap().is_mouse_captured {
                     let sensitivity = 0.5f32;
 
                     let yaw = Quat::from_rotation_y(-delta.0 as f32 * sensitivity * 0.01);
@@ -562,67 +667,117 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         let rcx = self.rendering_context.as_mut().unwrap();
+        let gui = &mut rcx.gui;
+
+        if !rcx.is_mouse_captured && gui.update(&event) {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested
             | WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    physical_key: PhysicalKey::Code(KeyCode::KeyQ),
-                    state: ElementState::Pressed,
-                    repeat: false,
-                    ..
-                },
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyQ),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
                 ..
             } => {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    physical_key: PhysicalKey::Code(KeyCode::Escape),
-                    state: ElementState::Pressed,
-                    repeat: false,
-                    ..
-                },
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
                 ..
             } => {
-                rcx.captured = !rcx.captured;
-                rcx.window.set_cursor_grab(if rcx.captured { CursorGrabMode::Confined } else { CursorGrabMode::None }).unwrap();
-                rcx.window.set_cursor_visible(!rcx.captured);
+                rcx.is_mouse_captured = !rcx.is_mouse_captured;
+                rcx.window
+                    .set_cursor_grab(if rcx.is_mouse_captured {
+                        CursorGrabMode::Confined
+                    } else {
+                        CursorGrabMode::None
+                    })
+                    .unwrap();
+                rcx.window.set_cursor_visible(!rcx.is_mouse_captured);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                rcx.captured = true;
-                rcx.window.set_cursor_grab(if rcx.captured { CursorGrabMode::Confined } else { CursorGrabMode::None }).unwrap();
-                rcx.window.set_cursor_visible(!rcx.captured);
+                // rcx.is_mouse_captured = true;
+                // rcx.window
+                //     .set_cursor_grab(if rcx.is_mouse_captured {
+                //         CursorGrabMode::Confined
+                //     } else {
+                //         CursorGrabMode::None
+                //     })
+                //     .unwrap();
+                // rcx.window.set_cursor_visible(!rcx.is_mouse_captured);
             }
             WindowEvent::Resized(..) => {
                 rcx.recreate_swapchain = true;
             }
             WindowEvent::RedrawRequested => {
-                if rcx.captured {
+                if rcx.is_mouse_captured {
                     let speed = 5f32;
                     let forward = -(self.camera.rotation * Vec3::Z);
                     let right = self.camera.rotation * Vec3::X;
                     let mut direction = Vec3::ZERO;
 
-                    if self.keys_state.get(&KeyCode::KeyW).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::KeyW)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction += forward;
                     }
-                    if self.keys_state.get(&KeyCode::KeyS).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::KeyS)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction -= forward;
                     }
-                    if self.keys_state.get(&KeyCode::KeyA).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::KeyA)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction -= right;
                     }
-                    if self.keys_state.get(&KeyCode::KeyD).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::KeyD)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction += right;
                     }
-                    if self.keys_state.get(&KeyCode::Space).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::Space)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction += Vec3::Y;
                     }
-                    if self.keys_state.get(&KeyCode::ShiftLeft).cloned().unwrap_or(false) {
+                    if self
+                        .keys_state
+                        .get(&KeyCode::ShiftLeft)
+                        .cloned()
+                        .unwrap_or(false)
+                    {
                         direction -= Vec3::Y;
                     }
 
@@ -635,6 +790,8 @@ impl ApplicationHandler for App {
                 if rcx.recreate_swapchain {
                     let window_size = rcx.window.inner_size();
                     let images;
+
+                    // Resize swapchain
                     (rcx.swapchain, images) = rcx
                         .swapchain
                         .recreate(SwapchainCreateInfo {
@@ -642,21 +799,37 @@ impl ApplicationHandler for App {
                             ..rcx.swapchain.create_info()
                         })
                         .expect("Failed to recreate swapchain");
-                    rcx.framebuffers_for_3d_renderer = rcx.renderer.write().unwrap().resize(images);
+
+                    // Create ImageViews for swapchain images
+                    rcx.swapchain_image_views = images
+                        .iter()
+                        .map(|image| ImageView::new_default(image.clone()).unwrap())
+                        .collect();
+
                     rcx.recreate_swapchain = false;
                 }
 
-                let (image_index, suboptimal, acquire_future) =
-                    match acquire_next_image(rcx.swapchain.clone(), None).map_err(Validated::unwrap) {
-                        Ok(r) => r,
-                        Err(VulkanError::OutOfDate) => {
-                            rcx.recreate_swapchain = true;
-                            return;
-                        }
-                        Err(e) => panic!("failed to acquire next image: {e}"),
-                    };
+                let (
+                    image_index,
+                    suboptimal,
+                    swapchain_image_available_future
+                ) = match acquire_next_image(
+                    rcx.swapchain.clone(),
+                    None,
+                )
+                .map_err(Validated::unwrap)
+                {
+                    Ok(r) => r,
+                    Err(VulkanError::OutOfDate) => {
+                        rcx.recreate_swapchain = true;
+                        return;
+                    }
+                    Err(e) => panic!("failed to acquire next image: {e}"),
+                };
 
-                if suboptimal { rcx.recreate_swapchain = true; }
+                if suboptimal {
+                    rcx.recreate_swapchain = true;
+                }
 
                 let timer = ProfileTimer::start("cleanup_finished");
                 let previous_future = match rcx.fences[rcx.previous_fence_index as usize].take() {
@@ -671,9 +844,81 @@ impl ApplicationHandler for App {
                     Some(mut fence) => {
                         fence.cleanup_finished();
                         fence.boxed()
-                    },
+                    }
                 };
                 drop(timer);
+
+                gui.immediate_ui(|gui| {
+                    let ctx = gui.context();
+                    egui::Window::new("Colors").vscroll(true).show(&ctx, |ui| {
+                        ui.label("Pruebaaaa");
+                        let available_size = ui.available_size();
+                        let size_changed =
+                            available_size.x as u32 != rcx.image_views_for_framebuffers_3d_renderer[0].image().extent()[0] ||
+                            available_size.y as u32 != rcx.image_views_for_framebuffers_3d_renderer[0].image().extent()[1];
+                        // Resize renderer things (pipeline, etc) if size of widget changed
+                        // TODO: Check the index of the last frame it resized and if 10 frames or
+                        // so havent passed dont resize until then. Because its crashing :).
+                        // Vulkano issues page has something similar i dont know what is
+                        if size_changed {
+                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer
+                                .iter().for_each(|id| gui.unregister_user_image(id.clone()));
+
+                            // 3d Renderer doesnt render directly to the swapchain, it renders to a
+                            // texture that later egui renders in a widget in the screen
+                            for image_view in rcx.image_views_for_framebuffers_3d_renderer.iter_mut() {
+                                *image_view = ImageView::new_default(
+                                        Image::new(
+                                            self.memory_allocator.clone(),
+                                            ImageCreateInfo {
+                                                image_type: ImageType::Dim2d,
+                                                format: Format::R8G8B8A8_UNORM,
+                                                extent: [available_size.x as u32, available_size.y as u32, 1],
+                                                usage: ImageUsage::TRANSFER_DST
+                                                    | ImageUsage::SAMPLED
+                                                    | ImageUsage::COLOR_ATTACHMENT,
+                                                ..Default::default()
+                                            },
+                                            AllocationCreateInfo::default(),
+                                        )
+                                        .unwrap(),
+                                    )
+                                    .unwrap();
+                            }
+
+                            rcx.framebuffers_for_3d_renderer = rcx
+                                .renderer
+                                .write()
+                                .unwrap()
+                                .resize(&rcx.image_views_for_framebuffers_3d_renderer);
+
+                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer = rcx
+                                .image_views_for_framebuffers_3d_renderer
+                                .iter()
+                                .map(|image_view| {
+                                    gui.register_user_image_view(
+                                        image_view.clone(),
+                                        SamplerCreateInfo::default(),
+                                    )
+                                })
+                                .collect();
+                        }
+
+                        // Render the renderer framebuffer
+                        ui.image(ImageSource::Texture(SizedTexture::new(
+                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer
+                                [image_index as usize].clone(),
+                            (
+                                rcx.image_views_for_framebuffers_3d_renderer[image_index as usize]
+                                    .image()
+                                    .extent()[0] as f32,
+                                rcx.image_views_for_framebuffers_3d_renderer[image_index as usize]
+                                    .image()
+                                    .extent()[1] as f32,
+                            ),
+                        )));
+                    });
+                });
 
                 let mut builder = AutoCommandBufferBuilder::primary(
                     self.command_buffer_allocator.clone(),
@@ -682,44 +927,61 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                rcx.renderer.write().unwrap()
-                    .draw(
-                        &mut builder,
-                        &rcx.framebuffers_for_3d_renderer[image_index as usize],
-                        &self.camera
-                    );
+                rcx.renderer.write().unwrap().draw(
+                    &mut builder,
+                    &rcx.framebuffers_for_3d_renderer[image_index as usize],
+                    &self.camera,
+                );
 
                 let timer = ProfileTimer::start("build");
                 let command_buffer = builder.build().unwrap();
                 drop(timer);
 
                 let timer = ProfileTimer::start("present");
-                let future = previous_future
-                    .join(acquire_future)
+                let future_3d_renderer = previous_future
                     .then_execute(self.queue.clone(), command_buffer)
                     .unwrap()
-                    .then_swapchain_present(
-                        self.queue.clone(),
-                        SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
-                    )
-                    .then_signal_fence_and_flush();
+                    .then_signal_fence_and_flush()
+                    .unwrap();
                 drop(timer);
 
+                let future_egui = gui.draw_on_image(
+                    swapchain_image_available_future.join(future_3d_renderer),
+                    rcx.swapchain_image_views[image_index as usize].clone(),
+                );
+
+                let future = future_egui
+                    .then_swapchain_present(
+                        self.queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(
+                            rcx.swapchain.clone(),
+                            image_index,
+                        ),
+                    )
+                    .then_signal_fence_and_flush();
+
                 rcx.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
-                    Ok(value) => Some(value.boxed()),
+                    Ok(value) => {
+                        Some(value.boxed())
+                    }
                     Err(VulkanError::OutOfDate) => {
                         rcx.recreate_swapchain = true;
-                        None
+                        println!("OutOfDate");
+                        Some(sync::now(self.device.clone()).boxed())
                     }
                     Err(e) => {
                         println!("failed to flush future: {e}");
-                        None
+                        Some(sync::now(self.device.clone()).boxed())
                     }
                 };
 
+
                 rcx.previous_fence_index = image_index;
 
-                println!("{} FPS", 1.0 / rcx.start_frame_instant.elapsed().as_secs_f32());
+                println!(
+                    "{} FPS",
+                    1.0 / rcx.start_frame_instant.elapsed().as_secs_f32()
+                );
                 rcx.start_frame_instant = Instant::now();
             }
             _ => {}
@@ -727,6 +989,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        self.rendering_context.as_ref().unwrap().window.request_redraw();
+        self.rendering_context
+            .as_ref()
+            .unwrap()
+            .window
+            .request_redraw();
     }
 }

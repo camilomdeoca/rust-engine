@@ -86,7 +86,7 @@ pub struct Renderer {
 }
 
 fn window_size_dependent_setup(
-    images: &[Arc<Image>],
+    image_views: &[Arc<ImageView>],
     render_pass: &Arc<RenderPass>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     mesh_vs: &EntryPoint,
@@ -99,6 +99,7 @@ fn window_size_dependent_setup(
     (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>),
 ) {
     let device = memory_allocator.device();
+    let extent = image_views[0].image().extent();
 
     let depth_buffer = ImageView::new_default(
         Image::new(
@@ -106,7 +107,7 @@ fn window_size_dependent_setup(
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::D16_UNORM,
-                extent: images[0].extent(),
+                extent,
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
                 ..Default::default()
             },
@@ -116,15 +117,13 @@ fn window_size_dependent_setup(
     )
     .unwrap();
 
-    let framebuffers = images
+    let framebuffers = image_views
         .iter()
-        .map(|image| {
-            let view = ImageView::new_default(image.clone()).unwrap();
-
+        .map(|image_view| {
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![view, depth_buffer.clone()],
+                    attachments: vec![image_view.clone(), depth_buffer.clone()],
                     ..Default::default()
                 },
             )
@@ -134,7 +133,7 @@ fn window_size_dependent_setup(
 
     let viewport = Viewport {
         offset: [0.0, 0.0],
-        extent: [images[0].extent()[0] as f32, images[0].extent()[1] as f32],
+        extent: [extent[0] as f32, extent[1] as f32],
         depth_range: 0.0..=1.0,
     };
 
@@ -284,7 +283,7 @@ impl Renderer {
         asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
-        images: &[Arc<Image>],
+        image_views: &[Arc<ImageView>],
     ) -> (Self, Vec<Arc<Framebuffer>>) {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
@@ -330,7 +329,7 @@ impl Renderer {
             device.clone(),
             attachments: {
                 color: {
-                    format: images[0].format(),
+                    format: image_views[0].format(),
                     samples: 1,
                     load_op: Clear,
                     store_op: Store,
@@ -389,7 +388,7 @@ impl Renderer {
         .unwrap();
 
         let (framebuffers, (mesh_pipeline, skybox_pipeline)) = window_size_dependent_setup(
-            &images,
+            &image_views,
             &render_pass,
             &memory_allocator,
             &mesh_vs,
@@ -617,11 +616,11 @@ impl Renderer {
         (renderer, framebuffers)
     }
 
-    pub fn resize(&mut self, images: Vec<Arc<Image>>) -> Vec<Arc<Framebuffer>> {
+    pub fn resize(&mut self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
         let framebuffers;
 
         (framebuffers, (self.mesh_pipeline, self.skybox_pipeline)) = window_size_dependent_setup(
-            &images,
+            &image_views,
             &self.render_pass,
             &self.memory_allocator,
             &self.mesh_vs,
