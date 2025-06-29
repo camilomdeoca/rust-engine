@@ -19,6 +19,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c71b1793ee61086797f5c80b6efa2b8ffa6d5dd703f118545808a7f2e27f7046"
 
 [[package]]
+name = "accesskit"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d3b8f9bae46a948369bc4a03e815d4ed6d616bd00de4051133a5019dc31c5a"
+dependencies = [
+ "enumn",
+ "serde",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -33,6 +43,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.3.3",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -208,7 +219,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cexpr",
  "clang-sys",
- "itertools",
+ "itertools 0.12.1",
  "lazy_static",
  "lazycell",
  "log",
@@ -617,6 +628,7 @@ checksum = "bc4feb366740ded31a004a0e4452fbf84e80ef432ecf8314c485210229672fd1"
 dependencies = [
  "bytemuck",
  "emath",
+ "serde",
 ]
 
 [[package]]
@@ -625,6 +637,7 @@ version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25dd34cec49ab55d85ebf70139cb1ccd29c977ef6b6ba4fe85489d6877ee9ef3"
 dependencies = [
+ "accesskit",
  "ahash",
  "bitflags 2.9.1",
  "emath",
@@ -632,6 +645,7 @@ dependencies = [
  "log",
  "nohash-hasher",
  "profiling",
+ "serde",
 ]
 
 [[package]]
@@ -651,6 +665,19 @@ dependencies = [
  "web-time",
  "webbrowser",
  "winit",
+]
+
+[[package]]
+name = "egui_tiles"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67756b63b283a65bd0534b0c2a5fb1a12a5768bb6383d422147cc93193d09cfc"
+dependencies = [
+ "ahash",
+ "egui",
+ "itertools 0.13.0",
+ "log",
+ "serde",
 ]
 
 [[package]]
@@ -681,6 +708,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e4cadcff7a5353ba72b7fea76bf2122b5ebdbc68e8155aa56dfdea90083fe1b"
 dependencies = [
  "bytemuck",
+ "serde",
+]
+
+[[package]]
+name = "enumn"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f9ed6b3789237c8a0c1c505af1c7eb2c560df6186f01b098c3a1064ea532f38"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -699,6 +738,7 @@ dependencies = [
  "nohash-hasher",
  "parking_lot",
  "profiling",
+ "serde",
 ]
 
 [[package]]
@@ -999,6 +1039,7 @@ version = "0.1.0"
 dependencies = [
  "bimap",
  "egui",
+ "egui_tiles",
  "egui_winit_vulkano",
  "flecs_ecs",
  "glam",
@@ -1203,6 +1244,15 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -2101,7 +2151,7 @@ dependencies = [
  "built",
  "cfg-if",
  "interpolate_name",
- "itertools",
+ "itertools 0.12.1",
  "libc",
  "libfuzzer-sys",
  "log",

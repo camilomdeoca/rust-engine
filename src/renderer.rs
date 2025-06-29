@@ -4,7 +4,7 @@ use std::{
 };
 
 use flecs_ecs::prelude::*;
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -86,7 +86,7 @@ pub struct Renderer {
 }
 
 fn window_size_dependent_setup(
-    image_views: &[Arc<ImageView>],
+    extent: Vec2,
     render_pass: &Arc<RenderPass>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     mesh_vs: &EntryPoint,
@@ -94,46 +94,12 @@ fn window_size_dependent_setup(
     skybox_vs: &EntryPoint,
     skybox_fs: &EntryPoint,
     sampler: &Arc<Sampler>,
-) -> (
-    Vec<Arc<Framebuffer>>,
-    (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>),
-) {
+) -> (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>) {
     let device = memory_allocator.device();
-    let extent = image_views[0].image().extent();
-
-    let depth_buffer = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::D16_UNORM,
-                extent,
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    let framebuffers = image_views
-        .iter()
-        .map(|image_view| {
-            Framebuffer::new(
-                render_pass.clone(),
-                FramebufferCreateInfo {
-                    attachments: vec![image_view.clone(), depth_buffer.clone()],
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
 
     let viewport = Viewport {
         offset: [0.0, 0.0],
-        extent: [extent[0] as f32, extent[1] as f32],
+        extent: extent.into(),
         depth_range: 0.0..=1.0,
     };
 
@@ -270,7 +236,7 @@ fn window_size_dependent_setup(
         .unwrap()
     };
 
-    (framebuffers, (mesh_pipeline, skybox_pipeline))
+    (mesh_pipeline, skybox_pipeline)
 }
 
 impl AssetDatabaseChangeObserver for Renderer {}
@@ -283,8 +249,8 @@ impl Renderer {
         asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
-        image_views: &[Arc<ImageView>],
-    ) -> (Self, Vec<Arc<Framebuffer>>) {
+        format: Format,
+    ) -> Self {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
             Default::default(),
@@ -329,7 +295,7 @@ impl Renderer {
             device.clone(),
             attachments: {
                 color: {
-                    format: image_views[0].format(),
+                    format: format,
                     samples: 1,
                     load_op: Clear,
                     store_op: Store,
@@ -387,8 +353,8 @@ impl Renderer {
         )
         .unwrap();
 
-        let (framebuffers, (mesh_pipeline, skybox_pipeline)) = window_size_dependent_setup(
-            &image_views,
+        let (mesh_pipeline, skybox_pipeline) = window_size_dependent_setup(
+            Vec2::new(1280.0, 720.0),
             &render_pass,
             &memory_allocator,
             &mesh_vs,
@@ -613,14 +579,55 @@ impl Renderer {
             world,
         };
 
-        (renderer, framebuffers)
+        renderer
     }
 
-    pub fn resize(&mut self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
-        let framebuffers;
+    fn create_framebuffers(&self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
+        let extent = image_views[0].image().extent();
 
-        (framebuffers, (self.mesh_pipeline, self.skybox_pipeline)) = window_size_dependent_setup(
-            &image_views,
+        let depth_buffer = ImageView::new_default(
+            Image::new(
+                self.memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::D16_UNORM,
+                    extent,
+                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let framebuffers = image_views
+            .iter()
+            .map(|image_view| {
+                Framebuffer::new(
+                    self.render_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![image_view.clone(), depth_buffer.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        framebuffers
+    }
+
+    pub fn resize_and_create_framebuffers(
+        &mut self,
+        image_views: &[Arc<ImageView>]
+    ) -> Vec<Arc<Framebuffer>> {
+        let extent = Vec2::new(
+            image_views[0].image().extent()[0] as f32,
+            image_views[0].image().extent()[1] as f32,
+        );
+        (self.mesh_pipeline, self.skybox_pipeline) = window_size_dependent_setup(
+            extent,
             &self.render_pass,
             &self.memory_allocator,
             &self.mesh_vs,
@@ -630,7 +637,7 @@ impl Renderer {
             &self.sampler,
         );
 
-        framebuffers
+        self.create_framebuffers(&image_views)
     }
 
     /// Returns true if the swapchain needs to be recreated

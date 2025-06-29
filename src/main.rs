@@ -13,6 +13,7 @@ mod ecs;
 mod image_based_lighting_maps_generator;
 mod profile;
 mod renderer;
+mod ui;
 
 use assets::{
     database::AssetDatabase,
@@ -20,18 +21,18 @@ use assets::{
 };
 use camera::Camera;
 use ecs::components::EnvironmentCubemap;
-use egui::{load::SizedTexture, ImageData, ImageSource, Vec2};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use profile::ProfileTimer;
 use renderer::Renderer;
+use ui::UserInterface;
 use std::{
     collections::HashMap,
     error::Error,
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use vulkano::{
     command_buffer::{
@@ -44,7 +45,6 @@ use vulkano::{
     },
     format::Format,
     image::{
-        sampler::SamplerCreateInfo,
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
     },
@@ -57,7 +57,6 @@ use vulkano::{
         Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
     },
     memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
-    render_pass::Framebuffer,
     swapchain::{
         acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
         SwapchainPresentInfo,
@@ -85,16 +84,14 @@ struct RenderingContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
     swapchain_image_views: Vec<Arc<ImageView>>,
-    image_views_for_framebuffers_3d_renderer: Vec<Arc<ImageView>>,
-    egui_texture_ids_for_image_views_for_framebuffers_3d_renderer: Vec<egui::TextureId>,
-    framebuffers_for_3d_renderer: Vec<Arc<Framebuffer>>,
     recreate_swapchain: bool,
     fences: Vec<Option<Box<dyn GpuFuture>>>,
     previous_fence_index: u32,
     renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
     is_mouse_captured: bool,
-    gui: Gui,
+    user_interface: UserInterface,
+    frametime: Duration,
 }
 
 struct App {
@@ -568,19 +565,16 @@ impl ApplicationHandler for App {
                 );
             }
 
-            let (renderer, framebuffers_for_3d_renderer) = {
-                let (renderer, framebuffers) = Renderer::new(
-                    self.device.clone(),
-                    self.queue.clone(),
-                    self.asset_database.clone(),
-                    self.memory_allocator.clone(),
-                    self.world.clone(),
-                    &image_views_for_framebuffers_3d_renderer,
-                );
-                (Arc::new(RwLock::new(renderer)), framebuffers)
-            };
+            let renderer = Arc::new(RwLock::new(Renderer::new(
+                self.device.clone(),
+                self.queue.clone(),
+                self.asset_database.clone(),
+                self.memory_allocator.clone(),
+                self.world.clone(),
+                Format::R8G8B8A8_UNORM,
+            )));
 
-            let mut gui = Gui::new(
+            let gui = Gui::new(
                 &event_loop,
                 surface.clone(),
                 self.queue.clone(),
@@ -591,16 +585,15 @@ impl ApplicationHandler for App {
                 },
             );
 
-            let egui_texture_ids_for_image_views_for_framebuffers_3d_renderer =
-                image_views_for_framebuffers_3d_renderer
-                    .iter()
-                    .map(|image_view| {
-                        gui.register_user_image_view(
-                            image_view.clone(),
-                            SamplerCreateInfo::default(),
-                        )
-                    })
-                    .collect();
+            let mut user_interface = UserInterface::new(
+                self.memory_allocator.clone(),
+                renderer.clone(),
+                gui,
+                frames_in_flight,
+            );
+
+            user_interface.add_camera_view(self.camera.clone());
+            user_interface.add_scene_view();
 
             let mut fences = vec![];
             for _ in 0..frames_in_flight {
@@ -611,16 +604,14 @@ impl ApplicationHandler for App {
                 window,
                 swapchain,
                 swapchain_image_views,
-                image_views_for_framebuffers_3d_renderer,
-                framebuffers_for_3d_renderer,
-                egui_texture_ids_for_image_views_for_framebuffers_3d_renderer,
                 recreate_swapchain: false,
                 fences,
                 previous_fence_index: 0,
                 renderer,
                 start_frame_instant: Instant::now(),
                 is_mouse_captured: false,
-                gui,
+                user_interface,
+                frametime: Duration::ZERO,
             });
         }
     }
@@ -667,9 +658,8 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         let rcx = self.rendering_context.as_mut().unwrap();
-        let gui = &mut rcx.gui;
 
-        if !rcx.is_mouse_captured && gui.update(&event) {
+        if !rcx.is_mouse_captured && rcx.user_interface.update(&event) {
             return;
         }
 
@@ -848,78 +838,6 @@ impl ApplicationHandler for App {
                 };
                 drop(timer);
 
-                gui.immediate_ui(|gui| {
-                    let ctx = gui.context();
-                    egui::Window::new("Colors").vscroll(true).show(&ctx, |ui| {
-                        ui.label("Pruebaaaa");
-                        let available_size = ui.available_size();
-                        let size_changed =
-                            available_size.x as u32 != rcx.image_views_for_framebuffers_3d_renderer[0].image().extent()[0] ||
-                            available_size.y as u32 != rcx.image_views_for_framebuffers_3d_renderer[0].image().extent()[1];
-                        // Resize renderer things (pipeline, etc) if size of widget changed
-                        // TODO: Check the index of the last frame it resized and if 10 frames or
-                        // so havent passed dont resize until then. Because its crashing :).
-                        // Vulkano issues page has something similar i dont know what is
-                        if size_changed {
-                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer
-                                .iter().for_each(|id| gui.unregister_user_image(id.clone()));
-
-                            // 3d Renderer doesnt render directly to the swapchain, it renders to a
-                            // texture that later egui renders in a widget in the screen
-                            for image_view in rcx.image_views_for_framebuffers_3d_renderer.iter_mut() {
-                                *image_view = ImageView::new_default(
-                                        Image::new(
-                                            self.memory_allocator.clone(),
-                                            ImageCreateInfo {
-                                                image_type: ImageType::Dim2d,
-                                                format: Format::R8G8B8A8_UNORM,
-                                                extent: [available_size.x as u32, available_size.y as u32, 1],
-                                                usage: ImageUsage::TRANSFER_DST
-                                                    | ImageUsage::SAMPLED
-                                                    | ImageUsage::COLOR_ATTACHMENT,
-                                                ..Default::default()
-                                            },
-                                            AllocationCreateInfo::default(),
-                                        )
-                                        .unwrap(),
-                                    )
-                                    .unwrap();
-                            }
-
-                            rcx.framebuffers_for_3d_renderer = rcx
-                                .renderer
-                                .write()
-                                .unwrap()
-                                .resize(&rcx.image_views_for_framebuffers_3d_renderer);
-
-                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer = rcx
-                                .image_views_for_framebuffers_3d_renderer
-                                .iter()
-                                .map(|image_view| {
-                                    gui.register_user_image_view(
-                                        image_view.clone(),
-                                        SamplerCreateInfo::default(),
-                                    )
-                                })
-                                .collect();
-                        }
-
-                        // Render the renderer framebuffer
-                        ui.image(ImageSource::Texture(SizedTexture::new(
-                            rcx.egui_texture_ids_for_image_views_for_framebuffers_3d_renderer
-                                [image_index as usize].clone(),
-                            (
-                                rcx.image_views_for_framebuffers_3d_renderer[image_index as usize]
-                                    .image()
-                                    .extent()[0] as f32,
-                                rcx.image_views_for_framebuffers_3d_renderer[image_index as usize]
-                                    .image()
-                                    .extent()[1] as f32,
-                            ),
-                        )));
-                    });
-                });
-
                 let mut builder = AutoCommandBufferBuilder::primary(
                     self.command_buffer_allocator.clone(),
                     self.queue.queue_family_index(),
@@ -927,11 +845,7 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                rcx.renderer.write().unwrap().draw(
-                    &mut builder,
-                    &rcx.framebuffers_for_3d_renderer[image_index as usize],
-                    &self.camera,
-                );
+                rcx.user_interface.build(image_index as usize, &mut builder, rcx.frametime);
 
                 let timer = ProfileTimer::start("build");
                 let command_buffer = builder.build().unwrap();
@@ -945,9 +859,9 @@ impl ApplicationHandler for App {
                     .unwrap();
                 drop(timer);
 
-                let future_egui = gui.draw_on_image(
+                let future_egui = rcx.user_interface.draw(
                     swapchain_image_available_future.join(future_3d_renderer),
-                    rcx.swapchain_image_views[image_index as usize].clone(),
+                    &rcx.swapchain_image_views[image_index as usize],
                 );
 
                 let future = future_egui
@@ -978,10 +892,7 @@ impl ApplicationHandler for App {
 
                 rcx.previous_fence_index = image_index;
 
-                println!(
-                    "{} FPS",
-                    1.0 / rcx.start_frame_instant.elapsed().as_secs_f32()
-                );
+                rcx.frametime = rcx.start_frame_instant.elapsed();
                 rcx.start_frame_instant = Instant::now();
             }
             _ => {}
@@ -996,3 +907,4 @@ impl ApplicationHandler for App {
             .request_redraw();
     }
 }
+
