@@ -12,7 +12,7 @@ use vulkano::{
     },
     memory::allocator::{AllocationCreateInfo, MemoryAllocator},
     render_pass::Framebuffer,
-    sync::GpuFuture,
+    sync::{future::FenceSignalFuture, GpuFuture},
 };
 use winit::event::WindowEvent;
 
@@ -84,7 +84,7 @@ impl UserInterface {
                 .renderer
                 .write()
                 .unwrap()
-                .draw(builder, &framebuffer, &camera);
+                .draw(builder, &framebuffer, &camera, image_index);
         }
         self.behavior.cameras_to_draw.clear();
     }

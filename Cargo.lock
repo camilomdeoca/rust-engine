@@ -1046,6 +1046,7 @@ dependencies = [
  "gltf",
  "image",
  "memory-stats",
+ "smallvec",
  "vulkano",
  "vulkano-shaders",
  "winit",

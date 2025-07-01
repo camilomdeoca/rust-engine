@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fs, path::Path, sync::{Arc, RwLock}};
 
-use flecs_ecs::core::World;
 use glam::{Quat, Vec3};
 use gltf::{buffer::Data, image::Source, mesh::util::ReadIndices, Texture};
 use vulkano::format::Format;
@@ -63,7 +62,7 @@ fn load_texture_from_gltf_texture(
 
 pub fn load_gltf_scene(
     path: impl AsRef<Path>,
-    world: World,
+    added_entities: Arc<RwLock<Vec<(String, Transform, MeshComponent, MaterialComponent)>>>,
     asset_database: Arc<RwLock<AssetDatabase>>,
 ) -> Result<(), String> {
     let path = path.as_ref();
@@ -227,20 +226,21 @@ pub fn load_gltf_scene(
 
             let name = mesh.name().unwrap().to_string() + primitive.material().name().unwrap();
 
-            world
-                .entity_named(&name)
-                .set(Transform {
+            added_entities.write().unwrap().push((
+                name,
+                Transform {
                     translation: Vec3::from_array(translation),
                     rotation: Quat::from_array(rotation)
                         * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
                     scale: Vec3::from_array(scale),
-                })
-                .set(MeshComponent {
+                },
+                MeshComponent {
                     mesh_id,
-                })
-                .set(MaterialComponent {
+                },
+                MaterialComponent {
                     material_id,
-                });
+                },
+            ));
         }
     }
 

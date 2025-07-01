@@ -8,7 +8,7 @@ use glam::{UVec2, Vec3, Vec4};
 use image::EncodableLayout;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
-    command_buffer::allocator::StandardCommandBufferAllocator,
+    command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, PrimaryAutoCommandBuffer},
     device::Queue,
     format::Format,
     image::view::ImageView,
@@ -64,7 +64,7 @@ pub struct Material {
     pub normal: Option<TextureId>,
 }
 
-pub trait AssetDatabaseChangeObserver {
+pub trait AssetDatabaseChangeObserver: Send + Sync {
     fn on_mesh_add(&mut self, mesh_id: MeshId, mesh: &Mesh) {}
     fn on_texture_add(&mut self, texture_id: TextureId, texture: &Texture) {}
     fn on_cubemap_add(&mut self, cubemap_id: CubemapId, cubemap: &Cubemap) {}
@@ -91,7 +91,18 @@ pub struct AssetDatabase {
     vertex_buffer: Subbuffer<[Vertex]>,
     index_buffer: Subbuffer<[u32]>,
 
+    add_mesh_to_main_buffers_queue: Vec<AddMeshToMainBufferTask>,
+
     asset_database_change_observers: Vec<Arc<RwLock<dyn AssetDatabaseChangeObserver>>>,
+}
+
+struct AddMeshToMainBufferTask {
+    /// Id of the mesh we are going to add
+    mesh_id: MeshId,
+
+    /// Staging buffers that will be copied to the main buffers
+    staging_vertex_buffer: Subbuffer<[Vertex]>,
+    staging_index_buffer: Subbuffer<[u32]>,
 }
 
 impl AssetDatabase {
@@ -146,6 +157,7 @@ impl AssetDatabase {
             cubemaps: Vec::new(),
             material_names: BiHashMap::new(),
             materials: Vec::new(),
+            add_mesh_to_main_buffers_queue: Vec::new(),
             asset_database_change_observers: Vec::new(),
             vertex_buffer,
             index_buffer,
@@ -175,42 +187,102 @@ impl AssetDatabase {
         &self.materials
     }
 
+    /// To call this you have to ensure the vertex and index buffers arent being used
+    pub fn add_newly_loaded_meshes_to_main_buffers(
+        &mut self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>
+    ) {
+        let mut vertex_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
+            acc.max((mesh.vertex_offset + mesh.vertex_count) as DeviceSize)
+        });
+
+        let mut index_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
+            acc.max((mesh.first_index + mesh.index_count) as DeviceSize)
+        });
+
+        for task in self.add_mesh_to_main_buffers_queue.drain(..) {
+            let AddMeshToMainBufferTask {
+                mesh_id,
+                staging_vertex_buffer,
+                staging_index_buffer,
+            } = task;
+
+            assert!(staging_vertex_buffer.len() <= self.vertex_buffer.len() - vertex_buffer_offset);
+            assert!(staging_index_buffer.len() <= self.index_buffer.len() - vertex_buffer_offset);
+
+            builder
+                .copy_buffer(CopyBufferInfo::buffers(
+                    staging_vertex_buffer.clone(),
+                    self.vertex_buffer.clone().slice(vertex_buffer_offset..),
+                ))
+                .unwrap()
+                .copy_buffer(CopyBufferInfo::buffers(
+                    staging_index_buffer.clone(),
+                    self.index_buffer.clone().slice(index_buffer_offset..),
+                ))
+                .unwrap();
+
+            self.meshes.push(Mesh {
+                index_count: staging_index_buffer.len() as u32,
+                first_index: index_buffer_offset as u32,
+                vertex_count: staging_vertex_buffer.len() as u32,
+                vertex_offset: vertex_buffer_offset as u32,
+            });
+
+            vertex_buffer_offset += staging_vertex_buffer.len();
+            index_buffer_offset += staging_index_buffer.len();
+
+            for observer in &self.asset_database_change_observers {
+                observer
+                    .write()
+                    .unwrap()
+                    .on_mesh_add(mesh_id.clone(), self.meshes.last().unwrap());
+            }
+        }
+    }
+
     pub fn add_mesh_from_buffers(
         &mut self,
         vertices: Vec<Vertex>,
         indices: Vec<u32>,
     ) -> Result<MeshId, String> {
-        let vertex_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
-            acc.max((mesh.vertex_offset + mesh.vertex_count) as DeviceSize)
-        });
-
-        let index_buffer_offset: DeviceSize = self.meshes.iter().fold(0, |acc, mesh| {
-            acc.max((mesh.first_index + mesh.index_count) as DeviceSize)
-        });
-        load_mesh_from_buffers(
+        let staging_vertex_buffer = Buffer::from_iter(
             self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            &self.queue,
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
             vertices.iter().cloned(),
+        )
+        .unwrap();
+
+        let staging_index_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
             indices.iter().cloned(),
-            self.vertex_buffer.clone().slice(vertex_buffer_offset..),
-            self.index_buffer.clone().slice(index_buffer_offset..),
-        )?;
+        )
+        .unwrap();
 
         let mesh_id = MeshId(self.meshes.len() as u32);
-        self.meshes.push(Mesh {
-            index_count: indices.len() as u32,
-            first_index: index_buffer_offset as u32,
-            vertex_count: vertices.len() as u32,
-            vertex_offset: vertex_buffer_offset as u32,
-        });
 
-        for observer in &self.asset_database_change_observers {
-            observer
-                .write()
-                .unwrap()
-                .on_mesh_add(mesh_id.clone(), self.meshes.last().unwrap());
-        }
+        self.add_mesh_to_main_buffers_queue.push(AddMeshToMainBufferTask {
+            mesh_id: mesh_id.clone(),
+            staging_vertex_buffer,
+            staging_index_buffer,
+        });
 
         Ok(mesh_id)
     }

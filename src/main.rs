@@ -20,7 +20,7 @@ use assets::{
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::EnvironmentCubemap;
+use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, Transform};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
@@ -58,10 +58,9 @@ use vulkano::{
     },
     memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
     swapchain::{
-        acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
-        SwapchainPresentInfo,
+        acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo
     },
-    sync::{self, GpuFuture},
+    sync::{self, future::FenceSignalFuture, GpuFuture},
     DeviceSize, Validated, VulkanError, VulkanLibrary,
 };
 use winit::{
@@ -85,7 +84,7 @@ struct RenderingContext {
     swapchain: Arc<Swapchain>,
     swapchain_image_views: Vec<Arc<ImageView>>,
     recreate_swapchain: bool,
-    fences: Vec<Option<Box<dyn GpuFuture>>>,
+    fences: Vec<Option<FenceSignalFuture<PresentFuture<Box<dyn GpuFuture>>>>>,
     previous_fence_index: u32,
     renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
@@ -102,6 +101,7 @@ struct App {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
 
     world: World,
+    entities_to_add_queue: Arc<RwLock<Vec<(String, Transform, MeshComponent, MaterialComponent)>>>,
     asset_database: Arc<RwLock<AssetDatabase>>,
     camera: Camera,
     _debug_callback: Arc<DebugUtilsMessenger>,
@@ -176,7 +176,7 @@ fn select_physical_device(
                     queue.queue_flags.intersects(QueueFlags::GRAPHICS)
                         && candidate_physical_device
                             .presentation_support(i as u32, event_loop)
-                            .unwrap_or(false) // TODO: Make this work
+                            .unwrap_or(false)
                 })
                 .map(|i| (candidate_physical_device, i as u32))
         })
@@ -285,14 +285,24 @@ impl App {
             physical_device.properties().device_type,
         );
 
+        println!("Queue {queue_family_index}");
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
+                queue_create_infos: vec![
+                    QueueCreateInfo {
+                        queue_family_index,
+                        // queues: vec![0.5, 0.1], // one queue for rendering and another for asset
+                        //                         // loading
+                        ..Default::default()
+                    },
+                    QueueCreateInfo {
+                        queue_family_index: 1,
+                        ..Default::default()
+                    },
+                ],
                 enabled_features: device_features,
                 ..Default::default()
             },
@@ -316,20 +326,11 @@ impl App {
         );
 
         let asset_database = Arc::new(RwLock::new(AssetDatabase::new(
-            queue.clone(),
+            queues.next().unwrap(),
             memory_allocator.clone(),
             vertex_count as DeviceSize,
             index_count as DeviceSize,
         )));
-
-        load_gltf_scene(
-            "assets/meshes/Bistro_with_tangents_all.glb",
-            //"assets/meshes/DamagedHelmet.glb",
-            world.clone(),
-            asset_database.clone(),
-        )
-        .unwrap();
-        println!("Loaded scene");
 
         let irradiance_map_image = Image::new(
             memory_allocator.clone(),
@@ -461,11 +462,6 @@ impl App {
         });
         drop(asset_database_write);
 
-        // {
-        //     asset_database.write().unwrap().add_asset_database_change_observer(renderer.clone());
-        // }
-        println!("Initialized renderer");
-
         App {
             instance,
             device,
@@ -473,6 +469,7 @@ impl App {
             memory_allocator,
             command_buffer_allocator,
             world,
+            entities_to_add_queue: Arc::new(RwLock::new(vec![])),
             asset_database,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 1.0),
@@ -569,10 +566,25 @@ impl ApplicationHandler for App {
                 self.device.clone(),
                 self.queue.clone(),
                 self.asset_database.clone(),
+                1024, // max_textures
                 self.memory_allocator.clone(),
                 self.world.clone(),
                 Format::R8G8B8A8_UNORM,
+                frames_in_flight,
             )));
+
+            let asset_database_clone = self.asset_database.clone();
+            let entities_to_add_queue_clone = self.entities_to_add_queue.clone();
+            std::thread::spawn(move || {
+                load_gltf_scene(
+                    "assets/meshes/Bistro_with_tangents_all.glb",
+                    //"assets/meshes/DamagedHelmet.glb",
+                    entities_to_add_queue_clone,
+                    asset_database_clone,
+                )
+                .unwrap();
+                println!("Loaded scene");
+            });
 
             let gui = Gui::new(
                 &event_loop,
@@ -777,6 +789,16 @@ impl ApplicationHandler for App {
                     self.camera.position += direction * speed * 0.01;
                 }
 
+                let mut entities_to_add_queue_write = self.entities_to_add_queue.write().unwrap();
+                while let Some((name, transform, mesh, material)) = entities_to_add_queue_write.pop() {
+                    self.world
+                        .entity_named(&name)
+                        .set(transform)
+                        .set(mesh)
+                        .set(material);
+                }
+                drop(entities_to_add_queue_write);
+
                 if rcx.recreate_swapchain {
                     let window_size = rcx.window.inner_size();
                     let images;
@@ -845,7 +867,14 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                rcx.user_interface.build(image_index as usize, &mut builder, rcx.frametime);
+                self.asset_database.write().unwrap()
+                    .add_newly_loaded_meshes_to_main_buffers(&mut builder);
+
+                rcx.user_interface.build(
+                    image_index as usize,
+                    &mut builder,
+                    rcx.frametime,
+                );
 
                 let timer = ProfileTimer::start("build");
                 let command_buffer = builder.build().unwrap();
@@ -876,16 +905,16 @@ impl ApplicationHandler for App {
 
                 rcx.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
                     Ok(value) => {
-                        Some(value.boxed())
+                        Some(value)
                     }
                     Err(VulkanError::OutOfDate) => {
                         rcx.recreate_swapchain = true;
                         println!("OutOfDate");
-                        Some(sync::now(self.device.clone()).boxed())
+                        None
                     }
                     Err(e) => {
                         println!("failed to flush future: {e}");
-                        Some(sync::now(self.device.clone()).boxed())
+                        None
                     }
                 };
 
