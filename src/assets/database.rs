@@ -8,7 +8,7 @@ use glam::{UVec2, Vec3, Vec4};
 use image::EncodableLayout;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
-    command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, PrimaryAutoCommandBuffer},
+    command_buffer::{allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CopyBufferInfo, PrimaryAutoCommandBuffer},
     device::Queue,
     format::Format,
     image::view::ImageView,
@@ -17,10 +17,7 @@ use vulkano::{
 };
 
 use super::{
-    loaders::{
-        mesh_loader::load_mesh_from_buffers,
-        texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer},
-    },
+    loaders::texture_loader::{load_cubemap_from_buffer, load_texture_from_buffer},
     vertex::Vertex,
 };
 
@@ -179,6 +176,10 @@ impl AssetDatabase {
         self.index_buffer.clone()
     }
 
+    pub fn meshes(&self) -> &Vec<Mesh> {
+        &self.meshes
+    }
+
     pub fn textures(&self) -> &Vec<Texture> {
         &self.textures
     }
@@ -200,7 +201,9 @@ impl AssetDatabase {
             acc.max((mesh.first_index + mesh.index_count) as DeviceSize)
         });
 
-        for task in self.add_mesh_to_main_buffers_queue.drain(..) {
+        let old_add_mesh_to_main_buffers_queue =
+            std::mem::take(&mut self.add_mesh_to_main_buffers_queue);
+        for task in old_add_mesh_to_main_buffers_queue {
             let AddMeshToMainBufferTask {
                 mesh_id,
                 staging_vertex_buffer,
@@ -222,12 +225,12 @@ impl AssetDatabase {
                 ))
                 .unwrap();
 
-            self.meshes.push(Mesh {
+            self.meshes[mesh_id.0 as usize] = Mesh {
                 index_count: staging_index_buffer.len() as u32,
                 first_index: index_buffer_offset as u32,
                 vertex_count: staging_vertex_buffer.len() as u32,
                 vertex_offset: vertex_buffer_offset as u32,
-            });
+            };
 
             vertex_buffer_offset += staging_vertex_buffer.len();
             index_buffer_offset += staging_index_buffer.len();
@@ -277,6 +280,12 @@ impl AssetDatabase {
         .unwrap();
 
         let mesh_id = MeshId(self.meshes.len() as u32);
+        self.meshes.push(Mesh {
+            index_count: 0,
+            first_index: 0,
+            vertex_count: 0,
+            vertex_offset: 0,
+        });
 
         self.add_mesh_to_main_buffers_queue.push(AddMeshToMainBufferTask {
             mesh_id: mesh_id.clone(),

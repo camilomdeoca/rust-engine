@@ -1,6 +1,6 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
-use egui::{load::SizedTexture, Frame, ImageSource, Margin, Ui};
+use egui::{load::SizedTexture, Frame, ImageSource, Margin, Sense, Ui};
 use egui_tiles::Tree;
 use egui_winit_vulkano::Gui;
 use glam::UVec2;
@@ -12,7 +12,7 @@ use vulkano::{
     },
     memory::allocator::{AllocationCreateInfo, MemoryAllocator},
     render_pass::Framebuffer,
-    sync::{future::FenceSignalFuture, GpuFuture},
+    sync::GpuFuture,
 };
 use winit::event::WindowEvent;
 
@@ -54,6 +54,7 @@ impl UserInterface {
             image_index: 0,
             frames_in_flight,
             cameras_to_draw: vec![],
+            focused_camera: None,
         };
 
         Self { tree, behavior }
@@ -84,7 +85,7 @@ impl UserInterface {
                 .renderer
                 .write()
                 .unwrap()
-                .draw(builder, &framebuffer, &camera, image_index);
+                .draw(builder, &framebuffer, &camera);
         }
         self.behavior.cameras_to_draw.clear();
     }
@@ -122,6 +123,24 @@ impl UserInterface {
             tiles.insert_tab_tile(vec![old_root, id])
         });
     }
+
+    pub fn get_focused_camera(&mut self) -> Option<&mut Camera> {
+        let tile = self.tree.tiles.get_mut(self.behavior.focused_camera?).unwrap();
+
+        let pane = match tile {
+            egui_tiles::Tile::Pane(pane) => pane,
+            _ => panic!("Focused camera TileId is from a non Pane tile"),
+        };
+
+        match pane {
+            Pane::CameraView(camera_view) => Some(&mut camera_view.camera),
+            _ => panic!("Focused camera TileId is from non camera pane"),
+        }
+    }
+
+    pub fn unfocus_camera(&mut self) {
+        self.behavior.focused_camera = None;
+    }
 }
 
 pub struct TreeBehavior {
@@ -131,6 +150,7 @@ pub struct TreeBehavior {
     image_index: usize,
     frames_in_flight: usize,
     cameras_to_draw: Vec<(Camera, Arc<Framebuffer>)>,
+    focused_camera: Option<egui_tiles::TileId>,
 }
 
 impl egui_tiles::Behavior<Pane> for TreeBehavior {
@@ -145,7 +165,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
-        _tile_id: egui_tiles::TileId,
+        tile_id: egui_tiles::TileId,
         pane: &mut Pane,
     ) -> egui_tiles::UiResponse {
         let (started_dragging, pressed_close) = ui
@@ -164,7 +184,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
 
         match pane {
             Pane::CameraView(camera_view) => {
-                camera_view.draw(
+                let clicked = camera_view.draw(
                     ui,
                     &mut self.gui,
                     &self.memory_allocator,
@@ -173,6 +193,10 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
                     self.frames_in_flight,
                     &mut self.cameras_to_draw,
                 );
+
+                if clicked {
+                    self.focused_camera = Some(tile_id);
+                }
             }
             Pane::SceneTree => {
                 ui.label("Algo aca");
@@ -197,7 +221,7 @@ impl CameraView {
         image_index: usize,
         frames_in_flight: usize,
         cameras_to_draw: &mut Vec<(Camera, Arc<Framebuffer>)>,
-    ) {
+    ) -> bool {
         let available_size = ui.available_size();
         let size_changed = self.image_views.len() > 0
             && (available_size.x as u32 != self.image_views[0].image().extent()[0]
@@ -217,14 +241,16 @@ impl CameraView {
         }
 
         // Render the renderer framebuffer
-        ui.image(ImageSource::Texture(SizedTexture::new(
+        let response = ui.image(ImageSource::Texture(SizedTexture::new(
             self.egui_texture_ids[image_index as usize].clone(),
             (
                 self.image_views[image_index].image().extent()[0] as f32,
                 self.image_views[image_index].image().extent()[1] as f32,
             ),
-        )));
+        ))).interact(Sense::click());
         cameras_to_draw.push((self.camera.clone(), self.framebuffers[image_index].clone()));
+
+        return response.clicked();
     }
 
     fn resize(

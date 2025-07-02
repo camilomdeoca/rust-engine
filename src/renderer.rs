@@ -1,10 +1,7 @@
-use std::{
-    iter::repeat_with, sync::{Arc, RwLock}, u32
-};
+use std::{sync::{Arc, RwLock}, u32};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat3, Mat4, Vec2, Vec3};
-use smallvec::SmallVec;
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -37,7 +34,7 @@ use vulkano::{
         layout::PipelineDescriptorSetLayoutCreateInfo,
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, sync::{future::FenceSignalFuture, GpuFuture}, DeviceSize
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, DeviceSize
 };
 
 use crate::{
@@ -76,11 +73,9 @@ pub struct Renderer {
 
     sampler: Arc<Sampler>,
 
-    per_frame_resources: SmallVec<[PerFrameResources; MAX_FRAMES_IN_FLIGHT]>,
-
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
     materials_descriptor_set: Arc<DescriptorSet>,
-    // environment_descriptor_set: Arc<DescriptorSet>,
+    environment_descriptor_set: Arc<DescriptorSet>,
 
     environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
@@ -91,14 +86,10 @@ pub struct Renderer {
     world: World,
 }
 
+#[derive(Debug)]
 struct RendererAssetChangeListener {
     materials_changed: bool,
-    added_textures_queue: Vec<TextureId>,
-}
-
-struct PerFrameResources {
-    added_textures_from_other_frames_in_flight: Vec<TextureId>,
-    environment_descriptor_set: Arc<DescriptorSet>,
+    textures_changed: bool,
 }
 
 fn window_size_dependent_setup(
@@ -260,7 +251,7 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
         // For now nothing needs to be done here
     }
 
-    fn on_texture_add(&mut self, texture_id: TextureId, _texture: &Texture) {
+    fn on_texture_add(&mut self, _texture_id: TextureId, _texture: &Texture) {
         // TODO: in the future create an allocator of indices that allocates an index for each id
         // so we can use random ids for assets and not use the id as index (ids are secuential for
         // now but that could change and texture indices need to be mostly contiguous)
@@ -269,7 +260,7 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
         // next frame (in that case we wont need the &Texture reference). This would be to not
         // recreate the environment_descriptor_set multiple times per frame and to not update the
         // descriptor set after binding
-        self.added_textures_queue.push(texture_id);
+        self.textures_changed = true;
     }
 
     fn on_cubemap_add(&mut self, _cubemap_id: CubemapId, _cubemap: &Cubemap) {
@@ -287,11 +278,9 @@ impl Renderer {
         device: Arc<Device>,
         queue: Arc<Queue>,
         asset_database: Arc<RwLock<AssetDatabase>>,
-        max_textures: u32,
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
         format: Format,
-        frames_in_flight: usize,
     ) -> Self {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
@@ -495,51 +484,48 @@ impl Renderer {
         let environment_brdf_lut = environment_brdf_lut.unwrap();
 
         let asset_database_read = asset_database.read().unwrap();
-
-        let per_frame_resources = repeat_with(|| {
-            let environment_descriptor_set = DescriptorSet::new_variable(
-                descriptor_set_allocator.clone(),
-                mesh_pipeline.layout().set_layouts()[3].clone(),
-                max_textures as u32,
-                [
-                    WriteDescriptorSet::image_view(
-                        1,
-                        asset_database_read
-                            .get_cubemap(irradiance_map.clone())
-                            .unwrap()
-                            .cubemap
-                            .clone(),
-                    ),
-                    WriteDescriptorSet::image_view(
-                        2,
-                        asset_database_read
-                            .get_cubemap(prefiltered_environment_map.clone())
-                            .unwrap()
-                            .cubemap
-                            .clone(),
-                    ),
-                    WriteDescriptorSet::image_view(
-                        3,
-                        asset_database_read
-                            .get_cubemap(environment_brdf_lut.clone())
-                            .unwrap()
-                            .cubemap
-                            .clone(),
-                    ),
-                ],
-                [],
-            )
-            .unwrap();
-
-            PerFrameResources {
-                added_textures_from_other_frames_in_flight: vec![],
-                environment_descriptor_set,
-            }
-
-        })
-        .take(frames_in_flight)
-        .collect();
-
+        println!("TEXTURE COUNT {}", asset_database_read.textures().len());
+        let environment_descriptor_set = DescriptorSet::new_variable(
+            descriptor_set_allocator.clone(),
+            mesh_pipeline.layout().set_layouts()[3].clone(),
+            1, // If this is zero for some reason it cant be deallocated
+            [
+                WriteDescriptorSet::image_view(
+                    1,
+                    asset_database_read
+                        .get_cubemap(irradiance_map.clone())
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    2,
+                    asset_database_read
+                        .get_cubemap(prefiltered_environment_map.clone())
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    3,
+                    asset_database_read
+                        .get_cubemap(environment_brdf_lut.clone())
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                // WriteDescriptorSet::image_view_array(
+                //     4,
+                //     0,
+                //     asset_database_read
+                //         .textures()
+                //         .iter()
+                //         .map(|texture| texture.texture.clone()),
+                // ),
+            ],
+            [],
+        )
+        .unwrap();
         drop(asset_database_read);
 
         assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
@@ -571,7 +557,7 @@ impl Renderer {
         .unwrap();
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
-            added_textures_queue: vec![],
+            textures_changed: false,
             materials_changed: false,
         }));
 
@@ -599,7 +585,7 @@ impl Renderer {
             sampler,
             materials_storage_buffer,
             materials_descriptor_set,
-            per_frame_resources,
+            environment_descriptor_set,
             asset_change_listener,
             environment_cubemap_query,
             meshes_with_materials_query,
@@ -609,68 +595,71 @@ impl Renderer {
         renderer
     }
 
-    fn add_textures_to_descriptor(
-        &mut self,
-        frame_in_flight_idx: usize,
-    ) {
-        if self.per_frame_resources[frame_in_flight_idx]
-            .added_textures_from_other_frames_in_flight
-            .is_empty()
-            && self.asset_change_listener.read().unwrap()
-                .added_textures_queue.is_empty()
-        {
+    fn add_textures_to_descriptor(&mut self) {
+        if !self.asset_change_listener.read().unwrap().textures_changed {
             return;
         }
 
+        let mut irradiance_map = None;
+        let mut prefiltered_environment_map = None;
+        let mut environment_brdf_lut = None;
+
+        self.environment_cubemap_query.each(|env_cubemap| {
+            irradiance_map = Some(env_cubemap.irradiance_map.clone());
+            prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
+            environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
+        });
+        let irradiance_map = irradiance_map.unwrap();
+        let prefiltered_environment_map = prefiltered_environment_map.unwrap();
+        let environment_brdf_lut = environment_brdf_lut.unwrap();
+
         let asset_database_read = self.asset_database.read().unwrap();
-
-        let update_descriptor_set_with_id = |per_frame_resources: &PerFrameResources, texture_id: TextureId| {
-            // The only other option I think is recreating the whole descriptor set and as it has
-            // al lot of textures i dont want to do it
-            unsafe {
-                per_frame_resources.environment_descriptor_set.update_by_ref(
-                    [
-                        WriteDescriptorSet::image_view_array(
-                            4,
-                            texture_id.0,
-                            [asset_database_read.get_texture(texture_id).unwrap().texture.clone()]
-                        ),
-                    ],
-                    [],
-                )
-            }.unwrap();
-        };
-
-        // TODO: FIXME: we could be updating the environment_descriptor_set while using it because we
-        // dont wait for the fence of the previous use of this frame in flight. Once i figure how
-        // to wait for that future add it here.
-        //
-        // It seams to work but that should be fixed
-
-        for texture_id in &self.per_frame_resources[frame_in_flight_idx].added_textures_from_other_frames_in_flight {
-            update_descriptor_set_with_id(
-                &self.per_frame_resources[frame_in_flight_idx],
-                texture_id.clone()
-            );
-        }
-        self.per_frame_resources[frame_in_flight_idx]
-            .added_textures_from_other_frames_in_flight
-            .clear();
-
+        println!("TEXTURE COUNT {}", asset_database_read.textures().len());
+        self.environment_descriptor_set = DescriptorSet::new_variable(
+            self.descriptor_set_allocator.clone(),
+            self.mesh_pipeline.layout().set_layouts()[3].clone(),
+            asset_database_read.textures().len() as u32,
+            [
+                WriteDescriptorSet::image_view(
+                    1,
+                    asset_database_read
+                        .get_cubemap(irradiance_map)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    2,
+                    asset_database_read
+                        .get_cubemap(prefiltered_environment_map)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    3,
+                    asset_database_read
+                        .get_cubemap(environment_brdf_lut)
+                        .unwrap()
+                        .cubemap
+                        .clone(),
+                ),
+                WriteDescriptorSet::image_view_array(
+                    4,
+                    0,
+                    asset_database_read
+                        .textures()
+                        .iter()
+                        .map(|texture| texture.texture.clone()),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+        drop(asset_database_read);
+        
         let mut asset_change_listener_write = self.asset_change_listener.write().unwrap();
-        for texture_id in asset_change_listener_write.added_textures_queue.iter() {
-            update_descriptor_set_with_id(
-                &self.per_frame_resources[frame_in_flight_idx],
-                texture_id.clone()
-            );
-            for (i, per_frame_resources) in self.per_frame_resources.iter_mut().enumerate() {
-                if i == frame_in_flight_idx { continue; }
-                per_frame_resources
-                    .added_textures_from_other_frames_in_flight
-                    .push(texture_id.clone());
-            }
-        }
-        asset_change_listener_write.added_textures_queue.clear();
+        asset_change_listener_write.textures_changed = false;
     }
 
     fn add_materials_to_storage_buffer(&mut self) {
@@ -795,10 +784,9 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         framebuffer: &Arc<Framebuffer>,
         camera: &Camera,
-        frame_in_flight: usize,
     ) {
-        self.add_textures_to_descriptor(frame_in_flight);
         self.add_materials_to_storage_buffer();
+        self.add_textures_to_descriptor();
 
         let timer = ProfileTimer::start("begin_render_pass");
         builder
@@ -819,7 +807,7 @@ impl Renderer {
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
         let timer = ProfileTimer::start("draw_meshes");
-        self.draw_meshes(builder, &camera, aspect_ratio, frame_in_flight);
+        self.draw_meshes(builder, &camera, aspect_ratio);
         drop(timer);
 
         let timer = ProfileTimer::start("next_subpass");
@@ -848,7 +836,6 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-        frame_in_flight: usize,
     ) {
         let frame_uniform_buffer = {
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
@@ -957,13 +944,13 @@ impl Renderer {
                     frame_descriptor_set.clone(),
                     self.materials_descriptor_set.clone(),
                     entity_data_descriptor_set.clone(),
-                    self.per_frame_resources[frame_in_flight].environment_descriptor_set.clone(),
+                    self.environment_descriptor_set.clone(),
                 ),
             )
             .map_err(|err| {
                 println!("{}", err);
                 println!("{:#?}", *self.mesh_pipeline.layout().set_layouts()[3]);
-                println!("{:#?}", self.per_frame_resources[frame_in_flight].environment_descriptor_set.layout());
+                println!("{:#?}", self.environment_descriptor_set.layout());
             }).unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();

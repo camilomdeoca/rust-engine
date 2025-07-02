@@ -88,7 +88,6 @@ struct RenderingContext {
     previous_fence_index: u32,
     renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
-    is_mouse_captured: bool,
     user_interface: UserInterface,
     frametime: Duration,
 }
@@ -103,7 +102,6 @@ struct App {
     world: World,
     entities_to_add_queue: Arc<RwLock<Vec<(String, Transform, MeshComponent, MaterialComponent)>>>,
     asset_database: Arc<RwLock<AssetDatabase>>,
-    camera: Camera,
     _debug_callback: Arc<DebugUtilsMessenger>,
 
     rendering_context: Option<RenderingContext>,
@@ -471,11 +469,6 @@ impl App {
             world,
             entities_to_add_queue: Arc::new(RwLock::new(vec![])),
             asset_database,
-            camera: Camera {
-                position: Vec3::new(0.0, 0.0, 1.0),
-                rotation: Quat::from_euler(EulerRot::YXZ, 0.0, 0.0, 0.0),
-                fov: 90f32.to_radians(),
-            },
             _debug_callback,
             rendering_context: None,
             keys_state: HashMap::new(),
@@ -537,40 +530,13 @@ impl ApplicationHandler for App {
                 .map(|image| ImageView::new_default(image.clone()).unwrap())
                 .collect();
 
-            // 3d Renderer doesnt render directly to the swapchain, it renders to a texture that
-            // later egui renders in a widget in the screen
-            let mut image_views_for_framebuffers_3d_renderer = Vec::with_capacity(frames_in_flight);
-            for _ in 0..frames_in_flight {
-                image_views_for_framebuffers_3d_renderer.push(
-                    ImageView::new_default(
-                        Image::new(
-                            self.memory_allocator.clone(),
-                            ImageCreateInfo {
-                                image_type: ImageType::Dim2d,
-                                format: Format::R8G8B8A8_UNORM,
-                                extent: [512, 512, 1],
-                                usage: ImageUsage::TRANSFER_DST
-                                    | ImageUsage::SAMPLED
-                                    | ImageUsage::COLOR_ATTACHMENT,
-                                ..Default::default()
-                            },
-                            AllocationCreateInfo::default(),
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap(),
-                );
-            }
-
             let renderer = Arc::new(RwLock::new(Renderer::new(
                 self.device.clone(),
                 self.queue.clone(),
                 self.asset_database.clone(),
-                1024, // max_textures
                 self.memory_allocator.clone(),
                 self.world.clone(),
                 Format::R8G8B8A8_UNORM,
-                frames_in_flight,
             )));
 
             let asset_database_clone = self.asset_database.clone();
@@ -580,10 +546,14 @@ impl ApplicationHandler for App {
                     "assets/meshes/Bistro_with_tangents_all.glb",
                     //"assets/meshes/DamagedHelmet.glb",
                     entities_to_add_queue_clone,
-                    asset_database_clone,
+                    asset_database_clone.clone(),
                 )
                 .unwrap();
                 println!("Loaded scene");
+                let vertex_buffer_offset: DeviceSize = asset_database_clone.read().unwrap().meshes().iter().fold(0, |acc, mesh| {
+                    acc.max((mesh.vertex_offset + mesh.vertex_count) as DeviceSize)
+                });
+                println!("OFFSET = {vertex_buffer_offset}");
             });
 
             let gui = Gui::new(
@@ -604,7 +574,11 @@ impl ApplicationHandler for App {
                 frames_in_flight,
             );
 
-            user_interface.add_camera_view(self.camera.clone());
+            user_interface.add_camera_view(Camera {
+                position: Vec3::new(0.0, 0.0, 1.0),
+                rotation: Quat::from_euler(EulerRot::YXZ, 0.0, 0.0, 0.0),
+                fov: 90f32.to_radians(),
+            });
             user_interface.add_scene_view();
 
             let mut fences = vec![];
@@ -621,7 +595,6 @@ impl ApplicationHandler for App {
                 previous_fence_index: 0,
                 renderer,
                 start_frame_instant: Instant::now(),
-                is_mouse_captured: false,
                 user_interface,
                 frametime: Duration::ZERO,
             });
@@ -647,13 +620,14 @@ impl ApplicationHandler for App {
                     .insert(key_code, state == ElementState::Pressed);
             }
             DeviceEvent::MouseMotion { delta } => {
-                if self.rendering_context.as_ref().unwrap().is_mouse_captured {
+                let rcx = self.rendering_context.as_mut().unwrap();
+                if let Some(camera) = rcx.user_interface.get_focused_camera() {
                     let sensitivity = 0.5f32;
 
                     let yaw = Quat::from_rotation_y(-delta.0 as f32 * sensitivity * 0.01);
                     let pitch = Quat::from_rotation_x(-delta.1 as f32 * sensitivity * 0.01);
 
-                    self.camera.rotation = yaw * self.camera.rotation * pitch;
+                    camera.rotation = yaw * camera.rotation * pitch;
                 }
             }
             DeviceEvent::MouseWheel { delta: _delta } => {
@@ -671,9 +645,13 @@ impl ApplicationHandler for App {
     ) {
         let rcx = self.rendering_context.as_mut().unwrap();
 
-        if !rcx.is_mouse_captured && rcx.user_interface.update(&event) {
+        if rcx.user_interface.get_focused_camera().is_some() {
+            rcx.window.set_cursor_grab(CursorGrabMode::Confined).unwrap();
+            rcx.window.set_cursor_visible(false);
+        } else if rcx.user_interface.update(&event) {
             return;
         }
+
 
         match event {
             WindowEvent::CloseRequested
@@ -699,15 +677,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                rcx.is_mouse_captured = !rcx.is_mouse_captured;
-                rcx.window
-                    .set_cursor_grab(if rcx.is_mouse_captured {
-                        CursorGrabMode::Confined
-                    } else {
-                        CursorGrabMode::None
-                    })
-                    .unwrap();
-                rcx.window.set_cursor_visible(!rcx.is_mouse_captured);
+                rcx.user_interface.unfocus_camera();
+                rcx.window.set_cursor_grab(CursorGrabMode::None).unwrap();
+                rcx.window.set_cursor_visible(true);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -728,10 +700,10 @@ impl ApplicationHandler for App {
                 rcx.recreate_swapchain = true;
             }
             WindowEvent::RedrawRequested => {
-                if rcx.is_mouse_captured {
+                if let Some(camera) = rcx.user_interface.get_focused_camera() {
                     let speed = 5f32;
-                    let forward = -(self.camera.rotation * Vec3::Z);
-                    let right = self.camera.rotation * Vec3::X;
+                    let forward = -(camera.rotation * Vec3::Z);
+                    let right = camera.rotation * Vec3::X;
                     let mut direction = Vec3::ZERO;
 
                     if self
@@ -786,18 +758,20 @@ impl ApplicationHandler for App {
                     if direction.length_squared() > 0.0 {
                         direction = direction.normalize();
                     }
-                    self.camera.position += direction * speed * 0.01;
+
+                    camera.position += direction * speed * 0.01;
                 }
 
                 let mut entities_to_add_queue_write = self.entities_to_add_queue.write().unwrap();
-                while let Some((name, transform, mesh, material)) = entities_to_add_queue_write.pop() {
+                let old_entities_to_add_queue = std::mem::take(&mut *entities_to_add_queue_write);
+                drop(entities_to_add_queue_write);
+                for (name, transform, mesh, material) in old_entities_to_add_queue {
                     self.world
                         .entity_named(&name)
                         .set(transform)
                         .set(mesh)
                         .set(material);
                 }
-                drop(entities_to_add_queue_write);
 
                 if rcx.recreate_swapchain {
                     let window_size = rcx.window.inner_size();
