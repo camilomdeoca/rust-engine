@@ -17,6 +17,7 @@ egui_tiles = "0.12.0"
 egui_winit_vulkano = "0.28.0"
 flecs_ecs = "0.1.3"
 image = "0.25.6"
+log = "0.4.27"
 memory-stats = "1.2.0"
 smallvec = "1.15.1"
 

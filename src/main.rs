@@ -14,6 +14,7 @@ mod image_based_lighting_maps_generator;
 mod profile;
 mod renderer;
 mod ui;
+mod input;
 
 use assets::{
     database::AssetDatabase,
@@ -25,9 +26,10 @@ use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
+use log::{info, warn};
 use profile::ProfileTimer;
 use renderer::Renderer;
-use ui::UserInterface;
+use ui::{logger, UserInterface};
 use std::{
     collections::HashMap,
     error::Error,
@@ -143,7 +145,7 @@ fn debug_messenger_callback(
         panic!("no-impl");
     };
 
-    println!(
+    info!(
         "{} {} {}: {}",
         callback_data.message_id_name.unwrap_or("unknown"),
         ty,
@@ -193,6 +195,8 @@ fn select_physical_device(
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Self {
+        log::set_max_level(log::LevelFilter::Debug);
+        log::set_logger(Box::leak(Box::new(logger::LoggerImplementation {}))).unwrap();
         let library = VulkanLibrary::new().unwrap();
 
         let required_extensions = InstanceExtensions {
@@ -277,13 +281,13 @@ impl App {
         let (physical_device, queue_family_index) =
             select_physical_device(instance.clone(), device_extensions, event_loop).unwrap();
 
-        println!(
+        info!(
             "Using device: {} (type: {:?})",
             physical_device.properties().device_name,
             physical_device.properties().device_type,
         );
 
-        println!("Queue {queue_family_index}");
+        info!("Queue {queue_family_index}");
 
         let (device, mut queues) = Device::new(
             physical_device,
@@ -346,7 +350,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
-        println!("Created irradiance map image");
+        info!("Created irradiance map image");
 
         let irradiance_map = ImageView::new(
             irradiance_map_image.clone(),
@@ -374,7 +378,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
-        println!("Created prefiltered environment image");
+        info!("Created prefiltered environment image");
 
         let prefiltered_environment_map = ImageView::new(
             prefiltered_environment_map_image.clone(),
@@ -399,7 +403,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
-        println!("Created environment brdf lut");
+        info!("Created environment brdf lut");
 
         let environment_brdf_lut = ImageView::new(
             environment_brdf_lut_image.clone(),
@@ -422,7 +426,7 @@ impl App {
                 "assets/cubemaps/skybox/nz.hdr",
             ])
             .unwrap();
-        println!("Loaded skybox");
+        info!("Loaded skybox");
 
         let irradiance_map_renderer = ImageBasedLightingMapsGenerator::new(
             device.clone(),
@@ -443,7 +447,7 @@ impl App {
             prefiltered_environment_map_image.clone(),
             environment_brdf_lut_image.clone(),
         );
-        println!("Created ibl maps");
+        info!("Created ibl maps");
 
         let mut asset_database_write = asset_database.write().unwrap();
         world.set(EnvironmentCubemap {
@@ -523,7 +527,7 @@ impl ApplicationHandler for App {
 
             let frames_in_flight = images.len();
 
-            println!("FRAMES IN FLIGHT {frames_in_flight}");
+            info!("FRAMES IN FLIGHT {frames_in_flight}");
 
             let swapchain_image_views: Vec<_> = images
                 .iter()
@@ -549,11 +553,7 @@ impl ApplicationHandler for App {
                     asset_database_clone.clone(),
                 )
                 .unwrap();
-                println!("Loaded scene");
-                let vertex_buffer_offset: DeviceSize = asset_database_clone.read().unwrap().meshes().iter().fold(0, |acc, mesh| {
-                    acc.max((mesh.vertex_offset + mesh.vertex_count) as DeviceSize)
-                });
-                println!("OFFSET = {vertex_buffer_offset}");
+                info!("Loaded scene");
             });
 
             let gui = Gui::new(
@@ -579,7 +579,7 @@ impl ApplicationHandler for App {
                 rotation: Quat::from_euler(EulerRot::YXZ, 0.0, 0.0, 0.0),
                 fov: 90f32.to_radians(),
             });
-            user_interface.add_scene_view();
+            user_interface.add_log_view();
 
             let mut fences = vec![];
             for _ in 0..frames_in_flight {
@@ -883,11 +883,11 @@ impl ApplicationHandler for App {
                     }
                     Err(VulkanError::OutOfDate) => {
                         rcx.recreate_swapchain = true;
-                        println!("OutOfDate");
+                        warn!("OutOfDate");
                         None
                     }
                     Err(e) => {
-                        println!("failed to flush future: {e}");
+                        warn!("failed to flush future: {e}");
                         None
                     }
                 };

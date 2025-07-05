@@ -1045,6 +1045,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "log",
  "memory-stats",
  "smallvec",
  "vulkano",

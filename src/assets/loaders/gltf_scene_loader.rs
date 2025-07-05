@@ -2,6 +2,7 @@ use std::{collections::HashMap, fs, path::Path, sync::{Arc, RwLock}};
 
 use glam::{Quat, Vec3};
 use gltf::{buffer::Data, image::Source, mesh::util::ReadIndices, Texture};
+use log::info;
 use vulkano::format::Format;
 
 use crate::{
@@ -68,7 +69,7 @@ pub fn load_gltf_scene(
     let path = path.as_ref();
     let file_data = fs::read(&path).unwrap();
     let gltf = gltf::Gltf::from_slice(&file_data).unwrap();
-    println!("Importing {:?} ({} meshes)", path, gltf.meshes().len());
+    info!("Importing {:?} ({} meshes)", path, gltf.meshes().len());
     let base_path = path.parent().unwrap_or_else(|| Path::new("./"));
     let gltf_buffers = gltf::import_buffers(&gltf.document, Some(base_path), gltf.blob).unwrap();
 
@@ -89,7 +90,7 @@ pub fn load_gltf_scene(
         }
         let mesh = node.mesh().unwrap();
 
-        println!(
+        info!(
             "    [{}/{}]: Mesh {}",
             node.index(),
             gltf.document.nodes().len(),
@@ -97,7 +98,7 @@ pub fn load_gltf_scene(
         );
 
         for primitive in mesh.primitives() {
-            println!(
+            info!(
                 "        Material {} {}",
                 primitive.material().name().unwrap(),
                 if materials.contains_key(&primitive.material().index().unwrap()) {

@@ -484,7 +484,6 @@ impl Renderer {
         let environment_brdf_lut = environment_brdf_lut.unwrap();
 
         let asset_database_read = asset_database.read().unwrap();
-        println!("TEXTURE COUNT {}", asset_database_read.textures().len());
         let environment_descriptor_set = DescriptorSet::new_variable(
             descriptor_set_allocator.clone(),
             mesh_pipeline.layout().set_layouts()[3].clone(),
@@ -614,7 +613,6 @@ impl Renderer {
         let environment_brdf_lut = environment_brdf_lut.unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();
-        println!("TEXTURE COUNT {}", asset_database_read.textures().len());
         self.environment_descriptor_set = DescriptorSet::new_variable(
             self.descriptor_set_allocator.clone(),
             self.mesh_pipeline.layout().set_layouts()[3].clone(),
@@ -947,11 +945,12 @@ impl Renderer {
                     self.environment_descriptor_set.clone(),
                 ),
             )
-            .map_err(|err| {
-                println!("{}", err);
-                println!("{:#?}", *self.mesh_pipeline.layout().set_layouts()[3]);
-                println!("{:#?}", self.environment_descriptor_set.layout());
-            }).unwrap();
+            // .map_err(|err| {
+            //     println!("{}", err);
+            //     println!("{:#?}", *self.mesh_pipeline.layout().set_layouts()[3]);
+            //     println!("{:#?}", self.environment_descriptor_set.layout());
+            // })
+            .unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();
         builder

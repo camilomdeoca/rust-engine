@@ -18,6 +18,8 @@ use winit::event::WindowEvent;
 
 use crate::{camera::Camera, renderer::Renderer};
 
+pub mod logger;
+
 struct CameraView {
     camera: Camera,
     image_views: Vec<Arc<ImageView>>,
@@ -27,7 +29,7 @@ struct CameraView {
 
 pub enum Pane {
     CameraView(CameraView),
-    SceneTree,
+    LogView,
 }
 
 pub struct UserInterface {
@@ -115,8 +117,8 @@ impl UserInterface {
         });
     }
 
-    pub fn add_scene_view(&mut self) {
-        let id = self.tree.tiles.insert_pane(Pane::SceneTree);
+    pub fn add_log_view(&mut self) {
+        let id = self.tree.tiles.insert_pane(Pane::LogView);
         self.tree.root = Some({
             let old_root = self.tree.root().unwrap();
             let tiles = &mut self.tree.tiles;
@@ -157,7 +159,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         match pane {
             Pane::CameraView(_) => "Camera view",
-            Pane::SceneTree => "scene tree",
+            Pane::LogView => "Log",
         }
         .into()
     }
@@ -198,8 +200,8 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
                     self.focused_camera = Some(tile_id);
                 }
             }
-            Pane::SceneTree => {
-                ui.label("Algo aca");
+            Pane::LogView => {
+                logger::ui(ui);
             }
         }
 

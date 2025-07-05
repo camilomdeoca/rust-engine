@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use log::info;
 use memory_stats::memory_stats;
 
 fn get_current_process_memory_usage() -> usize {
@@ -13,7 +14,7 @@ fn get_current_process_memory_usage() -> usize {
 #[allow(dead_code)]
 pub fn debug_memory_usage(line: u32, file: &'static str) {
     let mem_usage = get_current_process_memory_usage();
-    println!(
+    info!(
         "[Line {}] {}: RAM usage: {} MB",
         line,
         file,
