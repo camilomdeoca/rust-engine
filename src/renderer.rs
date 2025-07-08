@@ -50,6 +50,19 @@ use crate::{
 
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+/// The index of the descitptor set that doesnt change every frame
+/// It has textures and materials buffer
+pub const SLOW_CHANGING_DESCRIPTOR_SET: usize = 0;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING: u32 = 0;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING: u32 = 4;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 5;
+
+/// The index of the descriptor set that changes every frame
+/// Has camera matrices and the transformations and materials indices for every entity
+pub const FRAME_DESCRIPTOR_SET: usize = 1;
+pub const FRAME_DESCRIPTOR_SET_CAMERA_MATRICES_BINDING: u32 = 0;
+pub const FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING: u32 = 1;
+
 pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
@@ -74,8 +87,7 @@ pub struct Renderer {
     sampler: Arc<Sampler>,
 
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
-    materials_descriptor_set: Arc<DescriptorSet>,
-    environment_descriptor_set: Arc<DescriptorSet>,
+    slow_changing_descriptor_set: Arc<DescriptorSet>,
 
     environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
@@ -120,20 +132,20 @@ fn window_size_dependent_setup(
         let mut layout_create_info =
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
         
-        // Env descriptor set (rebound when the skybox changes, not too often)
-        layout_create_info.set_layouts[3]
+        // SLOW_CHANGING_DESCRIPTOR_SET
+        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
-            .get_mut(&0)
+            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING)
             .unwrap()
             .immutable_samplers = vec![sampler.clone()];
-        layout_create_info.set_layouts[3]
+        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
-            .get_mut(&4)
+            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
             .unwrap()
             .descriptor_count = properties.max_descriptor_set_samplers - 3;
-        layout_create_info.set_layouts[3]
+        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
-            .get_mut(&4)
+            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
             .unwrap()
             .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT | DescriptorBindingFlags::PARTIALLY_BOUND;
 
@@ -470,6 +482,23 @@ impl Renderer {
         let meshes_with_materials_query =
             world.new_query::<(&MeshComponent, &MaterialComponent, &Transform)>();
 
+        assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
+
+        let materials_storage_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+
         let mut irradiance_map = None;
         let mut prefiltered_environment_map = None;
         let mut environment_brdf_lut = None;
@@ -486,7 +515,7 @@ impl Renderer {
         let asset_database_read = asset_database.read().unwrap();
         let environment_descriptor_set = DescriptorSet::new_variable(
             descriptor_set_allocator.clone(),
-            mesh_pipeline.layout().set_layouts()[3].clone(),
+            mesh_pipeline.layout().set_layouts()[SLOW_CHANGING_DESCRIPTOR_SET].clone(),
             1, // If this is zero for some reason it cant be deallocated
             [
                 WriteDescriptorSet::image_view(
@@ -513,6 +542,10 @@ impl Renderer {
                         .cubemap
                         .clone(),
                 ),
+                WriteDescriptorSet::buffer(
+                    SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
+                    materials_storage_buffer.clone(),
+                ),
                 // WriteDescriptorSet::image_view_array(
                 //     4,
                 //     0,
@@ -526,34 +559,6 @@ impl Renderer {
         )
         .unwrap();
         drop(asset_database_read);
-
-        assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
-
-        let materials_storage_buffer = Buffer::new_slice(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        let materials_descriptor_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            mesh_pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(
-                0,
-                materials_storage_buffer.clone(),
-            )],
-            [],
-        )
-        .unwrap();
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
             textures_changed: false,
@@ -583,8 +588,7 @@ impl Renderer {
             cube_index_buffer,
             sampler,
             materials_storage_buffer,
-            materials_descriptor_set,
-            environment_descriptor_set,
+            slow_changing_descriptor_set: environment_descriptor_set,
             asset_change_listener,
             environment_cubemap_query,
             meshes_with_materials_query,
@@ -594,9 +598,53 @@ impl Renderer {
         renderer
     }
 
-    fn add_textures_to_descriptor(&mut self) {
-        if !self.asset_change_listener.read().unwrap().textures_changed {
+    fn add_materials_and_textures_to_descriptor_set(&mut self) {
+        let asset_change_listener_read = self.asset_change_listener.read().unwrap();
+        let textures_changed = asset_change_listener_read.textures_changed;
+        let materials_changed = asset_change_listener_read.materials_changed;
+        drop(asset_change_listener_read);
+
+        if !textures_changed && !materials_changed {
             return;
+        }
+
+        if materials_changed {
+            let asset_database_read = self.asset_database.read().unwrap();
+
+            let materials_iter = asset_database_read.materials().iter().map(|material| {
+                let diffuse = material.diffuse.clone().map(|id| id.0);
+                let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
+                let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
+                let emissive = material.emissive.clone().map(|id| id.0);
+                let normal = material.normal.clone().map(|id| id.0);
+                mesh_shaders::fs::Material {
+                    base_color_factor: material.color_factor.into(),
+                    emissive_factor: material.emissive_factor.into(),
+                    metallic_factor: material.metallic_factor.into(),
+                    roughness_factor: material.roughness_factor.into(),
+                    base_color_texture_id: diffuse.unwrap_or(u32::MAX),
+                    metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
+                    ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
+                    emissive_texture_id: emissive.unwrap_or(u32::MAX),
+                    normal_texture_id: normal.unwrap_or(u32::MAX),
+                    pad: [0; 3],
+                }
+            });
+
+            self.materials_storage_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                materials_iter,
+            )
+            .unwrap();
         }
 
         let mut irradiance_map = None;
@@ -613,9 +661,9 @@ impl Renderer {
         let environment_brdf_lut = environment_brdf_lut.unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();
-        self.environment_descriptor_set = DescriptorSet::new_variable(
+        self.slow_changing_descriptor_set = DescriptorSet::new_variable(
             self.descriptor_set_allocator.clone(),
-            self.mesh_pipeline.layout().set_layouts()[3].clone(),
+            self.mesh_pipeline.layout().set_layouts()[SLOW_CHANGING_DESCRIPTOR_SET].clone(),
             asset_database_read.textures().len() as u32,
             [
                 WriteDescriptorSet::image_view(
@@ -642,8 +690,12 @@ impl Renderer {
                         .cubemap
                         .clone(),
                 ),
+                WriteDescriptorSet::buffer(
+                    SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
+                    self.materials_storage_buffer.clone(),
+                ),
                 WriteDescriptorSet::image_view_array(
-                    4,
+                    SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING,
                     0,
                     asset_database_read
                         .textures()
@@ -655,67 +707,10 @@ impl Renderer {
         )
         .unwrap();
         drop(asset_database_read);
-        
-        let mut asset_change_listener_write = self.asset_change_listener.write().unwrap();
-        asset_change_listener_write.textures_changed = false;
-    }
-
-    fn add_materials_to_storage_buffer(&mut self) {
-        if !self.asset_change_listener.read().unwrap().materials_changed {
-            return;
-        }
-
-        let asset_database_read = self.asset_database.read().unwrap();
-
-        let materials_iter = asset_database_read.materials().iter().map(|material| {
-            let diffuse = material.diffuse.clone().map(|id| id.0);
-            let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
-            let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
-            let emissive = material.emissive.clone().map(|id| id.0);
-            let normal = material.normal.clone().map(|id| id.0);
-            mesh_shaders::fs::Material {
-                base_color_factor: material.color_factor.into(),
-                emissive_factor: material.emissive_factor.into(),
-                metallic_factor: material.metallic_factor.into(),
-                roughness_factor: material.roughness_factor.into(),
-                base_color_texture_id: diffuse.unwrap_or(u32::MAX),
-                metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
-                ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
-                emissive_texture_id: emissive.unwrap_or(u32::MAX),
-                normal_texture_id: normal.unwrap_or(u32::MAX),
-                pad: [0; 3],
-            }
-        });
-
-        self.materials_storage_buffer = Buffer::from_iter(
-            self.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            materials_iter,
-        )
-        .unwrap();
-        drop(asset_database_read);
-
-        self.materials_descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            self.mesh_pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(
-                0,
-                self.materials_storage_buffer.clone(),
-            )],
-            [],
-        )
-        .unwrap();
 
         let mut asset_change_listener_write = self.asset_change_listener.write().unwrap();
         asset_change_listener_write.materials_changed = false;
+        asset_change_listener_write.textures_changed = false;
     }
 
     fn create_framebuffers(&self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
@@ -783,8 +778,7 @@ impl Renderer {
         framebuffer: &Arc<Framebuffer>,
         camera: &Camera,
     ) {
-        self.add_materials_to_storage_buffer();
-        self.add_textures_to_descriptor();
+        self.add_materials_and_textures_to_descriptor_set();
 
         let timer = ProfileTimer::start("begin_render_pass");
         builder
@@ -859,14 +853,6 @@ impl Renderer {
             buffer
         };
 
-        let frame_descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            self.mesh_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, frame_uniform_buffer)],
-            [],
-        )
-        .unwrap();
-
         let mut entities_data = vec![];
         let mut indirect_commands = vec![];
 
@@ -917,14 +903,20 @@ impl Renderer {
             .write()
             .unwrap()
             .copy_from_slice(&entities_data);
-
-        let entity_data_descriptor_set = DescriptorSet::new(
+        
+        let frame_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
-            self.mesh_pipeline.layout().set_layouts()[2].clone(),
-            [WriteDescriptorSet::buffer(
-                0,
-                entity_data_storage_buffer.clone(),
-            )],
+            self.mesh_pipeline.layout().set_layouts()[FRAME_DESCRIPTOR_SET].clone(),
+            [
+                WriteDescriptorSet::buffer(
+                    FRAME_DESCRIPTOR_SET_CAMERA_MATRICES_BINDING,
+                    frame_uniform_buffer,
+                ),
+                WriteDescriptorSet::buffer(
+                    FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING,
+                    entity_data_storage_buffer.clone(),
+                ),
+            ],
             [],
         )
         .unwrap();
@@ -939,17 +931,10 @@ impl Renderer {
                 self.mesh_pipeline.layout().clone(),
                 0,
                 (
+                    self.slow_changing_descriptor_set.clone(),
                     frame_descriptor_set.clone(),
-                    self.materials_descriptor_set.clone(),
-                    entity_data_descriptor_set.clone(),
-                    self.environment_descriptor_set.clone(),
                 ),
             )
-            // .map_err(|err| {
-            //     println!("{}", err);
-            //     println!("{:#?}", *self.mesh_pipeline.layout().set_layouts()[3]);
-            //     println!("{:#?}", self.environment_descriptor_set.layout());
-            // })
             .unwrap();
 
         let asset_database_read = self.asset_database.read().unwrap();

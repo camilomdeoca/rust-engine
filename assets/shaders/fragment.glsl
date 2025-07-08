@@ -10,23 +10,6 @@ layout(location = 6) in vec3 v_light_pos;
 
 layout(location = 0) out vec4 f_color;
 
-// Environment descriptor
-layout(set = 3, binding = 0) uniform sampler s;
-layout(set = 3, binding = 1) uniform textureCube irradiance_map;
-layout(set = 3, binding = 2) uniform textureCube prefiltered_environment_map;
-layout(set = 3, binding = 3) uniform texture2D environment_brdf_lut;
-layout(set = 3, binding = 4) uniform texture2D textures[];
-
-// Frame descriptor set
-layout(set = 0, binding = 0) uniform FrameUniforms {
-    mat4 view;
-    mat3 inv_view;
-    mat4 proj;
-} frame;
-
-const uint UINT_MAX = 4294967295;
-
-// Material descriptor
 struct Material {
     vec4 base_color_factor;
     uint base_color_texture_id;
@@ -40,26 +23,36 @@ struct Material {
     uint pad[3];
 };
 
-layout(std430, set = 1, binding = 0) readonly buffer MaterialBuffer {
-    Material data[];
-} materials_buffer;
-
-// Model descriptor set
 struct EntityData {
     mat4 transform;
     uint material;
     uint pad[3];
 };
 
-layout(std430, set = 2, binding = 0) readonly buffer EntityDataBuffer {
-    EntityData data[];
-} entity_data_buffer;
+// Slow changing descriptor set 
+//   - doesn't change every frame
+//   - changes when a texture is added (a material is added)
+layout(set = 0, binding = 0) uniform sampler s;
+layout(set = 0, binding = 1) uniform textureCube irradiance_map;
+layout(set = 0, binding = 2) uniform textureCube prefiltered_environment_map;
+layout(set = 0, binding = 3) uniform texture2D environment_brdf_lut;
+layout(std430, set = 0, binding = 4) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+layout(set = 0, binding = 5) uniform texture2D textures[];
 
-// layout(set = 2, binding = 1) uniform texture2D diffuse;
-// layout(set = 2, binding = 2) uniform texture2D metallic_roughness;
-// layout(set = 2, binding = 3) uniform texture2D ambient_oclussion;
-// layout(set = 2, binding = 4) uniform texture2D emissive;
-// layout(set = 2, binding = 5) uniform texture2D normal;
+// Frame descriptor set
+//   - changes every frame
+layout(set = 1, binding = 0) uniform FrameUniforms {
+    mat4 view;
+    mat3 inv_view;
+    mat4 proj;
+};
+layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
+    EntityData entity_data[];
+};
+
+const uint UINT_MAX = 4294967295;
 
 const float PI = 3.14159265359;
 // ----------------------------------------------------------------------------
@@ -116,8 +109,8 @@ void main()
     vec3 emissive;
     vec3 N;
 
-    uint material_id = entity_data_buffer.data[v_draw_id].material;
-    Material material = materials_buffer.data[material_id];
+    uint material_id = entity_data[v_draw_id].material;
+    Material material = materials[material_id];
 
     if (material.base_color_texture_id != UINT_MAX)
     {
@@ -245,14 +238,14 @@ void main()
     vec3 kS = fresnelSchlick(max(dot(N, V), 0.0), F0);
     vec3 kD = 1.0 - kS;
     kD *= 1.0 - metallic;
-    vec3 Nuvw = frame.inv_view * N;
+    vec3 Nuvw = inv_view * N;
     Nuvw.x *= -1.0;
     vec3 irradiance = texture(samplerCube(irradiance_map, s), Nuvw).rgb;
     vec3 diffuse      = irradiance * base_color.rgb;
     
     // sample both the pre-filter map and the BRDF lut and combine them together as per the Split-Sum approximation to get the IBL specular part.
     const float MAX_REFLECTION_LOD = 4.0;
-    vec3 Ruvw = frame.inv_view * R;
+    vec3 Ruvw = inv_view * R;
     Ruvw.x *= -1.0;
     vec3 prefilteredColor = textureLod(samplerCube(prefiltered_environment_map, s), Ruvw, roughness * MAX_REFLECTION_LOD).rgb;
     vec2 brdf  = texture(sampler2D(environment_brdf_lut, s), vec2(max(dot(N, V), 0.0), roughness)).rg;

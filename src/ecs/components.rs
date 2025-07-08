@@ -32,6 +32,11 @@ pub struct EnvironmentCubemap {
 }
 
 #[derive(Debug, Component)]
+pub struct PointLight {
+    pub color: Vec3,
+}
+
+#[derive(Debug, Component)]
 pub struct Camera {
     pub fov: f32,
 }
