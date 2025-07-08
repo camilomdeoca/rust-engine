@@ -21,7 +21,7 @@ use assets::{
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, Transform};
+use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, SceneEntity, Transform};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
@@ -580,6 +580,7 @@ impl ApplicationHandler for App {
                 fov: 90f32.to_radians(),
             });
             user_interface.add_log_view();
+            user_interface.add_scene_tree(self.world.clone());
 
             let mut fences = vec![];
             for _ in 0..frames_in_flight {
@@ -768,6 +769,7 @@ impl ApplicationHandler for App {
                 for (name, transform, mesh, material) in old_entities_to_add_queue {
                     self.world
                         .entity_named(&name)
+                        .add::<SceneEntity>()
                         .set(transform)
                         .set(mesh)
                         .set(material);

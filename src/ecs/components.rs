@@ -4,6 +4,9 @@ use glam::{Quat, Vec2, Vec3};
 use crate::assets::database::{CubemapId, MaterialId, MeshId};
 
 #[derive(Debug, Component)]
+pub struct SceneEntity;
+
+#[derive(Debug, Component)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,
