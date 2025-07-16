@@ -2,11 +2,14 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 
+layout(constant_id = 0) const uint TILE_SIZE = 16;
+layout(constant_id = 1) const uint Z_SLICES = 32;
+
 layout(location = 0) in vec3 v_pos;
-layout(location = 1) in vec2 v_uv;
-layout(location = 2) flat in int v_draw_id;
-layout(location = 3) in mat3 v_TBN;
-layout(location = 6) in vec3 v_light_pos;
+layout(location = 1) in float v_view_space_depth;
+layout(location = 2) in vec2 v_uv;
+layout(location = 3) flat in int v_draw_id;
+layout(location = 4) in mat3 v_TBN;
 
 layout(location = 0) out vec4 f_color;
 
@@ -29,6 +32,13 @@ struct EntityData {
     uint pad[3];
 };
 
+struct PointLight {
+    vec3 position;
+    float radius;
+    vec3 color;
+    uint pad[1];
+};
+
 // Slow changing descriptor set 
 //   - doesn't change every frame
 //   - changes when a texture is added (a material is added)
@@ -45,11 +55,24 @@ layout(set = 0, binding = 5) uniform texture2D textures[];
 //   - changes every frame
 layout(set = 1, binding = 0) uniform FrameUniforms {
     mat4 view;
-    mat3 inv_view;
     mat4 proj;
+    vec3 view_position;
+    float near;
+    float far;
+    float width;
+    float height;
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];
+};
+layout(std430, set = 1, binding = 2) readonly buffer PointLights {
+    PointLight point_lights[];
+};
+layout(std430, set = 1, binding = 3) readonly buffer VisibleLightIndices {
+    uint light_indices[];
+};
+layout(std430, set = 1, binding = 4) readonly buffer LightsFromTile {
+    uvec2 light_grid[];
 };
 
 const uint UINT_MAX = 4294967295;
@@ -100,6 +123,14 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
     return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }   
 // ----------------------------------------------------------------------------
+
+uint slice_for_view_space_depth(float depth)
+{
+    float log_far_near = log2(far / near);
+    float scale = float(Z_SLICES) / log_far_near;
+    float bias = - (float(Z_SLICES) * log2(near)) / log_far_near;
+    return uint(floor(log2(depth) * scale + bias));
+}
 
 void main()
 {
@@ -172,7 +203,6 @@ void main()
         emissive = material.emissive_factor.rgb;
     }
 
-    vec3 light_color = vec3(3000.0);
     if (material.normal_texture_id != UINT_MAX)
     {
         N =
@@ -187,7 +217,7 @@ void main()
     }
     N = N * 2.0 - 1.0;
     N = normalize(v_TBN * N);
-    vec3 V = normalize(-v_pos);
+    vec3 V = normalize(view_position - v_pos);
     vec3 R = reflect(-V, N);
     
     // calculate reflectance at normal incidence; if dia-electric (like plastic) use F0 
@@ -195,20 +225,36 @@ void main()
     vec3 F0 = vec3(0.04); 
     F0 = mix(F0, base_color.rgb, metallic);
 
+	uvec2 tile = uvec2(gl_FragCoord.xy / vec2(float(TILE_SIZE)));
+    uint slice = slice_for_view_space_depth(-v_view_space_depth);
+
+	uvec2 num_tiles = uvec2(ceil(width / float(TILE_SIZE)), ceil(height / float(TILE_SIZE)));
+	uint index =
+        + slice * num_tiles.y * num_tiles.x
+        + tile.y * num_tiles.x
+        + tile.x;
+
+    // Calculating tile index from it
+	uint num_lights = light_grid[index].y;
+	uint light_offset = light_grid[index].x;
+
     // reflectance equation
     vec3 Lo = vec3(0.0);
-    {
+    for (int i = 0; i < num_lights; i++) {
+        PointLight light = point_lights[light_indices[light_offset + i]];
         // calculate per-light radiance
-        vec3 L = normalize(v_light_pos - v_pos);
+        vec3 L = normalize(light.position - v_pos);
         vec3 H = normalize(V + L);
-        float distance = length(v_light_pos - v_pos);
-        float attenuation = 1.0 / (distance * distance);
-        vec3 radiance = light_color * attenuation;
+        float distance = length(light.position - v_pos);
+        float attenuation = 1.0 / (1.0 + distance * distance);
+        //float attenuation = (1.0 - clamp(distance / light.radius, 0.0, 1.0));
+        attenuation *= attenuation; // square
+        vec3 radiance = light.color * attenuation;
 
         // Cook-Torrance BRDF
-        float NDF = DistributionGGX(N, H, roughness);   
+        float NDF = DistributionGGX(N, H, roughness);
         float G   = GeometrySmith(N, V, L, roughness);      
-        vec3 F    = fresnelSchlick(clamp(dot(H, V), 0.0, 1.0), F0);
+        vec3  F   = fresnelSchlick(clamp(dot(H, V), 0.0, 1.0), F0);
            
         vec3 numerator    = NDF * G * F; 
         float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001; // + 0.0001 to prevent divide by zero
@@ -229,7 +275,7 @@ void main()
         float NdotL = max(dot(N, L), 0.0);        
 
         // add to outgoing radiance Lo
-        Lo += (kD * base_color.rgb / PI + specular) * radiance * NdotL;  // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
+        Lo += (kD * base_color.rgb / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
     }
 
     vec3 F = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
@@ -238,17 +284,13 @@ void main()
     vec3 kS = fresnelSchlick(max(dot(N, V), 0.0), F0);
     vec3 kD = 1.0 - kS;
     kD *= 1.0 - metallic;
-    vec3 Nuvw = inv_view * N;
-    Nuvw.x *= -1.0;
-    vec3 irradiance = texture(samplerCube(irradiance_map, s), Nuvw).rgb;
-    vec3 diffuse      = irradiance * base_color.rgb;
+    vec3 irradiance = texture(samplerCube(irradiance_map, s), N).rgb;
+    vec3 diffuse    = irradiance * base_color.rgb;
     
     // sample both the pre-filter map and the BRDF lut and combine them together as per the Split-Sum approximation to get the IBL specular part.
     const float MAX_REFLECTION_LOD = 4.0;
-    vec3 Ruvw = inv_view * R;
-    Ruvw.x *= -1.0;
-    vec3 prefilteredColor = textureLod(samplerCube(prefiltered_environment_map, s), Ruvw, roughness * MAX_REFLECTION_LOD).rgb;
-    vec2 brdf  = texture(sampler2D(environment_brdf_lut, s), vec2(max(dot(N, V), 0.0), roughness)).rg;
+    vec3 prefilteredColor = textureLod(samplerCube(prefiltered_environment_map, s), R, roughness * MAX_REFLECTION_LOD).rgb;
+    vec2 brdf = texture(sampler2D(environment_brdf_lut, s), vec2(max(dot(N, V), 0.0), roughness)).rg;
     vec3 specular = prefilteredColor * (F * brdf.x + brdf.y);
 
     vec3 ambient = (kD * diffuse + specular) * ao;
@@ -262,5 +304,36 @@ void main()
     // rendering to the screen it needs to be working
     //color = pow(color, vec3(1.0/2.2)); 
 
-    f_color = vec4(color, base_color.a);
+    f_color = vec4(color, 1.0);
+
+    // float intensity = num_lights / (64 / 2.0);
+    // f_color = vec4(vec3(intensity, intensity * 0.5, intensity * 0.5) + f_color.rgb * 0.25, 1.0); //light culling debug
+    if (num_lights >= 64)
+        f_color = vec4(1.0, 0.0, 0.0, 1.0);
+
+    // vec3 colors[] = {
+    //     vec3(0.0, 1.0, 0.0),
+    //     vec3(0.0, 0.0, 1.0),
+    //     vec3(1.0, 0.0, 0.0),
+    //     vec3(1.0, 1.0, 1.0),
+    //     vec3(0.0, 1.0, 1.0),
+    //     vec3(1.0, 1.0, 0.0),
+    //     vec3(1.0, 0.0, 1.0),
+    //     vec3(0.0, 0.0, 0.0),
+    // };
+    // f_color.rgb = colors[slice % 8];
+
+    // For debugging
+    // if (uint(gl_FragCoord.x) % 16 == 0 || uint(gl_FragCoord.y) % 16 == 0) {
+    //     f_color.rgb = mix(f_color.rgb, vec3(1.0), 0.25);
+    // } else
+    // if (num_lights > 0) {
+    //     switch (num_lights) {
+    //         case 1:  f_color.rgb = mix(f_color.rgb, vec3(0.0, 1.0, 0.0), 0.25); break;
+    //         case 2:  f_color.rgb = mix(f_color.rgb, vec3(0.0, 1.0, 1.0), 0.25); break;
+    //         case 3:  f_color.rgb = mix(f_color.rgb, vec3(0.0, 0.0, 1.0), 0.25); break;
+    //         case 4:  f_color.rgb = mix(f_color.rgb, vec3(1.0, 0.0, 1.0), 0.25); break;
+    //         default: f_color.rgb = mix(f_color.rgb, vec3(1.0, 0.0, 0.0), 0.25); break;
+    //     }
+    // }
 }

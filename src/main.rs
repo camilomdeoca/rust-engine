@@ -21,20 +21,21 @@ use assets::{
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, SceneEntity, Transform};
+use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use log::{info, warn};
 use profile::ProfileTimer;
+use rand::distr::{Distribution, Uniform};
 use renderer::Renderer;
 use ui::{logger, UserInterface};
 use std::{
     collections::HashMap,
     error::Error,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use vulkano::{
     command_buffer::{
@@ -86,7 +87,7 @@ struct RenderingContext {
     swapchain: Arc<Swapchain>,
     swapchain_image_views: Vec<Arc<ImageView>>,
     recreate_swapchain: bool,
-    fences: Vec<Option<FenceSignalFuture<PresentFuture<Box<dyn GpuFuture>>>>>,
+    previous_frame_future: Option<Box<dyn GpuFuture>>,
     previous_fence_index: u32,
     renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
@@ -174,6 +175,7 @@ fn select_physical_device(
                 .enumerate()
                 .position(|(i, queue)| {
                     queue.queue_flags.intersects(QueueFlags::GRAPHICS)
+                        && queue.queue_flags.intersects(QueueFlags::COMPUTE)
                         && candidate_physical_device
                             .presentation_support(i as u32, event_loop)
                             .unwrap_or(false)
@@ -464,6 +466,17 @@ impl App {
         });
         drop(asset_database_write);
 
+        // world
+        //     .entity_named("Light1")
+        //     .set(Transform {
+        //         translation: Vec3::new(0.0, 5.0, 0.0),
+        //         rotation: Quat::IDENTITY,
+        //         scale: Vec3::ONE,
+        //     })
+        //     .set(PointLight {
+        //         color: Vec3::new(30.0, 30.0, 30.0),
+        //     });
+
         App {
             instance,
             device,
@@ -582,17 +595,12 @@ impl ApplicationHandler for App {
             user_interface.add_log_view();
             user_interface.add_scene_tree(self.world.clone());
 
-            let mut fences = vec![];
-            for _ in 0..frames_in_flight {
-                fences.push(None);
-            }
-
             self.rendering_context = Some(RenderingContext {
                 window,
                 swapchain,
                 swapchain_image_views,
                 recreate_swapchain: false,
-                fences,
+                previous_frame_future: Some(sync::now(self.device.clone()).boxed()),
                 previous_fence_index: 0,
                 renderer,
                 start_frame_instant: Instant::now(),
@@ -619,6 +627,39 @@ impl ApplicationHandler for App {
             }) => {
                 self.keys_state
                     .insert(key_code, state == ElementState::Pressed);
+                
+                if key_code == KeyCode::KeyL && state == ElementState::Pressed {
+                    let rcx = self.rendering_context.as_mut().unwrap();
+                    let light_count = 4000;
+                    let mut rng = rand::rng();
+                    let position_random_door = Uniform::new(-30.0f32, 30.0f32).unwrap();
+                    let color_random_door = Uniform::new(0.0f32, 5.0f32).unwrap();
+                    for _ in 0..light_count {
+                        self.world
+                            .entity_named(&format!(
+                                "Light {}",
+                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                            ))
+                            .add::<SceneEntity>()
+                            .set(Transform {
+                                translation: Vec3::new(
+                                    position_random_door.sample(&mut rng),
+                                    position_random_door.sample(&mut rng),
+                                    position_random_door.sample(&mut rng),
+                                ),
+                                rotation: Quat::IDENTITY,
+                                scale: Vec3::ONE,
+                            })
+                            .set(PointLight {
+                                color: Vec3::new(
+                                    color_random_door.sample(&mut rng),
+                                    color_random_door.sample(&mut rng),
+                                    color_random_door.sample(&mut rng),
+                                ),
+                                radius: 3.5,
+                            });
+                    }
+                }
             }
             DeviceEvent::MouseMotion { delta } => {
                 let rcx = self.rendering_context.as_mut().unwrap();
@@ -820,20 +861,7 @@ impl ApplicationHandler for App {
                 }
 
                 let timer = ProfileTimer::start("cleanup_finished");
-                let previous_future = match rcx.fences[rcx.previous_fence_index as usize].take() {
-                    // Create a NowFuture
-                    None => {
-                        let mut now = sync::now(self.device.clone());
-                        now.cleanup_finished();
-
-                        now.boxed()
-                    }
-                    // Use the existing FenceSignalFuture
-                    Some(mut fence) => {
-                        fence.cleanup_finished();
-                        fence.boxed()
-                    }
-                };
+                rcx.previous_frame_future.as_mut().unwrap().cleanup_finished();
                 drop(timer);
 
                 let mut builder = AutoCommandBufferBuilder::primary(
@@ -857,7 +885,7 @@ impl ApplicationHandler for App {
                 drop(timer);
 
                 let timer = ProfileTimer::start("present");
-                let future_3d_renderer = previous_future
+                let future_3d_renderer = rcx.previous_frame_future.take().unwrap()
                     .then_execute(self.queue.clone(), command_buffer)
                     .unwrap()
                     .then_signal_fence_and_flush()
@@ -865,7 +893,7 @@ impl ApplicationHandler for App {
                 drop(timer);
 
                 let future_egui = rcx.user_interface.draw(
-                    swapchain_image_available_future.join(future_3d_renderer),
+                    future_3d_renderer.join(swapchain_image_available_future),
                     &rcx.swapchain_image_views[image_index as usize],
                 );
 
@@ -879,18 +907,18 @@ impl ApplicationHandler for App {
                     )
                     .then_signal_fence_and_flush();
 
-                rcx.fences[image_index as usize] = match future.map_err(Validated::unwrap) {
+                match future.map_err(Validated::unwrap) {
                     Ok(value) => {
-                        Some(value)
+                        rcx.previous_frame_future = Some(value.boxed());
                     }
                     Err(VulkanError::OutOfDate) => {
                         rcx.recreate_swapchain = true;
                         warn!("OutOfDate");
-                        None
+                        rcx.previous_frame_future = Some(sync::now(self.device.clone()).boxed());
                     }
                     Err(e) => {
                         warn!("failed to flush future: {e}");
-                        None
+                        rcx.previous_frame_future = Some(sync::now(self.device.clone()).boxed());
                     }
                 };
 

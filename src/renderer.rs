@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, u32};
 
 use flecs_ecs::prelude::*;
-use glam::{Mat3, Mat4, Vec2, Vec3};
+use glam::{Mat4, UVec3, Vec2, Vec3};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -20,8 +20,8 @@ use vulkano::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
         view::ImageView,
         Image, ImageCreateInfo, ImageType, ImageUsage,
-    }, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, padded::Padded, pipeline::{
-        graphics::{
+    }, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
+        compute::ComputePipelineCreateInfo, graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
@@ -30,10 +30,7 @@ use vulkano::{
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        },
-        layout::PipelineDescriptorSetLayoutCreateInfo,
-        GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
+        }, layout::PipelineDescriptorSetLayoutCreateInfo, ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
     }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, DeviceSize
 };
 
@@ -44,11 +41,13 @@ use crate::{
         vertex::Vertex,
     },
     camera::Camera,
-    ecs::components::{self, MaterialComponent, MeshComponent, Transform},
+    ecs::components::{self, MaterialComponent, MeshComponent, PointLight, Transform},
     profile::ProfileTimer,
 };
 
-pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const MAX_LIGHTS_PER_TILE: u32 = 64;
+const TILE_SIZE: u32 = 32;
+const Z_SLICES: u32 = 32;
 
 /// The index of the descitptor set that doesnt change every frame
 /// It has textures and materials buffer
@@ -62,6 +61,8 @@ pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 5;
 pub const FRAME_DESCRIPTOR_SET: usize = 1;
 pub const FRAME_DESCRIPTOR_SET_CAMERA_MATRICES_BINDING: u32 = 0;
 pub const FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING: u32 = 1;
+pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING: u32 = 2;
+
 
 pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -79,6 +80,11 @@ pub struct Renderer {
     skybox_vs: EntryPoint,
     skybox_fs: EntryPoint,
     skybox_pipeline: Arc<GraphicsPipeline>,
+
+    /// For tiled rendering
+    light_culling_cs: EntryPoint,
+    light_culling_pipeline: Arc<ComputePipeline>,
+
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
 
@@ -334,6 +340,32 @@ impl Renderer {
             },
         );
 
+        let light_culling_cs = light_culling::cs::load(device.clone()).unwrap()
+            .specialize(
+                [
+                    (0, MAX_LIGHTS_PER_TILE.into()),
+                    (1, TILE_SIZE.into()),
+                    (2, Z_SLICES.into()),
+                ].into_iter().collect()
+            )
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let stage = PipelineShaderStageCreateInfo::new(light_culling_cs.clone());
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        let light_culling_pipeline = ComputePipeline::new(
+            device.clone(),
+            None,
+            ComputePipelineCreateInfo::stage_layout(stage, layout),
+        )
+        .unwrap();
+
         let render_pass = vulkano::ordered_passes_renderpass!(
             device.clone(),
             attachments: {
@@ -372,6 +404,13 @@ impl Renderer {
             .entry_point("main")
             .unwrap();
         let mesh_fs = mesh_shaders::fs::load(device.clone())
+            .unwrap()
+            .specialize(
+                [
+                    (0, TILE_SIZE.into()),
+                    (1, Z_SLICES.into()),
+                ].into_iter().collect(),
+            )
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -584,6 +623,8 @@ impl Renderer {
             skybox_fs,
             mesh_pipeline,
             skybox_pipeline,
+            light_culling_cs,
+            light_culling_pipeline,
             cube_vertex_buffer,
             cube_index_buffer,
             sampler,
@@ -779,6 +820,16 @@ impl Renderer {
         camera: &Camera,
     ) {
         self.add_materials_and_textures_to_descriptor_set();
+        
+        let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
+
+        let timer = ProfileTimer::start("cull_lights");
+        let (
+            point_lights_storage_buffer,
+            visible_light_indices_storage_buffer,
+            lights_from_tile_storage_buffer,
+        ) = self.cull_lights(builder, &camera, aspect_ratio);
+        drop(timer);
 
         let timer = ProfileTimer::start("begin_render_pass");
         builder
@@ -796,10 +847,15 @@ impl Renderer {
             .unwrap();
         drop(timer);
 
-        let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
-
         let timer = ProfileTimer::start("draw_meshes");
-        self.draw_meshes(builder, &camera, aspect_ratio);
+        self.draw_meshes(
+            builder,
+            &camera,
+            aspect_ratio,
+            point_lights_storage_buffer,
+            visible_light_indices_storage_buffer,
+            lights_from_tile_storage_buffer,
+        );
         drop(timer);
 
         let timer = ProfileTimer::start("next_subpass");
@@ -823,28 +879,169 @@ impl Renderer {
         drop(timer);
     }
 
-    fn draw_meshes(
+    fn cull_lights(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-    ) {
+    ) -> (Subbuffer<[light_culling::cs::PointLight]>, Subbuffer<[u32]>, Subbuffer<[[u32; 2]]>) {
+        let mut point_lights = vec![];
+        self.world.each::<(&PointLight, &Transform)>(|(point_light, transform)| {
+            point_lights.push(light_culling::cs::PointLight {
+                position: transform.translation.to_array().into(),
+                radius: point_light.radius,
+                color: point_light.color.into(),
+                pad: [0; 1],
+            });
+        });
+
+        let point_lights_storage_buffer = self
+            .storage_buffer_allocator
+            .allocate_slice(point_lights.len().max(1) as DeviceSize)
+            .unwrap();
+        if point_lights.len() > 0 {
+            point_lights_storage_buffer
+                .write()
+                .unwrap()
+                .copy_from_slice(&point_lights);
+        }
+
+        let next_ligth_index_global_storage_buffer = self
+            .storage_buffer_allocator
+            .allocate_sized()
+            .unwrap();
+        *next_ligth_index_global_storage_buffer
+            .write()
+            .unwrap() = light_culling::cs::NextLigthIndexGlobal { next_global_light_index: 0 };
+
+        let width = self.mesh_pipeline
+            .viewport_state().unwrap()
+            .viewports.get(0).unwrap()
+            .extent[0] as u32;
+        let height = self.mesh_pipeline
+            .viewport_state().unwrap()
+            .viewports.get(0).unwrap()
+            .extent[1] as u32;
+
+        let num_tiles = UVec3::new(
+            width.div_ceil(TILE_SIZE),
+            height.div_ceil(TILE_SIZE),
+            Z_SLICES,
+        );
+
+        let visible_light_indices_storage_buffer = self
+            .storage_buffer_allocator
+            .allocate_slice::<u32>((num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize)
+            .unwrap();
+        // visible_light_indices_storage_buffer
+        //     .write()
+        //     .unwrap()
+        //     .copy_from_slice(&vec![0u32; point_lights.len()]);
+        
+
+        let lights_from_tile_storage_buffer = self
+            .storage_buffer_allocator
+            .allocate_slice::<[u32; 2]>((num_tiles.x * num_tiles.y * num_tiles.z) as DeviceSize)
+            .unwrap();
+        // lights_from_tile_storage_buffer
+        //     .write()
+        //     .unwrap()
+        //     .copy_from_slice(&vec![[0; 2]; point_lights.len()]);
+
         let frame_uniform_buffer = {
-            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
             let view = Mat4::look_to_rh(
                 camera.position,
                 camera.rotation * Vec3::NEG_Z,
                 camera.rotation * Vec3::Y,
             );
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
+
+            let uniform_data = light_culling::cs::FrameUniforms {
+                view: view.to_cols_array_2d(),
+                view_proj: (proj * view).to_cols_array_2d(),
+                num_lights: point_lights.len() as u32,
+                width: width as f32,
+                height: height as f32,
+                near: 0.01,
+                far: 100.0,
+            };
+
+            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *buffer.write().unwrap() = uniform_data;
+
+            buffer
+        };
+
+        let set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.light_culling_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
+                WriteDescriptorSet::buffer(1, point_lights_storage_buffer.clone()),
+                WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
+                WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
+                WriteDescriptorSet::buffer(4, lights_from_tile_storage_buffer.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
+        builder
+            .bind_pipeline_compute(self.light_culling_pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute, 
+                self.light_culling_pipeline.layout().clone(), 
+                0, 
+                set,
+            )
+            .unwrap();
+
+        unsafe { builder.dispatch(num_tiles.to_array()) }.unwrap();
+
+        (
+            point_lights_storage_buffer,
+            visible_light_indices_storage_buffer,
+            lights_from_tile_storage_buffer,
+        )
+    }
+
+    fn draw_meshes(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        camera: &Camera,
+        aspect_ratio: f32,
+        point_lights_storage_buffer: Subbuffer<[light_culling::cs::PointLight]>,
+        visible_light_indices_storage_buffer: Subbuffer<[u32]>,
+        lights_from_tile_storage_buffer: Subbuffer<[[u32; 2]]>,
+    ) {
+        let view = Mat4::look_to_rh(
+            camera.position,
+            camera.rotation * Vec3::NEG_Z,
+            camera.rotation * Vec3::Y,
+        );
+
+        let frame_uniform_buffer = {
+            let width = self.mesh_pipeline
+                .viewport_state().unwrap()
+                .viewports.get(0).unwrap()
+                .extent[0];
+            let height = self.mesh_pipeline
+                .viewport_state().unwrap()
+                .viewports.get(0).unwrap()
+                .extent[1];
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
 
             let uniform_data = mesh_shaders::vs::FrameUniforms {
                 view: view.to_cols_array_2d(),
-                inv_view: Mat3::from_mat4(view)
-                    .inverse()
-                    .to_cols_array_2d()
-                    .map(Padded),
                 proj: proj.to_cols_array_2d(),
+                view_position: camera.position.into(),
+                near: 0.01,
+                far: 100.0,
+                width,
+                height,
             };
 
             let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
@@ -915,6 +1112,18 @@ impl Renderer {
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING,
                     entity_data_storage_buffer.clone(),
+                ),
+                WriteDescriptorSet::buffer(
+                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING,
+                    point_lights_storage_buffer.clone(),
+                ),
+                WriteDescriptorSet::buffer(
+                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING + 1,
+                    visible_light_indices_storage_buffer.clone(),
+                ),
+                WriteDescriptorSet::buffer(
+                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING + 2,
+                    lights_from_tile_storage_buffer.clone(),
                 ),
             ],
             [],
@@ -1031,6 +1240,15 @@ impl Renderer {
             .unwrap();
 
         unsafe { builder.draw_indexed(self.cube_index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
+    }
+}
+
+mod light_culling {
+    pub mod cs {
+        vulkano_shaders::shader! {
+            ty: "compute",
+            path: "assets/shaders/light_culling.cs.glsl",
+        }
     }
 }
 

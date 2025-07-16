@@ -34,6 +34,7 @@ pub struct EnvironmentCubemap {
 #[derive(Debug, Component)]
 pub struct PointLight {
     pub color: Vec3,
+    pub radius: f32,
 }
 
 #[derive(Debug, Component)]
