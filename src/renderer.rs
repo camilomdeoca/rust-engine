@@ -62,7 +62,8 @@ pub const FRAME_DESCRIPTOR_SET: usize = 1;
 pub const FRAME_DESCRIPTOR_SET_CAMERA_MATRICES_BINDING: u32 = 0;
 pub const FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING: u32 = 1;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING: u32 = 2;
-
+pub const FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING: u32 = 3;
+pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_BUFFER_BINDING: u32 = 4;
 
 pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -89,12 +90,16 @@ pub struct Renderer {
     cube_index_buffer: Subbuffer<[u32]>,
 
     asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
+    lights_changed: Arc<RwLock<bool>>,
 
     sampler: Arc<Sampler>,
 
+    point_lights_storage_buffer: Subbuffer<[mesh_shaders::fs::PointLight]>,
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
     slow_changing_descriptor_set: Arc<DescriptorSet>,
 
+    lights_set_observer_entity: Entity, // needs to be destructed when the renderer is dropped
+    lights_remove_observer_entity: Entity, // needs to be destructed when the renderer is dropped
     environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
         &'static MeshComponent,
@@ -287,6 +292,13 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 
     fn on_material_add(&mut self, _material_id: MaterialId, _material: &Material) {
         self.materials_changed = true;
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.lights_set_observer_entity.entity_view(&self.world).destruct();
+        self.lights_remove_observer_entity.entity_view(&self.world).destruct();
     }
 }
 
@@ -512,6 +524,24 @@ impl Renderer {
         )
         .unwrap();
 
+        let lights_changed = Arc::new(RwLock::new(false));
+        let lights_changed_clone = lights_changed.clone();
+        let lights_set_observer_entity: Entity = **world
+            .observer::<flecs::OnSet, &PointLight>()
+            .each_iter(move |_it, _index, _pos| {
+                *lights_changed_clone.write().unwrap() = true;
+            });
+        let lights_changed_clone = lights_changed.clone();
+        let lights_remove_observer_entity: Entity = **world
+            .observer::<flecs::OnRemove, &PointLight>()
+            .each_iter(move |_it, _index, _pos| {
+                *lights_changed_clone.write().unwrap() = true;
+            });
+
+        let point_lights_storage_buffer = storage_buffer_allocator
+            .allocate_slice(1 as DeviceSize)
+            .unwrap();
+
         let environment_cubemap_query = world
             .query::<&components::EnvironmentCubemap>()
             .term_at(0)
@@ -628,9 +658,13 @@ impl Renderer {
             cube_vertex_buffer,
             cube_index_buffer,
             sampler,
+            point_lights_storage_buffer,
             materials_storage_buffer,
             slow_changing_descriptor_set: environment_descriptor_set,
             asset_change_listener,
+            lights_changed,
+            lights_set_observer_entity,
+            lights_remove_observer_entity,
             environment_cubemap_query,
             meshes_with_materials_query,
             world,
@@ -754,6 +788,37 @@ impl Renderer {
         asset_change_listener_write.textures_changed = false;
     }
 
+    fn update_lights_storage_buffer(&mut self) {
+        {
+            let mut lights_changed_write = self.lights_changed.write().unwrap();
+            if !*lights_changed_write {
+                return;
+            }
+            *lights_changed_write = false;
+        }
+
+        let mut point_lights = vec![];
+        self.world.each::<(&PointLight, &Transform)>(|(point_light, transform)| {
+            point_lights.push(mesh_shaders::fs::PointLight {
+                position: transform.translation.to_array().into(),
+                radius: point_light.radius,
+                color: point_light.color.into(),
+                pad: [0; 1],
+            });
+        });
+
+        self.point_lights_storage_buffer = self
+            .storage_buffer_allocator
+            .allocate_slice(point_lights.len().max(1) as DeviceSize)
+            .unwrap();
+        if point_lights.len() > 0 {
+            self.point_lights_storage_buffer
+                .write()
+                .unwrap()
+                .copy_from_slice(&point_lights);
+        }
+    }
+
     fn create_framebuffers(&self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
         let extent = image_views[0].image().extent();
 
@@ -820,12 +885,12 @@ impl Renderer {
         camera: &Camera,
     ) {
         self.add_materials_and_textures_to_descriptor_set();
+        self.update_lights_storage_buffer();
         
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
         let timer = ProfileTimer::start("cull_lights");
         let (
-            point_lights_storage_buffer,
             visible_light_indices_storage_buffer,
             lights_from_tile_storage_buffer,
         ) = self.cull_lights(builder, &camera, aspect_ratio);
@@ -852,7 +917,6 @@ impl Renderer {
             builder,
             &camera,
             aspect_ratio,
-            point_lights_storage_buffer,
             visible_light_indices_storage_buffer,
             lights_from_tile_storage_buffer,
         );
@@ -884,28 +948,7 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-    ) -> (Subbuffer<[light_culling::cs::PointLight]>, Subbuffer<[u32]>, Subbuffer<[[u32; 2]]>) {
-        let mut point_lights = vec![];
-        self.world.each::<(&PointLight, &Transform)>(|(point_light, transform)| {
-            point_lights.push(light_culling::cs::PointLight {
-                position: transform.translation.to_array().into(),
-                radius: point_light.radius,
-                color: point_light.color.into(),
-                pad: [0; 1],
-            });
-        });
-
-        let point_lights_storage_buffer = self
-            .storage_buffer_allocator
-            .allocate_slice(point_lights.len().max(1) as DeviceSize)
-            .unwrap();
-        if point_lights.len() > 0 {
-            point_lights_storage_buffer
-                .write()
-                .unwrap()
-                .copy_from_slice(&point_lights);
-        }
-
+    ) -> (Subbuffer<[u32]>, Subbuffer<[[u32; 2]]>) {
         let next_ligth_index_global_storage_buffer = self
             .storage_buffer_allocator
             .allocate_sized()
@@ -960,7 +1003,7 @@ impl Renderer {
             let uniform_data = light_culling::cs::FrameUniforms {
                 view: view.to_cols_array_2d(),
                 view_proj: (proj * view).to_cols_array_2d(),
-                num_lights: point_lights.len() as u32,
+                num_lights: self.point_lights_storage_buffer.len() as u32,
                 width: width as f32,
                 height: height as f32,
                 near: 0.01,
@@ -978,7 +1021,7 @@ impl Renderer {
             self.light_culling_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
-                WriteDescriptorSet::buffer(1, point_lights_storage_buffer.clone()),
+                WriteDescriptorSet::buffer(1, self.point_lights_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(4, lights_from_tile_storage_buffer.clone()),
@@ -1001,7 +1044,6 @@ impl Renderer {
         unsafe { builder.dispatch(num_tiles.to_array()) }.unwrap();
 
         (
-            point_lights_storage_buffer,
             visible_light_indices_storage_buffer,
             lights_from_tile_storage_buffer,
         )
@@ -1012,7 +1054,6 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-        point_lights_storage_buffer: Subbuffer<[light_culling::cs::PointLight]>,
         visible_light_indices_storage_buffer: Subbuffer<[u32]>,
         lights_from_tile_storage_buffer: Subbuffer<[[u32; 2]]>,
     ) {
@@ -1115,14 +1156,14 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING,
-                    point_lights_storage_buffer.clone(),
+                    self.point_lights_storage_buffer.clone(),
                 ),
                 WriteDescriptorSet::buffer(
-                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING + 1,
+                    FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING,
                     visible_light_indices_storage_buffer.clone(),
                 ),
                 WriteDescriptorSet::buffer(
-                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING + 2,
+                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_BUFFER_BINDING,
                     lights_from_tile_storage_buffer.clone(),
                 ),
             ],

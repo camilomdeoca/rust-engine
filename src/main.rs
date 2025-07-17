@@ -629,7 +629,6 @@ impl ApplicationHandler for App {
                     .insert(key_code, state == ElementState::Pressed);
                 
                 if key_code == KeyCode::KeyL && state == ElementState::Pressed {
-                    let rcx = self.rendering_context.as_mut().unwrap();
                     let light_count = 4000;
                     let mut rng = rand::rng();
                     let position_random_door = Uniform::new(-30.0f32, 30.0f32).unwrap();
