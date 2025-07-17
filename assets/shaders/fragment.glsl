@@ -99,6 +99,7 @@ float GeometrySchlickGGX(float NdotV, float roughness)
 
     float nom   = NdotV;
     float denom = NdotV * (1.0 - k) + k;
+    denom = max(denom, 0.000001);
 
     return nom / denom;
 }

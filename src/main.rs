@@ -635,6 +635,14 @@ impl ApplicationHandler for App {
                     let position_random_door = Uniform::new(-30.0f32, 30.0f32).unwrap();
                     let color_random_door = Uniform::new(0.0f32, 5.0f32).unwrap();
                     for _ in 0..light_count {
+                        let mut light_color = Vec3::ZERO;
+                        while light_color.length() < 5.0 {
+                            light_color = Vec3::new(
+                                color_random_door.sample(&mut rng),
+                                color_random_door.sample(&mut rng),
+                                color_random_door.sample(&mut rng),
+                            );
+                        }
                         self.world
                             .entity_named(&format!(
                                 "Light {}",
@@ -651,11 +659,7 @@ impl ApplicationHandler for App {
                                 scale: Vec3::ONE,
                             })
                             .set(PointLight {
-                                color: Vec3::new(
-                                    color_random_door.sample(&mut rng),
-                                    color_random_door.sample(&mut rng),
-                                    color_random_door.sample(&mut rng),
-                                ),
+                                color: light_color,
                                 radius: 3.5,
                             });
                     }
