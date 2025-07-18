@@ -2,6 +2,7 @@ use std::{sync::{Arc, RwLock}, u32};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat4, UVec3, Vec2, Vec3};
+use smallvec::{SmallVec, smallvec};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -69,7 +70,8 @@ pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
-    storage_buffer_allocator: SubbufferAllocator,
+    host_writable_storage_buffer_allocator: SubbufferAllocator,
+    in_device_storage_buffer_allocator: SubbufferAllocator,
     indirect_buffer_allocator: SubbufferAllocator,
 
     asset_database: Arc<RwLock<AssetDatabase>>,
@@ -94,7 +96,8 @@ pub struct Renderer {
 
     sampler: Arc<Sampler>,
 
-    point_lights_storage_buffer: Subbuffer<[mesh_shaders::fs::PointLight]>,
+    // Option because it cant be of length 0
+    point_lights_storage_buffer: Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
     slow_changing_descriptor_set: Arc<DescriptorSet>,
 
@@ -332,12 +335,21 @@ impl Renderer {
             },
         );
 
-        let storage_buffer_allocator = SubbufferAllocator::new(
+        let host_writable_storage_buffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+        
+        let in_device_storage_buffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
         );
@@ -538,9 +550,7 @@ impl Renderer {
                 *lights_changed_clone.write().unwrap() = true;
             });
 
-        let point_lights_storage_buffer = storage_buffer_allocator
-            .allocate_slice(1 as DeviceSize)
-            .unwrap();
+        let point_lights_storage_buffer = None;
 
         let environment_cubemap_query = world
             .query::<&components::EnvironmentCubemap>()
@@ -643,7 +653,8 @@ impl Renderer {
             memory_allocator,
             descriptor_set_allocator,
             uniform_buffer_allocator,
-            storage_buffer_allocator,
+            host_writable_storage_buffer_allocator,
+            in_device_storage_buffer_allocator,
             indirect_buffer_allocator,
             asset_database,
             render_pass,
@@ -807,12 +818,18 @@ impl Renderer {
             });
         });
 
-        self.point_lights_storage_buffer = self
-            .storage_buffer_allocator
-            .allocate_slice(point_lights.len().max(1) as DeviceSize)
-            .unwrap();
-        if point_lights.len() > 0 {
+        if point_lights.is_empty() {
+            self.point_lights_storage_buffer = None;
+        } else {
+            self.point_lights_storage_buffer = Some(
+                self
+                    .host_writable_storage_buffer_allocator
+                    .allocate_slice(point_lights.len() as DeviceSize)
+                    .unwrap()
+            );
             self.point_lights_storage_buffer
+                .as_mut()
+                .unwrap()
                 .write()
                 .unwrap()
                 .copy_from_slice(&point_lights);
@@ -950,12 +967,17 @@ impl Renderer {
         aspect_ratio: f32,
     ) -> (Subbuffer<[u32]>, Subbuffer<[[u32; 2]]>) {
         let next_ligth_index_global_storage_buffer = self
-            .storage_buffer_allocator
-            .allocate_sized()
+            .in_device_storage_buffer_allocator
+            .allocate_slice::<light_culling::cs::NextLigthIndexGlobal>(4) // allocating 1 freezes
             .unwrap();
-        *next_ligth_index_global_storage_buffer
-            .write()
-            .unwrap() = light_culling::cs::NextLigthIndexGlobal { next_global_light_index: 0 };
+
+        // Initialize with value 0
+        assert_eq!(size_of::<light_culling::cs::NextLigthIndexGlobal>(), size_of::<u32>());
+        builder.fill_buffer(
+            next_ligth_index_global_storage_buffer.clone().reinterpret::<[u32]>(),
+            0
+        )
+        .unwrap();
 
         let width = self.mesh_pipeline
             .viewport_state().unwrap()
@@ -973,23 +995,14 @@ impl Renderer {
         );
 
         let visible_light_indices_storage_buffer = self
-            .storage_buffer_allocator
+            .in_device_storage_buffer_allocator
             .allocate_slice::<u32>((num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize)
             .unwrap();
-        // visible_light_indices_storage_buffer
-        //     .write()
-        //     .unwrap()
-        //     .copy_from_slice(&vec![0u32; point_lights.len()]);
-        
 
         let lights_from_tile_storage_buffer = self
-            .storage_buffer_allocator
+            .in_device_storage_buffer_allocator
             .allocate_slice::<[u32; 2]>((num_tiles.x * num_tiles.y * num_tiles.z) as DeviceSize)
             .unwrap();
-        // lights_from_tile_storage_buffer
-        //     .write()
-        //     .unwrap()
-        //     .copy_from_slice(&vec![[0; 2]; point_lights.len()]);
 
         let frame_uniform_buffer = {
             let view = Mat4::look_to_rh(
@@ -1000,10 +1013,15 @@ impl Renderer {
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
 
+            let num_lights = match &self.point_lights_storage_buffer {
+                Some(point_lights_storage_buffer) => point_lights_storage_buffer.len() as _,
+                None => 0,
+            };
+
             let uniform_data = light_culling::cs::FrameUniforms {
                 view: view.to_cols_array_2d(),
                 view_proj: (proj * view).to_cols_array_2d(),
-                num_lights: self.point_lights_storage_buffer.len() as u32,
+                num_lights,
                 width: width as f32,
                 height: height as f32,
                 near: 0.01,
@@ -1021,7 +1039,15 @@ impl Renderer {
             self.light_culling_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
-                WriteDescriptorSet::buffer(1, self.point_lights_storage_buffer.clone()),
+                WriteDescriptorSet::buffer(
+                    1,
+                    self.point_lights_storage_buffer.as_ref().unwrap_or(
+                        &self.in_device_storage_buffer_allocator
+                            .allocate_slice(1)
+                            .unwrap(),
+                    )
+                    .clone(),
+                ),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(4, lights_from_tile_storage_buffer.clone()),
@@ -1134,14 +1160,14 @@ impl Renderer {
             .copy_from_slice(&indirect_commands);
 
         let entity_data_storage_buffer = self
-            .storage_buffer_allocator
+            .host_writable_storage_buffer_allocator
             .allocate_slice(entities_data.len() as DeviceSize)
             .unwrap();
         entity_data_storage_buffer
             .write()
             .unwrap()
             .copy_from_slice(&entities_data);
-        
+
         let frame_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.mesh_pipeline.layout().set_layouts()[FRAME_DESCRIPTOR_SET].clone(),
@@ -1156,7 +1182,12 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING,
-                    self.point_lights_storage_buffer.clone(),
+                    self.point_lights_storage_buffer.as_ref().unwrap_or(
+                        &self.in_device_storage_buffer_allocator
+                            .allocate_slice(1)
+                            .unwrap()
+                    )
+                    .clone(),
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING,
