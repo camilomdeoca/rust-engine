@@ -39,6 +39,12 @@ struct PointLight {
     uint pad[1];
 };
 
+struct DirectionalLight {
+    vec3 direction;
+    vec3 color;
+    uint pad[1];
+};
+
 // Slow changing descriptor set 
 //   - doesn't change every frame
 //   - changes when a texture is added (a material is added)
@@ -61,17 +67,21 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float far;
     float width;
     float height;
+    uint directional_light_count;
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];
 };
-layout(std430, set = 1, binding = 2) readonly buffer PointLights {
+layout(std430, set = 1, binding = 2) readonly buffer DirectionalLights {
+    DirectionalLight directional_lights[];
+};
+layout(std430, set = 1, binding = 3) readonly buffer PointLights {
     PointLight point_lights[];
 };
-layout(std430, set = 1, binding = 3) readonly buffer VisibleLightIndices {
+layout(std430, set = 1, binding = 4) readonly buffer VisibleLightIndices {
     uint light_indices[];
 };
-layout(set = 1, binding = 4, rg32ui) readonly uniform uimage3D light_grid;
+layout(set = 1, binding = 5, rg32ui) readonly uniform uimage3D light_grid;
 
 const uint UINT_MAX = 4294967295;
 
@@ -129,6 +139,48 @@ uint slice_for_view_space_depth(float depth)
     float scale = float(Z_SLICES) / log_far_near;
     float bias = - (float(Z_SLICES) * log2(near)) / log_far_near;
     return uint(floor(log2(depth) * scale + bias));
+}
+
+vec3 get_light_contribution(
+    vec3 base_color,
+    vec3 radiance,
+    vec3 light_direction,
+    vec3 view_direction,
+    vec3 normal,
+    float metallic,
+    float roughness,
+    vec3 F0
+) {
+    vec3 H = normalize(view_direction + light_direction);
+
+    // Cook-Torrance BRDF
+    float NDF = DistributionGGX(normal, H, roughness);
+    float G   = GeometrySmith(normal, view_direction, light_direction, roughness);      
+    vec3  F   = fresnelSchlick(clamp(dot(H, view_direction), 0.0, 1.0), F0);
+       
+    vec3 numerator    = NDF * G * F;
+    float denominator = 4.0
+        * max(dot(normal, view_direction), 0.0)
+        * max(dot(normal, light_direction), 0.0)
+        + 0.0001; // + 0.0001 to prevent divide by zero
+    vec3 specular = numerator / denominator;
+    
+    // kS is equal to Fresnel
+    vec3 kS = F;
+    // for energy conservation, the diffuse and specular light can't
+    // be above 1.0 (unless the surface emits light); to preserve this
+    // relationship the diffuse component (kD) should equal 1.0 - kS.
+    vec3 kD = vec3(1.0) - kS;
+    // multiply kD by the inverse metalness such that only non-metals
+    // have diffuse lighting, or a linear blend if partly metal (pure metals
+    // have no diffuse light).
+    kD *= 1.0 - metallic;
+
+    // scale light by NdotL
+    float NdotL = max(dot(normal, light_direction), 0.0);
+
+    // add to outgoing radiance Lo
+    return (kD * base_color / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
 }
 
 void main()
@@ -240,42 +292,29 @@ void main()
 
     // reflectance equation
     vec3 Lo = vec3(0.0);
-    for (int i = 0; i < num_lights; i++) {
-        PointLight light = point_lights[light_indices[light_offset + i]];
+
+    for (int i = 0; i < directional_light_count; i++)
+    {
+        DirectionalLight light = directional_lights[i];
         // calculate per-light radiance
-        vec3 L = normalize(light.position - v_pos);
-        vec3 H = normalize(V + L);
-        float distance = length(light.position - v_pos);
-        float attenuation = 1.0 / (1.0 + distance * distance);
-        //float attenuation = (1.0 - clamp(distance / light.radius, 0.0, 1.0));
-        attenuation *= attenuation; // square
-        vec3 radiance = light.color * attenuation;
-
-        // Cook-Torrance BRDF
-        float NDF = DistributionGGX(N, H, roughness);
-        float G   = GeometrySmith(N, V, L, roughness);      
-        vec3  F   = fresnelSchlick(clamp(dot(H, V), 0.0, 1.0), F0);
-           
-        vec3 numerator    = NDF * G * F;
-        float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001; // + 0.0001 to prevent divide by zero
-        vec3 specular = numerator / denominator;
-        
-        // kS is equal to Fresnel
-        vec3 kS = F;
-        // for energy conservation, the diffuse and specular light can't
-        // be above 1.0 (unless the surface emits light); to preserve this
-        // relationship the diffuse component (kD) should equal 1.0 - kS.
-        vec3 kD = vec3(1.0) - kS;
-        // multiply kD by the inverse metalness such that only non-metals
-        // have diffuse lighting, or a linear blend if partly metal (pure metals
-        // have no diffuse light).
-        kD *= 1.0 - metallic;
-
-        // scale light by NdotL
-        float NdotL = max(dot(N, L), 0.0);
+        vec3 light_direction = normalize(light.direction);
+        vec3 radiance = light.color;
 
         // add to outgoing radiance Lo
-        Lo += (kD * base_color.rgb / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
+        Lo += get_light_contribution(base_color.rgb, radiance, light_direction, V, N, metallic, roughness, F0);
+    }
+
+    for (int i = 0; i < num_lights; i++)
+    {
+        PointLight light = point_lights[light_indices[light_offset + i]];
+        // calculate per-light radiance
+        vec3 light_direction = normalize(light.position - v_pos);
+        float distance = length(light.position - v_pos);
+        float attenuation = 1.0 / (1.0 + distance * distance);
+        vec3 radiance = light.color * attenuation;
+
+        // add to outgoing radiance Lo
+        Lo += get_light_contribution(base_color.rgb, radiance, light_direction, V, N, metallic, roughness, F0);
     }
 
     vec3 F = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);

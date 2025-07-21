@@ -21,7 +21,7 @@ use assets::{
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::{EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
+use ecs::components::{DirectionalLight, EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
 use glam::{EulerRot, Quat, Vec3};
@@ -32,10 +32,7 @@ use rand::distr::{Distribution, Uniform};
 use renderer::Renderer;
 use ui::{logger, UserInterface};
 use std::{
-    collections::HashMap,
-    error::Error,
-    sync::{Arc, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::HashMap, error::Error, f32::consts::{FRAC_PI_2, PI}, sync::{Arc, RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 use vulkano::{
     command_buffer::{
@@ -466,16 +463,16 @@ impl App {
         });
         drop(asset_database_write);
 
-        // world
-        //     .entity_named("Light1")
-        //     .set(Transform {
-        //         translation: Vec3::new(0.0, 5.0, 0.0),
-        //         rotation: Quat::IDENTITY,
-        //         scale: Vec3::ONE,
-        //     })
-        //     .set(PointLight {
-        //         color: Vec3::new(30.0, 30.0, 30.0),
-        //     });
+        world
+            .entity_named("Light1")
+            .set(Transform {
+                translation: Vec3::ZERO,
+                rotation: Quat::from_euler(EulerRot::YXZ, 0.0, PI * 3.0/4.0, 0.0),
+                scale: Vec3::ONE,
+            })
+            .set(DirectionalLight {
+                color: Vec3::new(5.0, 5.0, 3.0),
+            });
 
         App {
             instance,
@@ -629,13 +626,14 @@ impl ApplicationHandler for App {
                     .insert(key_code, state == ElementState::Pressed);
                 
                 if key_code == KeyCode::KeyL && state == ElementState::Pressed {
-                    let light_count = 4000;
+                    let light_count = 2000;
                     let mut rng = rand::rng();
-                    let position_random_door = Uniform::new(-30.0f32, 30.0f32).unwrap();
-                    let color_random_door = Uniform::new(0.0f32, 5.0f32).unwrap();
+                    let xz_position_random_door = Uniform::new(-50.0f32, 50.0f32).unwrap();
+                    let y_position_random_door = Uniform::new(-10.0f32, 20.0f32).unwrap();
+                    let color_random_door = Uniform::new(0.0f32, 1.0f32).unwrap();
                     for _ in 0..light_count {
                         let mut light_color = Vec3::ZERO;
-                        while light_color.length() < 5.0 {
+                        while light_color.length() < 1.0 {
                             light_color = Vec3::new(
                                 color_random_door.sample(&mut rng),
                                 color_random_door.sample(&mut rng),
@@ -650,16 +648,16 @@ impl ApplicationHandler for App {
                             .add::<SceneEntity>()
                             .set(Transform {
                                 translation: Vec3::new(
-                                    position_random_door.sample(&mut rng),
-                                    position_random_door.sample(&mut rng),
-                                    position_random_door.sample(&mut rng),
+                                    xz_position_random_door.sample(&mut rng),
+                                    y_position_random_door.sample(&mut rng),
+                                    xz_position_random_door.sample(&mut rng),
                                 ),
                                 rotation: Quat::IDENTITY,
                                 scale: Vec3::ONE,
                             })
                             .set(PointLight {
                                 color: light_color,
-                                radius: 3.5,
+                                radius: 5.0,
                             });
                     }
                 }

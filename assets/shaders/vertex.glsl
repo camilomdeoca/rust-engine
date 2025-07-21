@@ -27,6 +27,7 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float far;
     float width;
     float height;
+    uint directional_light_count;
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];

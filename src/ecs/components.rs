@@ -38,6 +38,11 @@ pub struct PointLight {
 }
 
 #[derive(Debug, Component)]
+pub struct DirectionalLight {
+    pub color: Vec3,
+}
+
+#[derive(Debug, Component)]
 pub struct Camera {
     pub fov: f32,
 }
