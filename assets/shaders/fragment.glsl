@@ -71,9 +71,7 @@ layout(std430, set = 1, binding = 2) readonly buffer PointLights {
 layout(std430, set = 1, binding = 3) readonly buffer VisibleLightIndices {
     uint light_indices[];
 };
-layout(std430, set = 1, binding = 4) readonly buffer LightsFromTile {
-    uvec2 light_grid[];
-};
+layout(set = 1, binding = 4, rg32ui) readonly uniform uimage3D light_grid;
 
 const uint UINT_MAX = 4294967295;
 
@@ -236,8 +234,9 @@ void main()
         + tile.x;
 
     // Calculating tile index from it
-	uint num_lights = light_grid[index].y;
-	uint light_offset = light_grid[index].x;
+    uvec2 light_grid_data = imageLoad(light_grid, ivec3(tile, slice)).xy;
+	uint num_lights = light_grid_data.y;
+	uint light_offset = light_grid_data.x;
 
     // reflectance equation
     vec3 Lo = vec3(0.0);
@@ -257,7 +256,7 @@ void main()
         float G   = GeometrySmith(N, V, L, roughness);      
         vec3  F   = fresnelSchlick(clamp(dot(H, V), 0.0, 1.0), F0);
            
-        vec3 numerator    = NDF * G * F; 
+        vec3 numerator    = NDF * G * F;
         float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001; // + 0.0001 to prevent divide by zero
         vec3 specular = numerator / denominator;
         
@@ -267,13 +266,13 @@ void main()
         // be above 1.0 (unless the surface emits light); to preserve this
         // relationship the diffuse component (kD) should equal 1.0 - kS.
         vec3 kD = vec3(1.0) - kS;
-        // multiply kD by the inverse metalness such that only non-metals 
+        // multiply kD by the inverse metalness such that only non-metals
         // have diffuse lighting, or a linear blend if partly metal (pure metals
         // have no diffuse light).
-        kD *= 1.0 - metallic;	  
+        kD *= 1.0 - metallic;
 
         // scale light by NdotL
-        float NdotL = max(dot(N, L), 0.0);        
+        float NdotL = max(dot(N, L), 0.0);
 
         // add to outgoing radiance Lo
         Lo += (kD * base_color.rgb / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again

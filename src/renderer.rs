@@ -2,7 +2,6 @@ use std::{sync::{Arc, RwLock}, u32};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat4, UVec3, Vec2, Vec3};
-use smallvec::{SmallVec, smallvec};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -64,7 +63,7 @@ pub const FRAME_DESCRIPTOR_SET_CAMERA_MATRICES_BINDING: u32 = 0;
 pub const FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING: u32 = 1;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING: u32 = 2;
 pub const FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING: u32 = 3;
-pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_BUFFER_BINDING: u32 = 4;
+pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING: u32 = 4;
 
 pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -909,7 +908,7 @@ impl Renderer {
         let timer = ProfileTimer::start("cull_lights");
         let (
             visible_light_indices_storage_buffer,
-            lights_from_tile_storage_buffer,
+            lights_from_tile_storage_image_view,
         ) = self.cull_lights(builder, &camera, aspect_ratio);
         drop(timer);
 
@@ -935,7 +934,7 @@ impl Renderer {
             &camera,
             aspect_ratio,
             visible_light_indices_storage_buffer,
-            lights_from_tile_storage_buffer,
+            lights_from_tile_storage_image_view,
         );
         drop(timer);
 
@@ -965,7 +964,7 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-    ) -> (Subbuffer<[u32]>, Subbuffer<[[u32; 2]]>) {
+    ) -> (Subbuffer<[u32]>, Arc<ImageView>) {
         let next_ligth_index_global_storage_buffer = self
             .in_device_storage_buffer_allocator
             .allocate_slice::<light_culling::cs::NextLigthIndexGlobal>(4) // allocating 1 freezes
@@ -999,9 +998,25 @@ impl Renderer {
             .allocate_slice::<u32>((num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize)
             .unwrap();
 
-        let lights_from_tile_storage_buffer = self
-            .in_device_storage_buffer_allocator
-            .allocate_slice::<[u32; 2]>((num_tiles.x * num_tiles.y * num_tiles.z) as DeviceSize)
+        // let lights_from_tile_storage_buffer = self
+        //     .in_device_storage_buffer_allocator
+        //     .allocate_slice::<[u32; 2]>((num_tiles.x * num_tiles.y * num_tiles.z) as DeviceSize)
+        //     .unwrap();
+
+        let lights_from_tile_storage_image = Image::new(
+                self.memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim3d,
+                    format: Format::R32G32_UINT,
+                    extent: num_tiles.into(),
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+        let lights_from_tile_storage_image_view = ImageView::new_default(lights_from_tile_storage_image)
             .unwrap();
 
         let frame_uniform_buffer = {
@@ -1050,7 +1065,7 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
-                WriteDescriptorSet::buffer(4, lights_from_tile_storage_buffer.clone()),
+                WriteDescriptorSet::image_view(4, lights_from_tile_storage_image_view.clone()),
             ],
             [],
         )
@@ -1071,7 +1086,7 @@ impl Renderer {
 
         (
             visible_light_indices_storage_buffer,
-            lights_from_tile_storage_buffer,
+            lights_from_tile_storage_image_view,
         )
     }
 
@@ -1081,7 +1096,7 @@ impl Renderer {
         camera: &Camera,
         aspect_ratio: f32,
         visible_light_indices_storage_buffer: Subbuffer<[u32]>,
-        lights_from_tile_storage_buffer: Subbuffer<[[u32; 2]]>,
+        lights_from_tile_storage_image_view: Arc<ImageView>,
     ) {
         let view = Mat4::look_to_rh(
             camera.position,
@@ -1193,9 +1208,9 @@ impl Renderer {
                     FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING,
                     visible_light_indices_storage_buffer.clone(),
                 ),
-                WriteDescriptorSet::buffer(
-                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_BUFFER_BINDING,
-                    lights_from_tile_storage_buffer.clone(),
+                WriteDescriptorSet::image_view(
+                    FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING,
+                    lights_from_tile_storage_image_view.clone(),
                 ),
             ],
             [],

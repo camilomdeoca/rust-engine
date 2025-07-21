@@ -4,7 +4,7 @@ layout(constant_id = 0) const uint MAX_LIGHTS_PER_TILE = 256;
 layout(constant_id = 1) const uint TILE_SIZE = 16;
 layout(constant_id = 2) const uint Z_SLICES = 32;
 
-layout (local_size_x = 32) in;
+layout (local_size_x = 64) in;
 
 struct PointLight {
     vec3 position;
@@ -33,9 +33,7 @@ layout(std430, set = 0, binding = 2) buffer NextLigthIndexGlobal {
 layout(std430, set = 0, binding = 3) writeonly buffer VisibleLightIndices {
     uint light_indices[];
 };
-layout(std430, set = 0, binding = 4) writeonly buffer LightsFromTile {
-    uvec2 light_grid[];
-};
+layout(set = 0, binding = 4, rg32ui) writeonly uniform uimage3D light_grid;
 
 float start_depth_for_nth_slice(uint slice)
 {
@@ -146,12 +144,11 @@ void main()
 
 	    index_offset_out = atomicAdd(next_global_light_index, next_index);
 	    
-	    // Im not currently using a texture2d, just flattening the index, each thread group is a tile
-	    uint grid_index =
-            + gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
-            + gl_WorkGroupID.y * gl_NumWorkGroups.x
-            + gl_WorkGroupID.x;
-	    light_grid[grid_index] = uvec2(index_offset_out, next_index);
+	    imageStore(
+            light_grid,
+            ivec3(gl_WorkGroupID),
+            uvec4(index_offset_out, next_index, 0u, 0u)
+        );
     }
 
     barrier();
