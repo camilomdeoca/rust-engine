@@ -1,16 +1,15 @@
+use smallvec::smallvec;
 use std::sync::Arc;
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        CopyBufferToImageInfo, PrimaryCommandBufferAbstract,
+        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract
     },
     device::Queue,
     format::Format,
     image::{
-        view::{ImageView, ImageViewCreateInfo, ImageViewType},
-        Image, ImageCreateFlags, ImageCreateInfo, ImageType, ImageUsage,
+        sampler::Filter, view::{ImageView, ImageViewCreateInfo, ImageViewType}, Image, ImageCreateFlags, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageType, ImageUsage
     },
     memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter},
     sync::GpuFuture,
@@ -58,6 +57,37 @@ pub fn load_cubemap_from_buffer(
     )
 }
 
+fn generate_mipmaps(
+    image: &Arc<Image>,
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>
+) {
+    for i in 1..image.mip_levels() {
+        builder
+            .blit_image(BlitImageInfo {
+                src_image: image.clone(),
+                src_image_layout: ImageLayout::TransferSrcOptimal,
+                dst_image: image.clone(),
+                dst_image_layout: ImageLayout::TransferDstOptimal,
+                regions: [ImageBlit {
+                    src_subresource: ImageSubresourceLayers {
+                        mip_level: i - 1,
+                        ..image.subresource_layers()
+                    },
+                    src_offsets: [[0; 3], image.extent().map(|e| if e > 1 { e >> (i - 1) } else { e })],
+                    dst_subresource: ImageSubresourceLayers {
+                        mip_level: i,
+                        ..image.subresource_layers()
+                    },
+                    dst_offsets: [[0; 3], image.extent().map(|e| if e > 1 { e >> i } else { e })],
+                    ..Default::default()
+                }].into(),
+                filter: Filter::Linear,
+                ..BlitImageInfo::images(image.clone(), image.clone())
+            })
+            .unwrap();
+    }
+}
+
 fn load_texture_from_buffer_impl<I>(
     memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
@@ -95,6 +125,8 @@ where
     )
     .unwrap();
 
+    let mip_levels = extent.iter().max().unwrap().ilog2();
+
     let image = Image::new(
         memory_allocator.clone(),
         ImageCreateInfo {
@@ -103,7 +135,8 @@ where
             extent: [extent[0], extent[1], 1],
             array_layers,
             flags,
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            mip_levels,
+            usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
             ..Default::default()
         },
         AllocationCreateInfo::default(),
@@ -122,6 +155,8 @@ where
             image.clone(),
         ))
         .unwrap();
+
+    generate_mipmaps(&image, &mut builder);
 
     let image_view_create_info = ImageViewCreateInfo {
         view_type,

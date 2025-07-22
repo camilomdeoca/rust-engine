@@ -1,4 +1,7 @@
-use std::{sync::{Arc, RwLock}, u32};
+use std::{
+    sync::{Arc, RwLock},
+    u32,
+};
 
 use flecs_ecs::prelude::*;
 use glam::{Mat4, UVec3, Vec2, Vec3};
@@ -6,22 +9,28 @@ use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         Buffer, BufferCreateInfo, BufferUsage, Subbuffer,
-    }, command_buffer::{
+    },
+    command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
         DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
         SubpassBeginInfo, SubpassContents, SubpassEndInfo,
-    }, descriptor_set::{
+    },
+    descriptor_set::{
         allocator::StandardDescriptorSetAllocator,
-        layout::{
-            DescriptorBindingFlags, DescriptorType,
-        },
+        layout::{DescriptorBindingFlags, DescriptorType},
         DescriptorSet, WriteDescriptorSet,
-    }, device::{Device, DeviceOwned, Queue}, format::Format, image::{
+    },
+    device::{Device, DeviceOwned, Queue},
+    format::Format,
+    image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
         view::ImageView,
         Image, ImageCreateInfo, ImageType, ImageUsage,
-    }, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
-        compute::ComputePipelineCreateInfo, graphics::{
+    },
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{
+        compute::ComputePipelineCreateInfo,
+        graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
@@ -30,18 +39,29 @@ use vulkano::{
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        }, layout::PipelineDescriptorSetLayoutCreateInfo, ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::EntryPoint, DeviceSize
+        },
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+        ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    shader::EntryPoint,
+    DeviceSize,
 };
 
 use crate::{
     assets::{
-        database::{AssetDatabase, AssetDatabaseChangeObserver, Cubemap, CubemapId, Material, MaterialId, Mesh, MeshId, Texture, TextureId},
+        database::{
+            AssetDatabase, AssetDatabaseChangeObserver, Cubemap, CubemapId, Material, MaterialId,
+            Mesh, MeshId, Texture, TextureId,
+        },
         loaders::mesh_loader::load_mesh_from_buffers_into_new_buffers,
         vertex::Vertex,
     },
     camera::Camera,
-    ecs::components::{self, DirectionalLight, MaterialComponent, MeshComponent, PointLight, Transform},
+    ecs::components::{
+        self, DirectionalLight, MaterialComponent, MeshComponent, PointLight, Transform,
+    },
     profile::ProfileTimer,
 };
 
@@ -150,7 +170,7 @@ fn window_size_dependent_setup(
         ];
         let mut layout_create_info =
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
-        
+
         // SLOW_CHANGING_DESCRIPTOR_SET
         layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
@@ -166,7 +186,8 @@ fn window_size_dependent_setup(
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
             .unwrap()
-            .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT | DescriptorBindingFlags::PARTIALLY_BOUND;
+            .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+            | DescriptorBindingFlags::PARTIALLY_BOUND;
 
         let layout = PipelineLayout::new(
             device.clone(),
@@ -305,10 +326,18 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        self.point_lights_set_observer_entity.entity_view(&self.world).destruct();
-        self.point_lights_remove_observer_entity.entity_view(&self.world).destruct();
-        self.directional_lights_set_observer_entity.entity_view(&self.world).destruct();
-        self.directional_lights_remove_observer_entity.entity_view(&self.world).destruct();
+        self.point_lights_set_observer_entity
+            .entity_view(&self.world)
+            .destruct();
+        self.point_lights_remove_observer_entity
+            .entity_view(&self.world)
+            .destruct();
+        self.directional_lights_set_observer_entity
+            .entity_view(&self.world)
+            .destruct();
+        self.directional_lights_remove_observer_entity
+            .entity_view(&self.world)
+            .destruct();
     }
 }
 
@@ -351,7 +380,7 @@ impl Renderer {
                 ..Default::default()
             },
         );
-        
+
         let in_device_storage_buffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -371,13 +400,16 @@ impl Renderer {
             },
         );
 
-        let light_culling_cs = light_culling::cs::load(device.clone()).unwrap()
+        let light_culling_cs = light_culling::cs::load(device.clone())
+            .unwrap()
             .specialize(
                 [
                     (0, MAX_LIGHTS_PER_TILE.into()),
                     (1, TILE_SIZE.into()),
                     (2, Z_SLICES.into()),
-                ].into_iter().collect()
+                ]
+                .into_iter()
+                .collect(),
             )
             .unwrap()
             .entry_point("main")
@@ -437,10 +469,9 @@ impl Renderer {
         let mesh_fs = mesh_shaders::fs::load(device.clone())
             .unwrap()
             .specialize(
-                [
-                    (0, TILE_SIZE.into()),
-                    (1, Z_SLICES.into()),
-                ].into_iter().collect(),
+                [(0, TILE_SIZE.into()), (1, Z_SLICES.into())]
+                    .into_iter()
+                    .collect(),
             )
             .unwrap()
             .entry_point("main")
@@ -558,7 +589,7 @@ impl Renderer {
             .each_iter(move |_it, _index, _pos| {
                 *point_lights_changed_clone.write().unwrap() = true;
             });
-        
+
         let directional_lights_changed = Arc::new(RwLock::new(false));
         let directional_lights_changed_clone = directional_lights_changed.clone();
         let directional_lights_set_observer_entity: Entity = **world
@@ -727,40 +758,38 @@ impl Renderer {
         if materials_changed {
             let asset_database_read = self.asset_database.read().unwrap();
 
-            let materials_iter = asset_database_read.materials().iter().map(|material| {
-                let diffuse = material.diffuse.clone().map(|id| id.0);
-                let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
-                let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
-                let emissive = material.emissive.clone().map(|id| id.0);
-                let normal = material.normal.clone().map(|id| id.0);
-                mesh_shaders::fs::Material {
-                    base_color_factor: material.color_factor.into(),
-                    emissive_factor: material.emissive_factor.into(),
-                    metallic_factor: material.metallic_factor.into(),
-                    roughness_factor: material.roughness_factor.into(),
-                    base_color_texture_id: diffuse.unwrap_or(u32::MAX),
-                    metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
-                    ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
-                    emissive_texture_id: emissive.unwrap_or(u32::MAX),
-                    normal_texture_id: normal.unwrap_or(u32::MAX),
-                    pad: [0; 3],
-                }
-            });
+            let materials: Vec<_> = asset_database_read
+                .materials()
+                .iter()
+                .map(|material| {
+                    let diffuse = material.diffuse.clone().map(|id| id.0);
+                    let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
+                    let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
+                    let emissive = material.emissive.clone().map(|id| id.0);
+                    let normal = material.normal.clone().map(|id| id.0);
+                    mesh_shaders::fs::Material {
+                        base_color_factor: material.color_factor.into(),
+                        emissive_factor: material.emissive_factor.into(),
+                        metallic_factor: material.metallic_factor.into(),
+                        roughness_factor: material.roughness_factor.into(),
+                        base_color_texture_id: diffuse.unwrap_or(u32::MAX),
+                        metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
+                        ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
+                        emissive_texture_id: emissive.unwrap_or(u32::MAX),
+                        normal_texture_id: normal.unwrap_or(u32::MAX),
+                        pad: [0; 3],
+                    }
+                })
+                .collect();
 
-            self.materials_storage_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                materials_iter,
-            )
-            .unwrap();
+            self.materials_storage_buffer = self
+                .host_writable_storage_buffer_allocator
+                .allocate_slice(materials.len() as DeviceSize)
+                .unwrap();
+            self.materials_storage_buffer
+                .write()
+                .unwrap()
+                .copy_from_slice(&materials);
         }
 
         let mut irradiance_map = None;
@@ -839,23 +868,23 @@ impl Renderer {
         }
 
         let mut point_lights = vec![];
-        self.world.each::<(&PointLight, &Transform)>(|(point_light, transform)| {
-            point_lights.push(mesh_shaders::fs::PointLight {
-                position: transform.translation.to_array().into(),
-                radius: point_light.radius,
-                color: point_light.color.into(),
-                pad: [0; 1],
+        self.world
+            .each::<(&PointLight, &Transform)>(|(point_light, transform)| {
+                point_lights.push(mesh_shaders::fs::PointLight {
+                    position: transform.translation.to_array().into(),
+                    radius: point_light.radius,
+                    color: point_light.color.into(),
+                    pad: [0; 1],
+                });
             });
-        });
 
         if point_lights.is_empty() {
             self.point_lights_storage_buffer = None;
         } else {
             self.point_lights_storage_buffer = Some(
-                self
-                    .host_writable_storage_buffer_allocator
+                self.host_writable_storage_buffer_allocator
                     .allocate_slice(point_lights.len() as DeviceSize)
-                    .unwrap()
+                    .unwrap(),
             );
             self.point_lights_storage_buffer
                 .as_mut()
@@ -865,10 +894,11 @@ impl Renderer {
                 .copy_from_slice(&point_lights);
         }
     }
-    
+
     fn update_directional_lights_storage_buffer(&mut self) {
         {
-            let mut directional_lights_changed_write = self.directional_lights_changed.write().unwrap();
+            let mut directional_lights_changed_write =
+                self.directional_lights_changed.write().unwrap();
             if !*directional_lights_changed_write {
                 return;
             }
@@ -876,22 +906,22 @@ impl Renderer {
         }
 
         let mut directional_lights = vec![];
-        self.world.each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
-            directional_lights.push(mesh_shaders::fs::DirectionalLight {
-                direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
-                color: directional_light.color.into(),
-                pad: [0; 1],
+        self.world
+            .each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
+                directional_lights.push(mesh_shaders::fs::DirectionalLight {
+                    direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
+                    color: directional_light.color.into(),
+                    pad: [0; 1],
+                });
             });
-        });
 
         if directional_lights.is_empty() {
             self.directional_lights_storage_buffer = None;
         } else {
             self.directional_lights_storage_buffer = Some(
-                self
-                    .host_writable_storage_buffer_allocator
+                self.host_writable_storage_buffer_allocator
                     .allocate_slice(directional_lights.len() as DeviceSize)
-                    .unwrap()
+                    .unwrap(),
             );
             self.directional_lights_storage_buffer
                 .as_mut()
@@ -940,7 +970,7 @@ impl Renderer {
 
     pub fn resize_and_create_framebuffers(
         &mut self,
-        image_views: &[Arc<ImageView>]
+        image_views: &[Arc<ImageView>],
     ) -> Vec<Arc<Framebuffer>> {
         let extent = Vec2::new(
             image_views[0].image().extent()[0] as f32,
@@ -970,14 +1000,12 @@ impl Renderer {
         self.add_materials_and_textures_to_descriptor_set();
         self.update_point_lights_storage_buffer();
         self.update_directional_lights_storage_buffer();
-        
+
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
         let timer = ProfileTimer::start("cull_lights");
-        let (
-            visible_light_indices_storage_buffer,
-            lights_from_tile_storage_image_view,
-        ) = self.cull_lights(builder, &camera, aspect_ratio);
+        let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
+            self.cull_lights(builder, &camera, aspect_ratio);
         drop(timer);
 
         let timer = ProfileTimer::start("begin_render_pass");
@@ -1039,20 +1067,34 @@ impl Renderer {
             .unwrap();
 
         // Initialize with value 0
-        assert_eq!(size_of::<light_culling::cs::NextLigthIndexGlobal>(), size_of::<u32>());
-        builder.fill_buffer(
-            next_ligth_index_global_storage_buffer.clone().reinterpret::<[u32]>(),
-            0
-        )
-        .unwrap();
+        assert_eq!(
+            size_of::<light_culling::cs::NextLigthIndexGlobal>(),
+            size_of::<u32>()
+        );
+        builder
+            .fill_buffer(
+                next_ligth_index_global_storage_buffer
+                    .clone()
+                    .reinterpret::<[u32]>(),
+                0,
+            )
+            .unwrap();
 
-        let width = self.mesh_pipeline
-            .viewport_state().unwrap()
-            .viewports.get(0).unwrap()
+        let width = self
+            .mesh_pipeline
+            .viewport_state()
+            .unwrap()
+            .viewports
+            .get(0)
+            .unwrap()
             .extent[0] as u32;
-        let height = self.mesh_pipeline
-            .viewport_state().unwrap()
-            .viewports.get(0).unwrap()
+        let height = self
+            .mesh_pipeline
+            .viewport_state()
+            .unwrap()
+            .viewports
+            .get(0)
+            .unwrap()
             .extent[1] as u32;
 
         let num_tiles = UVec3::new(
@@ -1063,24 +1105,26 @@ impl Renderer {
 
         let visible_light_indices_storage_buffer = self
             .in_device_storage_buffer_allocator
-            .allocate_slice::<u32>((num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize)
-            .unwrap();
-
-        let lights_from_tile_storage_image = Image::new(
-                self.memory_allocator.clone(),
-                ImageCreateInfo {
-                    image_type: ImageType::Dim3d,
-                    format: Format::R32G32_UINT,
-                    extent: num_tiles.into(),
-                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-                    ..Default::default()
-                },
-                AllocationCreateInfo::default(),
+            .allocate_slice::<u32>(
+                (num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize,
             )
             .unwrap();
 
-        let lights_from_tile_storage_image_view = ImageView::new_default(lights_from_tile_storage_image)
-            .unwrap();
+        let lights_from_tile_storage_image = Image::new(
+            self.memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim3d,
+                format: Format::R32G32_UINT,
+                extent: num_tiles.into(),
+                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let lights_from_tile_storage_image_view =
+            ImageView::new_default(lights_from_tile_storage_image).unwrap();
 
         let frame_uniform_buffer = {
             let view = Mat4::look_to_rh(
@@ -1119,12 +1163,15 @@ impl Renderer {
                 WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
                 WriteDescriptorSet::buffer(
                     1,
-                    self.point_lights_storage_buffer.as_ref().unwrap_or(
-                        &self.in_device_storage_buffer_allocator
-                            .allocate_slice(1)
-                            .unwrap(),
-                    )
-                    .clone(),
+                    self.point_lights_storage_buffer
+                        .as_ref()
+                        .unwrap_or(
+                            &self
+                                .in_device_storage_buffer_allocator
+                                .allocate_slice(1)
+                                .unwrap(),
+                        )
+                        .clone(),
                 ),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
@@ -1138,9 +1185,9 @@ impl Renderer {
             .bind_pipeline_compute(self.light_culling_pipeline.clone())
             .unwrap()
             .bind_descriptor_sets(
-                PipelineBindPoint::Compute, 
-                self.light_culling_pipeline.layout().clone(), 
-                0, 
+                PipelineBindPoint::Compute,
+                self.light_culling_pipeline.layout().clone(),
+                0,
                 set,
             )
             .unwrap();
@@ -1168,13 +1215,21 @@ impl Renderer {
         );
 
         let frame_uniform_buffer = {
-            let width = self.mesh_pipeline
-                .viewport_state().unwrap()
-                .viewports.get(0).unwrap()
+            let width = self
+                .mesh_pipeline
+                .viewport_state()
+                .unwrap()
+                .viewports
+                .get(0)
+                .unwrap()
                 .extent[0];
-            let height = self.mesh_pipeline
-                .viewport_state().unwrap()
-                .viewports.get(0).unwrap()
+            let height = self
+                .mesh_pipeline
+                .viewport_state()
+                .unwrap()
+                .viewports
+                .get(0)
+                .unwrap()
                 .extent[1];
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
@@ -1187,7 +1242,8 @@ impl Renderer {
                 far: 100.0,
                 width,
                 height,
-                directional_light_count: self.directional_lights_storage_buffer
+                directional_light_count: self
+                    .directional_lights_storage_buffer
                     .as_ref()
                     .map(|buffer| buffer.len() as u32)
                     .unwrap_or(0),
@@ -1230,7 +1286,9 @@ impl Renderer {
             });
         drop(asset_database_read);
 
-        if indirect_commands.is_empty() { return; }
+        if indirect_commands.is_empty() {
+            return;
+        }
 
         let indirect_buffer = self
             .indirect_buffer_allocator
@@ -1264,21 +1322,27 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_DIRECTIONAL_LIGHTS_BUFFER_BINDING,
-                    self.directional_lights_storage_buffer.as_ref().unwrap_or(
-                        &self.in_device_storage_buffer_allocator
-                            .allocate_slice(1)
-                            .unwrap()
-                    )
-                    .clone(),
+                    self.directional_lights_storage_buffer
+                        .as_ref()
+                        .unwrap_or(
+                            &self
+                                .in_device_storage_buffer_allocator
+                                .allocate_slice(1)
+                                .unwrap(),
+                        )
+                        .clone(),
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING,
-                    self.point_lights_storage_buffer.as_ref().unwrap_or(
-                        &self.in_device_storage_buffer_allocator
-                            .allocate_slice(1)
-                            .unwrap()
-                    )
-                    .clone(),
+                    self.point_lights_storage_buffer
+                        .as_ref()
+                        .unwrap_or(
+                            &self
+                                .in_device_storage_buffer_allocator
+                                .allocate_slice(1)
+                                .unwrap(),
+                        )
+                        .clone(),
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING,

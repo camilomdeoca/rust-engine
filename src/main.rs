@@ -295,12 +295,8 @@ impl App {
                 queue_create_infos: vec![
                     QueueCreateInfo {
                         queue_family_index,
-                        // queues: vec![0.5, 0.1], // one queue for rendering and another for asset
-                        //                         // loading
-                        ..Default::default()
-                    },
-                    QueueCreateInfo {
-                        queue_family_index: 1,
+                        queues: vec![0.5, 0.1], // one queue for rendering and another for asset
+                                                // loading
                         ..Default::default()
                     },
                 ],
@@ -464,7 +460,7 @@ impl App {
         drop(asset_database_write);
 
         world
-            .entity_named("Light1")
+            .entity_named("SunLight")
             .set(Transform {
                 translation: Vec3::ZERO,
                 rotation: Quat::from_euler(EulerRot::YXZ, 0.0, PI * 3.0/4.0, 0.0),
