@@ -411,7 +411,7 @@ impl Renderer {
                     store_op: Store,
                 },
                 depth_stencil: {
-                    format: Format::D16_UNORM,
+                    format: Format::D32_SFLOAT,
                     samples: 1,
                     load_op: Clear,
                     store_op: DontCare,
@@ -854,7 +854,7 @@ impl Renderer {
                 self.memory_allocator.clone(),
                 ImageCreateInfo {
                     image_type: ImageType::Dim2d,
-                    format: Format::D16_UNORM,
+                    format: Format::D32_SFLOAT,
                     extent,
                     usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
                     ..Default::default()
