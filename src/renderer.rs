@@ -112,21 +112,11 @@ pub struct Renderer {
     cube_index_buffer: Subbuffer<[u32]>,
 
     asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
-    point_lights_changed: Arc<RwLock<bool>>,
-    directional_lights_changed: Arc<RwLock<bool>>,
 
     sampler: Arc<Sampler>,
 
-    // Option because it cant be of length 0
-    directional_lights_storage_buffer: Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
-    point_lights_storage_buffer: Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
     slow_changing_descriptor_set: Arc<DescriptorSet>,
-
-    point_lights_set_observer_entity: Entity, // needs to be destructed when the renderer is dropped
-    point_lights_remove_observer_entity: Entity, // needs to be destructed when the renderer is dropped
-    directional_lights_set_observer_entity: Entity, // needs to be destructed when the renderer is dropped
-    directional_lights_remove_observer_entity: Entity, // needs to be destructed when the renderer is dropped
 
     environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
@@ -324,24 +314,6 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
     }
 }
 
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        self.point_lights_set_observer_entity
-            .entity_view(&self.world)
-            .destruct();
-        self.point_lights_remove_observer_entity
-            .entity_view(&self.world)
-            .destruct();
-        self.directional_lights_set_observer_entity
-            .entity_view(&self.world)
-            .destruct();
-        self.directional_lights_remove_observer_entity
-            .entity_view(&self.world)
-            .destruct();
-    }
-}
-
-///
 impl Renderer {
     pub fn new(
         device: Arc<Device>,
@@ -574,41 +546,6 @@ impl Renderer {
         )
         .unwrap();
 
-        let point_lights_changed = Arc::new(RwLock::new(false));
-        let point_lights_changed_clone = point_lights_changed.clone();
-        let point_lights_set_observer_entity: Entity = **world
-            .observer::<flecs::OnSet, &PointLight>()
-            .yield_existing()
-            .each_iter(move |_it, _index, _pos| {
-                *point_lights_changed_clone.write().unwrap() = true;
-            });
-        let point_lights_changed_clone = point_lights_changed.clone();
-        let point_lights_remove_observer_entity: Entity = **world
-            .observer::<flecs::OnRemove, &PointLight>()
-            .yield_existing()
-            .each_iter(move |_it, _index, _pos| {
-                *point_lights_changed_clone.write().unwrap() = true;
-            });
-
-        let directional_lights_changed = Arc::new(RwLock::new(false));
-        let directional_lights_changed_clone = directional_lights_changed.clone();
-        let directional_lights_set_observer_entity: Entity = **world
-            .observer::<flecs::OnSet, &DirectionalLight>()
-            .yield_existing()
-            .each_iter(move |_it, _index, _pos| {
-                *directional_lights_changed_clone.write().unwrap() = true;
-            });
-        let directional_lights_changed_clone = directional_lights_changed.clone();
-        let directional_lights_remove_observer_entity: Entity = **world
-            .observer::<flecs::OnRemove, &DirectionalLight>()
-            .yield_existing()
-            .each_iter(move |_it, _index, _pos| {
-                *directional_lights_changed_clone.write().unwrap() = true;
-            });
-
-        let point_lights_storage_buffer = None;
-        let directional_lights_storage_buffer = None;
-
         let environment_cubemap_query = world
             .query::<&components::EnvironmentCubemap>()
             .term_at(0)
@@ -726,17 +663,9 @@ impl Renderer {
             cube_vertex_buffer,
             cube_index_buffer,
             sampler,
-            directional_lights_storage_buffer,
-            point_lights_storage_buffer,
             materials_storage_buffer,
             slow_changing_descriptor_set: environment_descriptor_set,
             asset_change_listener,
-            point_lights_changed,
-            directional_lights_changed,
-            point_lights_set_observer_entity,
-            point_lights_remove_observer_entity,
-            directional_lights_set_observer_entity,
-            directional_lights_remove_observer_entity,
             environment_cubemap_query,
             meshes_with_materials_query,
             world,
@@ -858,15 +787,9 @@ impl Renderer {
         asset_change_listener_write.textures_changed = false;
     }
 
-    fn update_point_lights_storage_buffer(&mut self) {
-        {
-            let mut point_lights_changed_write = self.point_lights_changed.write().unwrap();
-            if !*point_lights_changed_write {
-                return;
-            }
-            *point_lights_changed_write = false;
-        }
-
+    fn create_point_lights_storage_buffer(
+        &mut self
+    ) -> Option<Subbuffer<[mesh_shaders::fs::PointLight]>> {
         let mut point_lights = vec![];
         self.world
             .each::<(&PointLight, &Transform)>(|(point_light, transform)| {
@@ -879,32 +802,24 @@ impl Renderer {
             });
 
         if point_lights.is_empty() {
-            self.point_lights_storage_buffer = None;
+            None
         } else {
-            self.point_lights_storage_buffer = Some(
-                self.host_writable_storage_buffer_allocator
-                    .allocate_slice(point_lights.len() as DeviceSize)
-                    .unwrap(),
-            );
-            self.point_lights_storage_buffer
-                .as_mut()
-                .unwrap()
+            let point_lights_storage_buffer = self.host_writable_storage_buffer_allocator
+                .allocate_slice(point_lights.len() as DeviceSize)
+                .unwrap();
+
+            point_lights_storage_buffer
                 .write()
                 .unwrap()
                 .copy_from_slice(&point_lights);
+
+            Some(point_lights_storage_buffer)
         }
     }
 
-    fn update_directional_lights_storage_buffer(&mut self) {
-        {
-            let mut directional_lights_changed_write =
-                self.directional_lights_changed.write().unwrap();
-            if !*directional_lights_changed_write {
-                return;
-            }
-            *directional_lights_changed_write = false;
-        }
-
+    fn create_directional_lights_storage_buffer(
+        &mut self
+    ) -> Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>> {
         let mut directional_lights = vec![];
         self.world
             .each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
@@ -916,19 +831,18 @@ impl Renderer {
             });
 
         if directional_lights.is_empty() {
-            self.directional_lights_storage_buffer = None;
+            None
         } else {
-            self.directional_lights_storage_buffer = Some(
-                self.host_writable_storage_buffer_allocator
-                    .allocate_slice(directional_lights.len() as DeviceSize)
-                    .unwrap(),
-            );
-            self.directional_lights_storage_buffer
-                .as_mut()
-                .unwrap()
+            let directional_lights_storage_buffer = self.host_writable_storage_buffer_allocator
+                .allocate_slice(directional_lights.len() as DeviceSize)
+                .unwrap();
+
+            directional_lights_storage_buffer
                 .write()
                 .unwrap()
                 .copy_from_slice(&directional_lights);
+
+            Some(directional_lights_storage_buffer)
         }
     }
 
@@ -998,14 +912,19 @@ impl Renderer {
         camera: &Camera,
     ) {
         self.add_materials_and_textures_to_descriptor_set();
-        self.update_point_lights_storage_buffer();
-        self.update_directional_lights_storage_buffer();
+        let point_lights_buffer = self.create_point_lights_storage_buffer();
+        let directional_lights_buffer = self.create_directional_lights_storage_buffer();
 
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
         let timer = ProfileTimer::start("cull_lights");
         let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
-            self.cull_lights(builder, &camera, aspect_ratio);
+            self.cull_lights(
+                builder,
+                &camera,
+                aspect_ratio,
+                &point_lights_buffer,
+            );
         drop(timer);
 
         let timer = ProfileTimer::start("begin_render_pass");
@@ -1029,6 +948,8 @@ impl Renderer {
             builder,
             &camera,
             aspect_ratio,
+            &point_lights_buffer,
+            &directional_lights_buffer,
             visible_light_indices_storage_buffer,
             lights_from_tile_storage_image_view,
         );
@@ -1060,6 +981,7 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
+        point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
     ) -> (Subbuffer<[u32]>, Arc<ImageView>) {
         let next_ligth_index_global_storage_buffer = self
             .in_device_storage_buffer_allocator
@@ -1135,7 +1057,7 @@ impl Renderer {
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
 
-            let num_lights = match &self.point_lights_storage_buffer {
+            let num_lights = match point_lights_storage_buffer {
                 Some(point_lights_storage_buffer) => point_lights_storage_buffer.len() as _,
                 None => 0,
             };
@@ -1163,7 +1085,7 @@ impl Renderer {
                 WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
                 WriteDescriptorSet::buffer(
                     1,
-                    self.point_lights_storage_buffer
+                    point_lights_storage_buffer
                         .as_ref()
                         .unwrap_or(
                             &self
@@ -1205,6 +1127,8 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
+        point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
+        directional_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
         visible_light_indices_storage_buffer: Subbuffer<[u32]>,
         lights_from_tile_storage_image_view: Arc<ImageView>,
     ) {
@@ -1242,8 +1166,7 @@ impl Renderer {
                 far: 100.0,
                 width,
                 height,
-                directional_light_count: self
-                    .directional_lights_storage_buffer
+                directional_light_count: directional_lights_storage_buffer
                     .as_ref()
                     .map(|buffer| buffer.len() as u32)
                     .unwrap_or(0),
@@ -1322,7 +1245,7 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_DIRECTIONAL_LIGHTS_BUFFER_BINDING,
-                    self.directional_lights_storage_buffer
+                    directional_lights_storage_buffer
                         .as_ref()
                         .unwrap_or(
                             &self
@@ -1334,7 +1257,7 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING,
-                    self.point_lights_storage_buffer
+                    point_lights_storage_buffer
                         .as_ref()
                         .unwrap_or(
                             &self
