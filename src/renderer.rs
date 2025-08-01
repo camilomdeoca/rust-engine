@@ -23,9 +23,7 @@ use vulkano::{
     device::{Device, DeviceOwned, Queue},
     format::Format,
     image::{
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
-        view::ImageView,
-        Image, ImageCreateInfo, ImageType, ImageUsage,
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE}, view::ImageView, Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -44,7 +42,7 @@ use vulkano::{
         ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription},
     shader::EntryPoint,
     DeviceSize,
 };
@@ -60,7 +58,7 @@ use crate::{
     },
     camera::Camera,
     ecs::components::{
-        self, DirectionalLight, MaterialComponent, MeshComponent, PointLight, Transform,
+        self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent, PointLight, Transform
     },
     profile::ProfileTimer,
 };
@@ -85,6 +83,7 @@ pub const FRAME_DESCRIPTOR_SET_DIRECTIONAL_LIGHTS_BUFFER_BINDING: u32 = 2;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING: u32 = 3;
 pub const FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING: u32 = 4;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING: u32 = 5;
+pub const FRAME_DESCRIPTOR_SET_SHADOW_MAP_BINDING: u32 = 6;
 
 pub struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -99,10 +98,13 @@ pub struct Renderer {
     render_pass: Arc<RenderPass>,
     mesh_vs: EntryPoint,
     mesh_fs: EntryPoint,
+    shadow_mapping_pipeline: Arc<GraphicsPipeline>,
     mesh_pipeline: Arc<GraphicsPipeline>,
     skybox_vs: EntryPoint,
     skybox_fs: EntryPoint,
     skybox_pipeline: Arc<GraphicsPipeline>,
+
+    shadow_map_framebuffer: Arc<Framebuffer>,
 
     /// For tiled rendering
     light_culling_cs: EntryPoint,
@@ -171,7 +173,7 @@ fn window_size_dependent_setup(
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
             .unwrap()
-            .descriptor_count = properties.max_descriptor_set_samplers - 3;
+            .descriptor_count = properties.max_descriptor_set_samplers - 4;
         layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
@@ -314,6 +316,113 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
     }
 }
 
+fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            depth_stencil: {
+                format: Format::D32_SFLOAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [],
+            depth_stencil: {depth_stencil},
+        },
+    )
+    .unwrap()
+    // RenderPass::new(
+    //     device.clone(),
+    //     RenderPassCreateInfo {
+    //         attachments: [AttachmentDescription {
+    //             format: Format::D32_SFLOAT,
+    //             load_op: AttachmentLoadOp::Clear,
+    //             store_op: AttachmentStoreOp::Store,
+    //             initial_layout: ImageLayout::DepthStencilAttachmentOptimal,
+    //             final_layout: ImageLayout::DepthStencilAttachmentOptimal,
+    //             ..Default::default()
+    //         }].into(),
+    //         subpasses: [SubpassDescription {
+    //             //view_mask: (1 << SHADOW_MAPPING_LEVELS) - 1,
+    //             depth_stencil_attachment: Some(AttachmentReference {
+    //                 attachment: 0,
+    //                 layout: ImageLayout::DepthStencilAttachmentOptimal,
+    //                 ..Default::default()
+    //             }),
+    //             // depth_stencil_resolve_attachment: Some(AttachmentReference {
+    //             //     attachment: 0,
+    //             //     layout: ImageLayout::DepthStencilAttachmentOptimal,
+    //             //     ..Default::default()
+    //             // }),
+    //             // depth_resolve_mode: Some(ResolveMode::Min),
+    //             ..Default::default()
+    //         }].into(),
+    //         //correlated_view_masks: [(1 << SHADOW_MAPPING_LEVELS) - 1].into(),
+    //         ..Default::default()
+    //     },
+    // )
+    // .unwrap()
+}
+
+fn create_shadow_map_pipeline(
+    extent: Vec2,
+    render_pass: &Arc<RenderPass>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    shadow_mapping_vs: &EntryPoint,
+    shadow_mapping_fs: &EntryPoint,
+) -> Arc<GraphicsPipeline> {
+    let device = memory_allocator.device();
+    let stages = [
+        PipelineShaderStageCreateInfo::new(shadow_mapping_vs.clone()),
+        PipelineShaderStageCreateInfo::new(shadow_mapping_fs.clone()),
+    ];
+    let layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: extent.into(),
+        depth_range: 0.0..=1.0,
+    };
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(shadow_mapping_vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport.clone()].into(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
+}
+
 impl Renderer {
     pub fn new(
         device: Arc<Device>,
@@ -398,6 +507,52 @@ impl Renderer {
             device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(stage, layout),
+        )
+        .unwrap();
+
+        let shadow_mapping_render_pass = create_shadow_map_renderpass(&device);
+
+        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+
+        let shadow_mapping_pipeline = create_shadow_map_pipeline(
+            Vec2::new(1024.0, 1024.0),
+            &shadow_mapping_render_pass,
+            &memory_allocator,
+            &shadow_mapping_vs,
+            &shadow_mapping_fs,
+        );
+
+        assert_eq!(shadow_mapping_render_pass.attachments()[0].format, Format::D32_SFLOAT);
+        let shadow_map = ImageView::new_default(
+            Image::new(
+                memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: shadow_mapping_render_pass.attachments()[0].format,
+                    extent: [1024, 1024, 1],
+                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT
+                        | ImageUsage::SAMPLED,
+                    //array_layers: SHADOW_MAPPING_LEVELS,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let shadow_map_framebuffer = Framebuffer::new(
+            shadow_mapping_render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![shadow_map.clone()],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -656,8 +811,10 @@ impl Renderer {
             mesh_fs,
             skybox_vs,
             skybox_fs,
+            shadow_mapping_pipeline,
             mesh_pipeline,
             skybox_pipeline,
+            shadow_map_framebuffer,
             light_culling_cs,
             light_culling_pipeline,
             cube_vertex_buffer,
@@ -821,14 +978,24 @@ impl Renderer {
         &mut self
     ) -> Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>> {
         let mut directional_lights = vec![];
-        self.world
-            .each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
-                directional_lights.push(mesh_shaders::fs::DirectionalLight {
-                    direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
-                    color: directional_light.color.into(),
-                    pad: [0; 1],
-                });
+        self.world.each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
+            let light_projection = 1.0
+                * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::orthographic_rh(-10.0, 10.0, -10.0, 10.0, -100.0, 100.0);
+            
+            let light_view = Mat4::look_to_rh(
+                Vec3::ZERO, // TODO: Use camera pos?
+                (transform.rotation * Vec3::NEG_Z).normalize(),
+                Vec3::Y,
+            );
+
+            let light_space = light_projection * light_view;
+            directional_lights.push(mesh_shaders::fs::DirectionalLight {
+                direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
+                color: directional_light.color.to_array().into(),
+                light_space: light_space.to_cols_array_2d().into(),
             });
+        });
 
         if directional_lights.is_empty() {
             None
@@ -927,6 +1094,22 @@ impl Renderer {
             );
         drop(timer);
 
+        let entities_data_and_indirect_commands =
+            self.get_entities_data_and_indirect_draw_commands();
+
+        if let Some((entities_data, indirect_commands)) =
+            entities_data_and_indirect_commands.as_ref()
+        {
+            let timer = ProfileTimer::start("render_shadow_maps");
+            self.render_shadow_maps(
+                builder,
+                &entities_data,
+                &indirect_commands,
+                &directional_lights_buffer,
+            );
+            drop(timer);
+        }
+
         let timer = ProfileTimer::start("begin_render_pass");
         builder
             .begin_render_pass(
@@ -943,17 +1126,23 @@ impl Renderer {
             .unwrap();
         drop(timer);
 
-        let timer = ProfileTimer::start("draw_meshes");
-        self.draw_meshes(
-            builder,
-            &camera,
-            aspect_ratio,
-            &point_lights_buffer,
-            &directional_lights_buffer,
-            visible_light_indices_storage_buffer,
-            lights_from_tile_storage_image_view,
-        );
-        drop(timer);
+        if let Some((entities_data, indirect_commands)) =
+            entities_data_and_indirect_commands.as_ref()
+        {
+            let timer = ProfileTimer::start("draw_meshes");
+            self.draw_meshes(
+                builder,
+                &camera,
+                aspect_ratio,
+                &point_lights_buffer,
+                &directional_lights_buffer,
+                &visible_light_indices_storage_buffer,
+                &lights_from_tile_storage_image_view,
+                &entities_data,
+                &indirect_commands,
+            );
+            drop(timer);
+        }
 
         let timer = ProfileTimer::start("next_subpass");
         builder
@@ -974,6 +1163,83 @@ impl Renderer {
         let timer = ProfileTimer::start("end_render_pass");
         builder.end_render_pass(Default::default()).unwrap();
         drop(timer);
+    }
+
+    fn render_shadow_maps(
+        &mut self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
+        indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
+        directional_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
+    ) {
+        builder
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![Some(1f32.into())],
+
+                    ..RenderPassBeginInfo::framebuffer(self.shadow_map_framebuffer.clone())
+                },
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.shadow_mapping_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::buffer(
+                    0,
+                    directional_lights_storage_buffer
+                        .as_ref()
+                        .map(|buf| buf.clone())
+                        .unwrap_or_else(||
+                            self.in_device_storage_buffer_allocator
+                                .allocate_slice(1)
+                                .unwrap(),
+                        ),
+                ),
+                WriteDescriptorSet::buffer(
+                    1,
+                    entities_data.clone(),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+
+        builder
+            .bind_pipeline_graphics(self.shadow_mapping_pipeline.clone())
+            .unwrap();
+        
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.shadow_mapping_pipeline.layout().clone(),
+                0,
+                descriptor_set.clone(),
+            )
+            .unwrap();
+
+        let vertex_buffer;
+        let index_buffer;
+        {
+            let asset_database_read = self.asset_database.read().unwrap();
+            vertex_buffer = asset_database_read.vertex_buffer().clone();
+            index_buffer = asset_database_read.index_buffer().clone();
+        }
+
+        builder
+            .bind_vertex_buffers(0, vertex_buffer.clone())
+            .unwrap()
+            .bind_index_buffer(index_buffer.clone())
+            .unwrap();
+
+        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }.unwrap();
+
+        builder.end_render_pass(Default::default()).unwrap();
     }
 
     fn cull_lights(
@@ -1051,11 +1317,11 @@ impl Renderer {
         let frame_uniform_buffer = {
             let view = Mat4::look_to_rh(
                 camera.position,
-                camera.rotation * Vec3::NEG_Z,
-                camera.rotation * Vec3::Y,
+                (camera.rotation * Vec3::NEG_Z).normalize(),
+                (camera.rotation * Vec3::Y).normalize(),
             );
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
+                * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
 
             let num_lights = match point_lights_storage_buffer {
                 Some(point_lights_storage_buffer) => point_lights_storage_buffer.len() as _,
@@ -1087,13 +1353,12 @@ impl Renderer {
                     1,
                     point_lights_storage_buffer
                         .as_ref()
-                        .unwrap_or(
-                            &self
-                                .in_device_storage_buffer_allocator
+                        .map(|buf| buf.clone())
+                        .unwrap_or_else(||
+                            self.in_device_storage_buffer_allocator
                                 .allocate_slice(1)
                                 .unwrap(),
-                        )
-                        .clone(),
+                        ),
                 ),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
@@ -1122,62 +1387,10 @@ impl Renderer {
         )
     }
 
-    fn draw_meshes(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        camera: &Camera,
-        aspect_ratio: f32,
-        point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
-        directional_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
-        visible_light_indices_storage_buffer: Subbuffer<[u32]>,
-        lights_from_tile_storage_image_view: Arc<ImageView>,
-    ) {
-        let view = Mat4::look_to_rh(
-            camera.position,
-            camera.rotation * Vec3::NEG_Z,
-            camera.rotation * Vec3::Y,
-        );
-
-        let frame_uniform_buffer = {
-            let width = self
-                .mesh_pipeline
-                .viewport_state()
-                .unwrap()
-                .viewports
-                .get(0)
-                .unwrap()
-                .extent[0];
-            let height = self
-                .mesh_pipeline
-                .viewport_state()
-                .unwrap()
-                .viewports
-                .get(0)
-                .unwrap()
-                .extent[1];
-            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
-
-            let uniform_data = mesh_shaders::vs::FrameUniforms {
-                view: view.to_cols_array_2d(),
-                proj: proj.to_cols_array_2d(),
-                view_position: camera.position.into(),
-                near: 0.01,
-                far: 100.0,
-                width,
-                height,
-                directional_light_count: directional_lights_storage_buffer
-                    .as_ref()
-                    .map(|buffer| buffer.len() as u32)
-                    .unwrap_or(0),
-            };
-
-            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-            *buffer.write().unwrap() = uniform_data;
-
-            buffer
-        };
-
+    fn get_entities_data_and_indirect_draw_commands(&self) -> Option<(
+        Subbuffer<[mesh_shaders::vs::EntityData]>,
+        Subbuffer<[DrawIndexedIndirectCommand]>,
+    )> {
         let mut entities_data = vec![];
         let mut indirect_commands = vec![];
 
@@ -1209,9 +1422,7 @@ impl Renderer {
             });
         drop(asset_database_read);
 
-        if indirect_commands.is_empty() {
-            return;
-        }
+        if indirect_commands.is_empty() { return None }
 
         let indirect_buffer = self
             .indirect_buffer_allocator
@@ -1230,6 +1441,67 @@ impl Renderer {
             .write()
             .unwrap()
             .copy_from_slice(&entities_data);
+        Some((entity_data_storage_buffer, indirect_buffer))
+    }
+
+    fn draw_meshes(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        camera: &Camera,
+        aspect_ratio: f32,
+        point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
+        directional_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
+        visible_light_indices_storage_buffer: &Subbuffer<[u32]>,
+        lights_from_tile_storage_image_view: &Arc<ImageView>,
+        entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
+        indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    ) {
+        let view = Mat4::look_to_rh(
+            camera.position,
+            (camera.rotation * Vec3::NEG_Z).normalize(),
+            (camera.rotation * Vec3::Y).normalize(),
+        );
+
+        let frame_uniform_buffer = {
+            let width = self
+                .mesh_pipeline
+                .viewport_state()
+                .unwrap()
+                .viewports
+                .get(0)
+                .unwrap()
+                .extent[0];
+            let height = self
+                .mesh_pipeline
+                .viewport_state()
+                .unwrap()
+                .viewports
+                .get(0)
+                .unwrap()
+                .extent[1];
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
+
+            let uniform_data = mesh_shaders::vs::FrameUniforms {
+                view: view.to_cols_array_2d(),
+                proj: proj.to_cols_array_2d(),
+                view_position: camera.position.into(),
+                near: 0.01,
+                far: 100.0,
+                width,
+                height,
+                directional_light_count: directional_lights_storage_buffer
+                    .as_ref()
+                    .map(|buffer| buffer.len() as u32)
+                    .unwrap_or(0),
+            };
+
+            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *buffer.write().unwrap() = uniform_data;
+
+            buffer
+        };
+
 
         let frame_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
@@ -1241,7 +1513,7 @@ impl Renderer {
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_ENTITY_DATA_BUFFER_BINDING,
-                    entity_data_storage_buffer.clone(),
+                    entities_data.clone(),
                 ),
                 WriteDescriptorSet::buffer(
                     FRAME_DESCRIPTOR_SET_DIRECTIONAL_LIGHTS_BUFFER_BINDING,
@@ -1275,6 +1547,10 @@ impl Renderer {
                     FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING,
                     lights_from_tile_storage_image_view.clone(),
                 ),
+                WriteDescriptorSet::image_view(
+                    FRAME_DESCRIPTOR_SET_SHADOW_MAP_BINDING,
+                    self.shadow_map_framebuffer.attachments()[0].clone(),
+                ),
             ],
             [],
         )
@@ -1304,7 +1580,7 @@ impl Renderer {
             .unwrap();
         drop(asset_database_read);
 
-        unsafe { builder.draw_indexed_indirect(indirect_buffer) }.unwrap();
+        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }.unwrap();
     }
 
     fn draw_skybox(
@@ -1348,11 +1624,11 @@ impl Renderer {
         let frame_uniform_buffer = {
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) // Correction for vulkan's
                                                                    // inverted y
-                * Mat4::perspective_rh_gl(camera.fov, aspect_ratio, 0.01, 100.0);
+                * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
             let view = Mat4::look_at_rh(
                 Vec3::ZERO,
-                camera.rotation * Vec3::NEG_Z,
-                camera.rotation * Vec3::Y,
+                (camera.rotation * Vec3::NEG_Z).normalize(),
+                (camera.rotation * Vec3::Y).normalize(),
             );
 
             let uniform_data = skybox_shaders::vs::FrameUniforms {
@@ -1398,6 +1674,22 @@ mod light_culling {
         vulkano_shaders::shader! {
             ty: "compute",
             path: "assets/shaders/light_culling.cs.glsl",
+        }
+    }
+}
+
+mod shadow_mapping_shaders {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            path: "assets/shaders/shadow_mapping.vs.glsl",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/shadow_mapping.fs.glsl",
         }
     }
 }

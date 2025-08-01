@@ -1,4 +1,4 @@
-use flecs_ecs::{core::{Entity, EntityView, World}, macros::Component};
+use flecs_ecs::{core::EntityView, macros::Component};
 use glam::{Quat, Vec2, Vec3};
 
 use crate::assets::database::{CubemapId, MaterialId, MeshId};
@@ -41,6 +41,9 @@ pub struct PointLight {
 pub struct DirectionalLight {
     pub color: Vec3,
 }
+
+#[derive(Debug, Component)]
+pub struct DirectionalLightShadowMap;
 
 #[derive(Debug, Component)]
 pub struct Camera {

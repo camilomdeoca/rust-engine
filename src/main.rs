@@ -21,10 +21,10 @@ use assets::{
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::{DirectionalLight, EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
+use ecs::components::{DirectionalLight, DirectionalLightShadowMap, EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
-use glam::{EulerRot, Quat, Vec3};
+use glam::{EulerRot, Mat3, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use log::{info, warn};
 use profile::ProfileTimer;
@@ -295,8 +295,8 @@ impl App {
                 queue_create_infos: vec![
                     QueueCreateInfo {
                         queue_family_index,
-                        queues: vec![0.5, 0.1], // one queue for rendering and another for asset
-                                                // loading
+                        // queues: vec![0.5, 0.1], // one queue for rendering and another for asset
+                        //                         // loading
                         ..Default::default()
                     },
                 ],
@@ -323,7 +323,7 @@ impl App {
         );
 
         let asset_database = Arc::new(RwLock::new(AssetDatabase::new(
-            queues.next().unwrap(),
+            queue.clone(), // queues.next().unwrap(),
             memory_allocator.clone(),
             vertex_count as DeviceSize,
             index_count as DeviceSize,
@@ -459,16 +459,19 @@ impl App {
         });
         drop(asset_database_write);
 
+        let rot = Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::new(2.0, -4.0, 3.0).normalize());
+
         world
             .entity_named("SunLight")
             .set(Transform {
                 translation: Vec3::ZERO,
-                rotation: Quat::from_euler(EulerRot::YXZ, 0.0, PI * 3.0/4.0, 0.0),
+                rotation: rot.normalize(),
                 scale: Vec3::ONE,
             })
             .set(DirectionalLight {
                 color: Vec3::new(5.0, 5.0, 3.0),
-            });
+            })
+            .add::<DirectionalLightShadowMap>();
 
         App {
             instance,
@@ -667,6 +670,7 @@ impl ApplicationHandler for App {
                     let pitch = Quat::from_rotation_x(-delta.1 as f32 * sensitivity * 0.01);
 
                     camera.rotation = yaw * camera.rotation * pitch;
+                    camera.rotation = camera.rotation.normalize()
                 }
             }
             DeviceEvent::MouseWheel { delta: _delta } => {

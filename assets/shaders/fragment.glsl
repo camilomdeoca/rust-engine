@@ -42,7 +42,7 @@ struct PointLight {
 struct DirectionalLight {
     vec3 direction;
     vec3 color;
-    uint pad[1];
+    mat4 light_space;
 };
 
 // Slow changing descriptor set 
@@ -82,6 +82,7 @@ layout(std430, set = 1, binding = 4) readonly buffer VisibleLightIndices {
     uint light_indices[];
 };
 layout(set = 1, binding = 5, rg32ui) readonly uniform uimage3D light_grid;
+layout(set = 1, binding = 6) uniform texture2D shadow_map;
 
 const uint UINT_MAX = 4294967295;
 
@@ -297,11 +298,35 @@ void main()
     {
         DirectionalLight light = directional_lights[i];
         // calculate per-light radiance
-        vec3 light_direction = normalize(light.direction);
+        vec3 light_direction = normalize(-light.direction);
         vec3 radiance = light.color;
-
+        
+        float bias = 0.00025;
+        bias = max(bias * (1.0 - dot(N, light_direction)), bias);
+        const mat4 bias_mat = mat4( 
+            0.5, 0.0, 0.0, 0.0,
+            0.0, 0.5, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.5, 0.5, 0.0, 1.0 );
+        vec4 pos_light_space = bias_mat * light.light_space * vec4(v_pos, 1.0);
+        vec3 projCoords = pos_light_space.xyz / pos_light_space.w;
+        // transform to [0,1] range
+        // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
+        float closestDepth = texture(sampler2D(shadow_map, s), projCoords.xy).r; 
+        // get depth of current fragment from light's perspective
+        float currentDepth = projCoords.z;
+        // check whether current frag pos is in shadow
+        float shadow;
+        if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+        {
+            shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+            // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
+            // return;
+        }
+        else
+            shadow = 0.0;
         // add to outgoing radiance Lo
-        Lo += get_light_contribution(base_color.rgb, radiance, light_direction, V, N, metallic, roughness, F0);
+        Lo += (1.0 - shadow) * get_light_contribution(base_color.rgb, radiance, light_direction, V, N, metallic, roughness, F0);
     }
 
     for (int i = 0; i < num_lights; i++)
