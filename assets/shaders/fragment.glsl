@@ -5,6 +5,9 @@
 layout(constant_id = 0) const uint TILE_SIZE = 16;
 layout(constant_id = 1) const uint Z_SLICES = 32;
 
+const uint SHADOW_MAP_CASCADE_COUNT = 3; // Cant be specialization constant if we still want
+                                         // to have vulkano-shaders do all the nice things
+
 layout(location = 0) in vec3 v_pos;
 layout(location = 1) in float v_view_space_depth;
 layout(location = 2) in vec2 v_uv;
@@ -42,7 +45,7 @@ struct PointLight {
 struct DirectionalLight {
     vec3 direction;
     vec3 color;
-    mat4 light_space;
+    bool has_shadow_maps;
 };
 
 // Slow changing descriptor set 
@@ -68,6 +71,8 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float width;
     float height;
     uint directional_light_count;
+    float cutoff_distances[SHADOW_MAP_CASCADE_COUNT];
+    mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];
@@ -82,7 +87,7 @@ layout(std430, set = 1, binding = 4) readonly buffer VisibleLightIndices {
     uint light_indices[];
 };
 layout(set = 1, binding = 5, rg32ui) readonly uniform uimage3D light_grid;
-layout(set = 1, binding = 6) uniform texture2D shadow_map;
+layout(set = 1, binding = 6) uniform texture2DArray shadow_map;
 
 const uint UINT_MAX = 4294967295;
 
@@ -182,6 +187,27 @@ vec3 get_light_contribution(
 
     // add to outgoing radiance Lo
     return (kD * base_color / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
+}
+
+float texture_project(vec3 projCoords, uint level_index, float bias)
+{
+    // transform to [0,1] range
+    // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
+    float closestDepth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy, level_index)).r; 
+    // get depth of current fragment from light's perspective
+    float currentDepth = projCoords.z;
+    // check whether current frag pos is in shadow
+    float shadow;
+    if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+    {
+        shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+        // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
+        // return;
+    }
+    else
+        shadow = 0.0;
+
+    return shadow;
 }
 
 void main()
@@ -300,31 +326,47 @@ void main()
         // calculate per-light radiance
         vec3 light_direction = normalize(-light.direction);
         vec3 radiance = light.color;
-        
-        float bias = 0.00025;
-        bias = max(bias * (1.0 - dot(N, light_direction)), bias);
-        const mat4 bias_mat = mat4( 
-            0.5, 0.0, 0.0, 0.0,
-            0.0, 0.5, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.5, 0.5, 0.0, 1.0 );
-        vec4 pos_light_space = bias_mat * light.light_space * vec4(v_pos, 1.0);
-        vec3 projCoords = pos_light_space.xyz / pos_light_space.w;
-        // transform to [0,1] range
-        // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
-        float closestDepth = texture(sampler2D(shadow_map, s), projCoords.xy).r; 
-        // get depth of current fragment from light's perspective
-        float currentDepth = projCoords.z;
-        // check whether current frag pos is in shadow
-        float shadow;
-        if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+
+        float shadow = 0.0;
+        if (light.has_shadow_maps)
         {
-            shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
-            // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
+            uint level = 0;
+            for (uint i = 0; i < SHADOW_MAP_CASCADE_COUNT - 1; i++)
+            {
+                if (v_view_space_depth < cutoff_distances[i])
+                {
+                    level = i + 1;
+                }
+            }
+
+            const mat4 bias_mat = mat4( 
+                0.5, 0.0, 0.0, 0.0,
+                0.0, 0.5, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.5, 0.5, 0.0, 1.0
+            );
+            vec4 pos_light_space = bias_mat * light_space_matrices[level] * vec4(v_pos, 1.0);
+            vec3 projected_coords = pos_light_space.xyz / pos_light_space.w;
+
+            float bias = 0.00025;
+            bias = max(bias * (1.0 - dot(N, light_direction)), bias);
+
+            shadow = texture_project(projected_coords, level, bias);
+            // f_color = vec4(1.0, shadow * 0.0, 0.0, 1.0);
             // return;
+		    // switch(level) {
+		    // 	case 0 : 
+		    // 		f_color = vec4(1.0, 0.25, 0.25, 1.0 + shadow*0.0);
+		    // 		break;
+		    // 	case 1 : 
+		    // 		f_color = vec4(0.25, 1.0, 0.25, 1.0);
+		    // 		break;
+		    // 	case 2 : 
+		    // 		f_color = vec4(0.25, 0.25, 1.0, 1.0);
+		    // 		break;
+		    // }
+		    //       return;
         }
-        else
-            shadow = 0.0;
         // add to outgoing radiance Lo
         Lo += (1.0 - shadow) * get_light_contribution(base_color.rgb, radiance, light_direction, V, N, metallic, roughness, F0);
     }

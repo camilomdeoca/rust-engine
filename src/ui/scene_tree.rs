@@ -1,16 +1,17 @@
 use egui::Ui;
-use flecs_ecs::{core::{Query, World}, prelude::{Builder, QueryAPI, QueryBuilderImpl}};
+use flecs_ecs::{
+    core::{Query, World},
+    prelude::{Builder, QueryAPI, QueryBuilderImpl},
+};
 use glam::Vec3;
 
-use crate::ecs::components::{MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
+use crate::ecs::components::{
+    DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent, PointLight,
+    SceneEntity, Transform,
+};
 
 pub struct SceneTree {
-    query: Query<(
-        Option<&'static mut Transform>,
-        Option<&'static mut MeshComponent>,
-        Option<&'static mut MaterialComponent>,
-        Option<&'static mut PointLight>,
-    )>,
+    query: Query<()>,
 }
 
 fn edit_vec3_ui(ui: &mut egui::Ui, vec: &mut Vec3, label: &str) {
@@ -24,51 +25,58 @@ fn edit_vec3_ui(ui: &mut egui::Ui, vec: &mut Vec3, label: &str) {
 
 impl SceneTree {
     pub fn new(world: World) -> Self {
-        let query = world
-            .query()
-            .with::<&SceneEntity>()
-            .build();
-        Self {
-            query,
-        }
+        let query = world.query().with::<&SceneEntity>().build();
+        Self { query }
     }
 
-    pub fn draw(
-        &mut self,
-        ui: &mut Ui,
-    ) {
-        egui::ScrollArea::both()
-            .show(ui, |ui| {
-                self.query.each_entity(|entity, (transform, mesh_component, material_component, point_light)| {
-                    ui.collapsing(entity.name(),|ui| {
-                        if let Some(transform) = transform {
-                            ui.collapsing("Transform", |ui| {
-                                edit_vec3_ui(ui, &mut transform.translation, "Position");
-                                ui.label(format!("Rotation: {}", transform.rotation));
-                                edit_vec3_ui(ui, &mut transform.scale, "Scale");
+    pub fn draw(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::both().show(ui, |ui| {
+            // Why: https://github.com/Indra-db/Flecs-Rust/issues/209
+            self.query.run(|mut it| {
+                while it.next() {
+                    for i in it.iter() {
+                        let entity = it.entity(i);
+                        ui.collapsing(entity.name(), |ui| {
+                            entity.try_get::<&mut Transform>(|transform| {
+                                ui.collapsing("Transform", |ui| {
+                                    edit_vec3_ui(ui, &mut transform.translation, "Position");
+                                    ui.label(format!("Rotation: {}", transform.rotation));
+                                    edit_vec3_ui(ui, &mut transform.scale, "Scale");
+                                });
                             });
-                        }
-                        
-                        if let Some(_mesh_component) = mesh_component {
-                            ui.label("MeshComponent");
-                        }
-                        
-                        if let Some(_material_component) = material_component {
-                            ui.label("MaterialComponent");
-                        }
-                        
-                        if let Some(point_light) = point_light {
-                            ui.collapsing("PointLight", |ui| {
-                                edit_vec3_ui(ui, &mut point_light.color, "Color");
-                                ui.add(
-                                    egui::DragValue::new(&mut point_light.radius)
-                                        .speed(0.1)
-                                        .prefix("Radius: ")
-                                );
+
+                            entity.try_get::<&MeshComponent>(|_mesh_component| {
+                                ui.label("MeshComponent");
                             });
-                        }
-                    });
-                });
+
+                            entity.try_get::<&MaterialComponent>(|_material_component| {
+                                ui.label("MaterialComponent");
+                            });
+
+                            entity.try_get::<&mut PointLight>(|point_light| {
+                                ui.collapsing("PointLight", |ui| {
+                                    edit_vec3_ui(ui, &mut point_light.color, "Color");
+                                    ui.add(
+                                        egui::DragValue::new(&mut point_light.radius)
+                                            .speed(0.1)
+                                            .prefix("Radius: "),
+                                    );
+                                });
+                            });
+
+                            entity.try_get::<&mut DirectionalLight>(|directional_light| {
+                                ui.collapsing("DirectionalLight", |ui| {
+                                    edit_vec3_ui(ui, &mut directional_light.color, "Color");
+                                });
+                            });
+
+                            if entity.has::<DirectionalLightShadowMap>() {
+                                ui.label("DirectionalLightShadowMap");
+                            }
+                        });
+                    }
+                }
             });
+        });
     }
 }

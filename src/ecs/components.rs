@@ -7,6 +7,9 @@ use crate::assets::database::{CubemapId, MaterialId, MeshId};
 pub struct SceneEntity;
 
 #[derive(Debug, Component)]
+pub struct DirectionalLightShadowMap;
+
+#[derive(Debug, Component)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,
@@ -41,9 +44,6 @@ pub struct PointLight {
 pub struct DirectionalLight {
     pub color: Vec3,
 }
-
-#[derive(Debug, Component)]
-pub struct DirectionalLightShadowMap;
 
 #[derive(Debug, Component)]
 pub struct Camera {

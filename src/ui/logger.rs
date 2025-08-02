@@ -1,6 +1,6 @@
 use std::sync::{LazyLock, RwLock};
 
-use egui::{Color32, RichText, TextStyle, Ui};
+use egui::{Color32, TextStyle, Ui};
 use log::{Level, LevelFilter, Metadata, Record};
 
 struct LoggerData {

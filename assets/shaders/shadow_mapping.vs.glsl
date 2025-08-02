@@ -1,5 +1,7 @@
 #version 460
-//#extension GL_EXT_multiview : enable
+#extension GL_EXT_multiview : enable
+
+const uint SHADOW_MAP_LEVELS = 3;
 
 layout(location = 0) in vec3 a_position;
 
@@ -9,15 +11,10 @@ struct EntityData {
     uint pad[3];
 };
 
-struct DirectionalLight {
-    vec3 direction;
-    vec3 color;
-    mat4 light_space;
+layout(set = 0, binding = 0) uniform LightData {
+    mat4 light_space_matrices[SHADOW_MAP_LEVELS];
 };
 
-layout(std430, set = 0, binding = 0) readonly buffer DirectionalLights {
-    DirectionalLight directional_lights[];
-};
 layout(std430, set = 0, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];
 };
@@ -25,7 +22,7 @@ layout(std430, set = 0, binding = 1) readonly buffer EntityDataBuffer {
 void main() {
     mat4 model = entity_data[gl_DrawID].transform;
     vec4 position = model * vec4(a_position, 1.0);
-    gl_Position = directional_lights[0].light_space * position;
+    gl_Position = light_space_matrices[gl_ViewIndex] * position;
     // vec4 position = model * vec4(a_position, 1.0);
     // gl_Position = lights_data[0/*gl_ViewIndex*/].light_space * position;
 }

@@ -11,6 +11,9 @@ layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out int v_draw_id;
 layout(location = 4) out mat3 v_TBN;
 
+const uint SHADOW_MAP_CASCADE_COUNT = 3; // Cant be specialization constant if we still want
+                                         // to have vulkano-shaders do all the nice things
+
 struct EntityData {
     mat4 transform;
     uint material;
@@ -28,6 +31,8 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float width;
     float height;
     uint directional_light_count;
+    float cutoff_distances[SHADOW_MAP_CASCADE_COUNT];
+    mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
     EntityData entity_data[];

@@ -11,29 +11,35 @@ mod assets;
 mod camera;
 mod ecs;
 mod image_based_lighting_maps_generator;
+mod input;
 mod profile;
 mod renderer;
 mod ui;
-mod input;
 
 use assets::{
     database::AssetDatabase,
     loaders::gltf_scene_loader::{count_vertices_and_indices_in_gltf_scene, load_gltf_scene},
 };
 use camera::Camera;
-use ecs::components::{DirectionalLight, DirectionalLightShadowMap, EnvironmentCubemap, MaterialComponent, MeshComponent, PointLight, SceneEntity, Transform};
+use ecs::components::{
+    DirectionalLight, DirectionalLightShadowMap, EnvironmentCubemap, MaterialComponent,
+    MeshComponent, PointLight, SceneEntity, Transform,
+};
 use egui_winit_vulkano::{Gui, GuiConfig};
 use flecs_ecs::prelude::*;
-use glam::{EulerRot, Mat3, Quat, Vec3};
+use glam::{EulerRot, Quat, Vec3};
 use image_based_lighting_maps_generator::ImageBasedLightingMapsGenerator;
 use log::{info, warn};
 use profile::ProfileTimer;
 use rand::distr::{Distribution, Uniform};
 use renderer::Renderer;
-use ui::{logger, UserInterface};
 use std::{
-    collections::HashMap, error::Error, f32::consts::{FRAC_PI_2, PI}, sync::{Arc, RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::HashMap,
+    error::Error,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use ui::{logger, UserInterface};
 use vulkano::{
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
@@ -58,9 +64,10 @@ use vulkano::{
     },
     memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
     swapchain::{
-        acquire_next_image, PresentFuture, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo
+        acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
+        SwapchainPresentInfo,
     },
-    sync::{self, future::FenceSignalFuture, GpuFuture},
+    sync::{self, GpuFuture},
     DeviceSize, Validated, VulkanError, VulkanLibrary,
 };
 use winit::{
@@ -274,6 +281,7 @@ impl App {
             shader_sampled_image_array_non_uniform_indexing: true,
             shader_draw_parameters: true,
             multi_draw_indirect: true,
+            multiview: true,
             ..Default::default()
         };
 
@@ -292,14 +300,13 @@ impl App {
             physical_device,
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
-                queue_create_infos: vec![
-                    QueueCreateInfo {
-                        queue_family_index,
-                        // queues: vec![0.5, 0.1], // one queue for rendering and another for asset
-                        //                         // loading
-                        ..Default::default()
-                    },
-                ],
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index,
+                    // For some reason renderdoc does not work when i use multiple queues
+                    // queues: vec![0.5, 0.1], // one queue for rendering and another for asset
+                    //                         // loading
+                    ..Default::default()
+                }],
                 enabled_features: device_features,
                 ..Default::default()
             },
@@ -471,7 +478,8 @@ impl App {
             .set(DirectionalLight {
                 color: Vec3::new(5.0, 5.0, 3.0),
             })
-            .add::<DirectionalLightShadowMap>();
+            .add::<DirectionalLightShadowMap>()
+            .add::<SceneEntity>();
 
         App {
             instance,
@@ -623,7 +631,7 @@ impl ApplicationHandler for App {
             }) => {
                 self.keys_state
                     .insert(key_code, state == ElementState::Pressed);
-                
+
                 if key_code == KeyCode::KeyL && state == ElementState::Pressed {
                     let light_count = 2000;
                     let mut rng = rand::rng();
@@ -642,7 +650,10 @@ impl ApplicationHandler for App {
                         self.world
                             .entity_named(&format!(
                                 "Light {}",
-                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos(),
                             ))
                             .add::<SceneEntity>()
                             .set(Transform {
@@ -689,12 +700,13 @@ impl ApplicationHandler for App {
         let rcx = self.rendering_context.as_mut().unwrap();
 
         if rcx.user_interface.get_focused_camera().is_some() {
-            rcx.window.set_cursor_grab(CursorGrabMode::Confined).unwrap();
+            rcx.window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .unwrap();
             rcx.window.set_cursor_visible(false);
         } else if rcx.user_interface.update(&event) {
             return;
         }
-
 
         match event {
             WindowEvent::CloseRequested
@@ -839,30 +851,26 @@ impl ApplicationHandler for App {
                     rcx.recreate_swapchain = false;
                 }
 
-                let (
-                    image_index,
-                    suboptimal,
-                    swapchain_image_available_future
-                ) = match acquire_next_image(
-                    rcx.swapchain.clone(),
-                    None,
-                )
-                .map_err(Validated::unwrap)
-                {
-                    Ok(r) => r,
-                    Err(VulkanError::OutOfDate) => {
-                        rcx.recreate_swapchain = true;
-                        return;
-                    }
-                    Err(e) => panic!("failed to acquire next image: {e}"),
-                };
+                let (image_index, suboptimal, swapchain_image_available_future) =
+                    match acquire_next_image(rcx.swapchain.clone(), None).map_err(Validated::unwrap)
+                    {
+                        Ok(r) => r,
+                        Err(VulkanError::OutOfDate) => {
+                            rcx.recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("failed to acquire next image: {e}"),
+                    };
 
                 if suboptimal {
                     rcx.recreate_swapchain = true;
                 }
 
                 let timer = ProfileTimer::start("cleanup_finished");
-                rcx.previous_frame_future.as_mut().unwrap().cleanup_finished();
+                rcx.previous_frame_future
+                    .as_mut()
+                    .unwrap()
+                    .cleanup_finished();
                 drop(timer);
 
                 let mut builder = AutoCommandBufferBuilder::primary(
@@ -872,21 +880,23 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                self.asset_database.write().unwrap()
+                self.asset_database
+                    .write()
+                    .unwrap()
                     .add_newly_loaded_meshes_to_main_buffers(&mut builder);
 
-                rcx.user_interface.build(
-                    image_index as usize,
-                    &mut builder,
-                    rcx.frametime,
-                );
+                rcx.user_interface
+                    .build(image_index as usize, &mut builder, rcx.frametime);
 
                 let timer = ProfileTimer::start("build");
                 let command_buffer = builder.build().unwrap();
                 drop(timer);
 
                 let timer = ProfileTimer::start("present");
-                let future_3d_renderer = rcx.previous_frame_future.take().unwrap()
+                let future_3d_renderer = rcx
+                    .previous_frame_future
+                    .take()
+                    .unwrap()
                     .then_execute(self.queue.clone(), command_buffer)
                     .unwrap()
                     .then_signal_fence_and_flush()
@@ -923,7 +933,6 @@ impl ApplicationHandler for App {
                     }
                 };
 
-
                 rcx.previous_fence_index = image_index;
 
                 rcx.frametime = rcx.start_frame_instant.elapsed();
@@ -941,4 +950,3 @@ impl ApplicationHandler for App {
             .request_redraw();
     }
 }
-

@@ -4,7 +4,7 @@ use std::{
 };
 
 use flecs_ecs::prelude::*;
-use glam::{Mat4, UVec3, Vec2, Vec3};
+use glam::{Mat4, UVec3, Vec2, Vec3, Vec4Swizzles};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -23,7 +23,9 @@ use vulkano::{
     device::{Device, DeviceOwned, Queue},
     format::Format,
     image::{
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE}, view::ImageView, Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
+        view::ImageView,
+        Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -42,7 +44,11 @@ use vulkano::{
         ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
-    render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription},
+    render_pass::{
+        AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
+        Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass,
+        SubpassDescription,
+    },
     shader::EntryPoint,
     DeviceSize,
 };
@@ -58,7 +64,8 @@ use crate::{
     },
     camera::Camera,
     ecs::components::{
-        self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent, PointLight, Transform
+        self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent,
+        PointLight, Transform,
     },
     profile::ProfileTimer,
 };
@@ -66,6 +73,7 @@ use crate::{
 const MAX_LIGHTS_PER_TILE: u32 = 64;
 const TILE_SIZE: u32 = 32;
 const Z_SLICES: u32 = 32;
+const SHADOW_MAP_CASCADE_COUNT: u32 = 3;
 
 /// The index of the descitptor set that doesnt change every frame
 /// It has textures and materials buffer
@@ -107,7 +115,6 @@ pub struct Renderer {
     shadow_map_framebuffer: Arc<Framebuffer>,
 
     /// For tiled rendering
-    light_culling_cs: EntryPoint,
     light_culling_pipeline: Arc<ComputePipeline>,
 
     cube_vertex_buffer: Subbuffer<[Vertex]>,
@@ -317,53 +324,55 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 }
 
 fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
-    vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            depth_stencil: {
-                format: Format::D32_SFLOAT,
-                samples: 1,
-                load_op: Clear,
-                store_op: Store,
-            },
-        },
-        pass: {
-            color: [],
-            depth_stencil: {depth_stencil},
-        },
-    )
-    .unwrap()
-    // RenderPass::new(
+    // vulkano::single_pass_renderpass!(
     //     device.clone(),
-    //     RenderPassCreateInfo {
-    //         attachments: [AttachmentDescription {
+    //     attachments: {
+    //         depth_stencil: {
     //             format: Format::D32_SFLOAT,
-    //             load_op: AttachmentLoadOp::Clear,
-    //             store_op: AttachmentStoreOp::Store,
-    //             initial_layout: ImageLayout::DepthStencilAttachmentOptimal,
-    //             final_layout: ImageLayout::DepthStencilAttachmentOptimal,
-    //             ..Default::default()
-    //         }].into(),
-    //         subpasses: [SubpassDescription {
-    //             //view_mask: (1 << SHADOW_MAPPING_LEVELS) - 1,
-    //             depth_stencil_attachment: Some(AttachmentReference {
-    //                 attachment: 0,
-    //                 layout: ImageLayout::DepthStencilAttachmentOptimal,
-    //                 ..Default::default()
-    //             }),
-    //             // depth_stencil_resolve_attachment: Some(AttachmentReference {
-    //             //     attachment: 0,
-    //             //     layout: ImageLayout::DepthStencilAttachmentOptimal,
-    //             //     ..Default::default()
-    //             // }),
-    //             // depth_resolve_mode: Some(ResolveMode::Min),
-    //             ..Default::default()
-    //         }].into(),
-    //         //correlated_view_masks: [(1 << SHADOW_MAPPING_LEVELS) - 1].into(),
-    //         ..Default::default()
+    //             samples: 1,
+    //             load_op: Clear,
+    //             store_op: Store,
+    //         },
+    //     },
+    //     pass: {
+    //         color: [],
+    //         depth_stencil: {depth_stencil},
     //     },
     // )
     // .unwrap()
+    RenderPass::new(
+        device.clone(),
+        RenderPassCreateInfo {
+            attachments: [AttachmentDescription {
+                format: Format::D32_SFLOAT,
+                load_op: AttachmentLoadOp::Clear,
+                store_op: AttachmentStoreOp::Store,
+                initial_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                final_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                ..Default::default()
+            }]
+            .into(),
+            subpasses: [SubpassDescription {
+                view_mask: (1 << SHADOW_MAP_CASCADE_COUNT) - 1,
+                depth_stencil_attachment: Some(AttachmentReference {
+                    attachment: 0,
+                    layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    ..Default::default()
+                }),
+                // depth_stencil_resolve_attachment: Some(AttachmentReference {
+                //     attachment: 0,
+                //     layout: ImageLayout::DepthStencilAttachmentOptimal,
+                //     ..Default::default()
+                // }),
+                // depth_resolve_mode: Some(ResolveMode::Min),
+                ..Default::default()
+            }]
+            .into(),
+            correlated_view_masks: [(1 << SHADOW_MAP_CASCADE_COUNT) - 1].into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
 }
 
 fn create_shadow_map_pipeline(
@@ -529,7 +538,10 @@ impl Renderer {
             &shadow_mapping_fs,
         );
 
-        assert_eq!(shadow_mapping_render_pass.attachments()[0].format, Format::D32_SFLOAT);
+        assert_eq!(
+            shadow_mapping_render_pass.attachments()[0].format,
+            Format::D32_SFLOAT
+        );
         let shadow_map = ImageView::new_default(
             Image::new(
                 memory_allocator.clone(),
@@ -537,9 +549,8 @@ impl Renderer {
                     image_type: ImageType::Dim2d,
                     format: shadow_mapping_render_pass.attachments()[0].format,
                     extent: [1024, 1024, 1],
-                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT
-                        | ImageUsage::SAMPLED,
-                    //array_layers: SHADOW_MAPPING_LEVELS,
+                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
+                    array_layers: SHADOW_MAP_CASCADE_COUNT,
                     ..Default::default()
                 },
                 AllocationCreateInfo::default(),
@@ -815,7 +826,6 @@ impl Renderer {
             mesh_pipeline,
             skybox_pipeline,
             shadow_map_framebuffer,
-            light_culling_cs,
             light_culling_pipeline,
             cube_vertex_buffer,
             cube_index_buffer,
@@ -945,7 +955,7 @@ impl Renderer {
     }
 
     fn create_point_lights_storage_buffer(
-        &mut self
+        &mut self,
     ) -> Option<Subbuffer<[mesh_shaders::fs::PointLight]>> {
         let mut point_lights = vec![];
         self.world
@@ -961,7 +971,8 @@ impl Renderer {
         if point_lights.is_empty() {
             None
         } else {
-            let point_lights_storage_buffer = self.host_writable_storage_buffer_allocator
+            let point_lights_storage_buffer = self
+                .host_writable_storage_buffer_allocator
                 .allocate_slice(point_lights.len() as DeviceSize)
                 .unwrap();
 
@@ -975,32 +986,56 @@ impl Renderer {
     }
 
     fn create_directional_lights_storage_buffer(
-        &mut self
+        &mut self,
     ) -> Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>> {
         let mut directional_lights = vec![];
-        self.world.each::<(&DirectionalLight, &Transform)>(|(directional_light, transform)| {
-            let light_projection = 1.0
-                * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
-                * Mat4::orthographic_rh(-10.0, 10.0, -10.0, 10.0, -100.0, 100.0);
-            
-            let light_view = Mat4::look_to_rh(
-                Vec3::ZERO, // TODO: Use camera pos?
-                (transform.rotation * Vec3::NEG_Z).normalize(),
-                Vec3::Y,
-            );
 
-            let light_space = light_projection * light_view;
-            directional_lights.push(mesh_shaders::fs::DirectionalLight {
-                direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
-                color: directional_light.color.to_array().into(),
-                light_space: light_space.to_cols_array_2d().into(),
-            });
+        let query = self.world
+            .query::<(
+                &DirectionalLight,
+                &Transform,
+            )>()
+            .with::<DirectionalLightShadowMap>()
+            .optional()
+            .build();
+
+        query.run(|mut it| while it.next() {
+            let directional_light = it.field::<&DirectionalLight>(0).unwrap();
+            let transform = it.field::<&Transform>(1).unwrap();
+            let has_shadow_maps = it.is_set(2); // DirectionalLightShadowMap
+
+            for i in it.iter() {
+                directional_lights.push(mesh_shaders::fs::DirectionalLight {
+                    direction: (transform[i].rotation * Vec3::NEG_Z).to_array().into(),
+                    color: directional_light[i].color.to_array().into(),
+                    has_shadow_maps: has_shadow_maps.into(),
+                });
+                if has_shadow_maps {
+                    println!("HAS SHADOW MAP");
+                } else {
+                    println!("DOESNT HAVE SHADOW MAP");
+                }
+            }
         });
+
+        // query.each(|(directional_light, transform, directional_light_shadow_map)| {
+        //     directional_lights.push(mesh_shaders::fs::DirectionalLight {
+        //         direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
+        //         color: directional_light.color.to_array().into(),
+        //         has_shadow_maps: directional_light_shadow_map.is_some().into(),
+        //     });
+        //     if directional_light_shadow_map.is_some() {
+        //         println!("HAS SHADOW MAP");
+        //     } else {
+        //         println!("DOESNT HAVE SHADOW MAP");
+        //     }
+        // });
 
         if directional_lights.is_empty() {
             None
         } else {
-            let directional_lights_storage_buffer = self.host_writable_storage_buffer_allocator
+            let directional_lights_storage_buffer = self
+                .host_writable_storage_buffer_allocator
                 .allocate_slice(directional_lights.len() as DeviceSize)
                 .unwrap();
 
@@ -1010,6 +1045,140 @@ impl Renderer {
                 .copy_from_slice(&directional_lights);
 
             Some(directional_lights_storage_buffer)
+        }
+    }
+
+    fn compute_shadow_map_matrices_and_splits(
+        &mut self,
+        camera: &Camera,
+        aspect_ratio: f32,
+    ) -> Option<(
+        [f32; SHADOW_MAP_CASCADE_COUNT as usize],
+        [Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
+    )> {
+        let near_clip = 0.01;
+        let far_clip = 100.0;
+        let clip_range = far_clip - near_clip;
+
+        let min_z = near_clip;
+        let max_z = near_clip + clip_range;
+
+        let range = max_z - min_z;
+        let ratio: f32 = max_z / min_z;
+
+        let cascade_split_lambda = 0.5;
+
+        let cascade_splits: [f32; SHADOW_MAP_CASCADE_COUNT as usize] = std::array::from_fn(|i| {
+            let p = (i + 1) as f32 / SHADOW_MAP_CASCADE_COUNT as f32;
+            let log = min_z * ratio.powf(p);
+            let uniform = min_z + range * p;
+            let d = cascade_split_lambda * (log - uniform) + uniform;
+            (d - near_clip) / clip_range
+        });
+        println!("CUTOFF {cascade_splits:?}");
+
+        const NDC_CORNERS: [Vec3; 8] = [
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+        ];
+
+        let camera_view = Mat4::look_to_rh(
+            camera.position,
+            (camera.rotation * Vec3::NEG_Z).normalize(),
+            (camera.rotation * Vec3::Y).normalize(),
+        );
+        let camera_projection = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+            * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
+
+        let inverse_camera_view_proj = (camera_projection * camera_view).inverse();
+
+        let full_frustum_corners = NDC_CORNERS
+            .map(|ndc_corner| {
+                let corner = inverse_camera_view_proj * ndc_corner.extend(1.0);
+                corner.xyz() / corner.w
+            });
+        
+        let mut light_space_matrices = [Mat4::IDENTITY; SHADOW_MAP_CASCADE_COUNT as usize];
+        let mut split_depths = [0.0; SHADOW_MAP_CASCADE_COUNT as usize];
+
+        let query = self
+            .world
+            .query::<&Transform>()
+            .with::<DirectionalLight>()
+            .with::<DirectionalLightShadowMap>()
+            .build();
+
+        let mut count = 0;
+        query.each(|transform| {
+            count += 1;
+
+            let mut last_split_dist = 0.0;
+            for i in 0..SHADOW_MAP_CASCADE_COUNT as usize {
+                let split_dist = cascade_splits[i];
+                let mut frustum_corners = full_frustum_corners;
+
+                for j in 0..4 {
+                    let dist = frustum_corners[j + 4] + frustum_corners[j];
+                    frustum_corners[j + 4] = frustum_corners[j] + (dist * split_dist);
+                    frustum_corners[j] = frustum_corners[j] + (dist * last_split_dist);
+                }
+
+                let frustum_center = frustum_corners
+                    .iter()
+                    .cloned()
+                    .fold(Vec3::ZERO, |acc, e| acc + e)
+                    / 8.0;
+
+                let radius = frustum_corners
+                    .iter()
+                    .map(|corner| corner.distance(frustum_center))
+                    .reduce(|acc, e| acc.max(e))
+                    .unwrap();
+
+                let max_extents = Vec3::splat(radius);
+                let min_extents = -max_extents;
+
+                let light_projection = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                    * Mat4::orthographic_rh(
+                        min_extents.x,
+                        max_extents.x,
+                        min_extents.y,
+                        max_extents.y,
+                        0.0,
+                        max_extents.z - min_extents.z,
+                    );
+
+                let light_direction = (transform.rotation * Vec3::NEG_Z).normalize();
+
+                let light_view = Mat4::look_at_rh(
+                    frustum_center - light_direction * -min_extents.z, // TODO: Use camera pos?
+                    frustum_center,
+                    Vec3::Y,
+                );
+
+                split_depths[i] = (near_clip + split_dist * clip_range) * -1.0;
+                light_space_matrices[i] = light_projection * light_view;
+                last_split_dist = split_dist;
+            }
+        });
+        
+        println!("SPLITS {split_depths:?}");
+
+        assert!(
+            count == 0 || count == 1,
+            "We support at most one light with shadow maps"
+        );
+
+        if count == 0 {
+            None
+        } else {
+            Some((split_depths, light_space_matrices))
         }
     }
 
@@ -1078,20 +1247,18 @@ impl Renderer {
         framebuffer: &Arc<Framebuffer>,
         camera: &Camera,
     ) {
+        let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
+
         self.add_materials_and_textures_to_descriptor_set();
         let point_lights_buffer = self.create_point_lights_storage_buffer();
         let directional_lights_buffer = self.create_directional_lights_storage_buffer();
 
-        let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
+        let shadow_map_matrices_and_splits =
+            self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
 
         let timer = ProfileTimer::start("cull_lights");
         let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
-            self.cull_lights(
-                builder,
-                &camera,
-                aspect_ratio,
-                &point_lights_buffer,
-            );
+            self.cull_lights(builder, &camera, aspect_ratio, &point_lights_buffer);
         drop(timer);
 
         let entities_data_and_indirect_commands =
@@ -1100,14 +1267,16 @@ impl Renderer {
         if let Some((entities_data, indirect_commands)) =
             entities_data_and_indirect_commands.as_ref()
         {
-            let timer = ProfileTimer::start("render_shadow_maps");
-            self.render_shadow_maps(
-                builder,
-                &entities_data,
-                &indirect_commands,
-                &directional_lights_buffer,
-            );
-            drop(timer);
+            if let Some((_depth_splits, light_space_matrices)) = shadow_map_matrices_and_splits {
+                let timer = ProfileTimer::start("render_shadow_maps");
+                self.render_shadow_maps(
+                    builder,
+                    &entities_data,
+                    &indirect_commands,
+                    &light_space_matrices,
+                );
+                drop(timer);
+            }
         }
 
         let timer = ProfileTimer::start("begin_render_pass");
@@ -1140,6 +1309,7 @@ impl Renderer {
                 &lights_from_tile_storage_image_view,
                 &entities_data,
                 &indirect_commands,
+                &shadow_map_matrices_and_splits,
             );
             drop(timer);
         }
@@ -1170,7 +1340,7 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
         indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
-        directional_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>>,
+        light_space_matrices: &[Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
     ) {
         builder
             .begin_render_pass(
@@ -1186,25 +1356,17 @@ impl Renderer {
             )
             .unwrap();
 
+        let light_data_buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+        *light_data_buffer.write().unwrap() = shadow_mapping_shaders::vs::LightData {
+            light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
+        };
+
         let descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             self.shadow_mapping_pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::buffer(
-                    0,
-                    directional_lights_storage_buffer
-                        .as_ref()
-                        .map(|buf| buf.clone())
-                        .unwrap_or_else(||
-                            self.in_device_storage_buffer_allocator
-                                .allocate_slice(1)
-                                .unwrap(),
-                        ),
-                ),
-                WriteDescriptorSet::buffer(
-                    1,
-                    entities_data.clone(),
-                ),
+                WriteDescriptorSet::buffer(0, light_data_buffer),
+                WriteDescriptorSet::buffer(1, entities_data.clone()),
             ],
             [],
         )
@@ -1213,7 +1375,7 @@ impl Renderer {
         builder
             .bind_pipeline_graphics(self.shadow_mapping_pipeline.clone())
             .unwrap();
-        
+
         builder
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
@@ -1354,11 +1516,11 @@ impl Renderer {
                     point_lights_storage_buffer
                         .as_ref()
                         .map(|buf| buf.clone())
-                        .unwrap_or_else(||
+                        .unwrap_or_else(|| {
                             self.in_device_storage_buffer_allocator
                                 .allocate_slice(1)
-                                .unwrap(),
-                        ),
+                                .unwrap()
+                        }),
                 ),
                 WriteDescriptorSet::buffer(2, next_ligth_index_global_storage_buffer.clone()),
                 WriteDescriptorSet::buffer(3, visible_light_indices_storage_buffer.clone()),
@@ -1387,7 +1549,9 @@ impl Renderer {
         )
     }
 
-    fn get_entities_data_and_indirect_draw_commands(&self) -> Option<(
+    fn get_entities_data_and_indirect_draw_commands(
+        &self,
+    ) -> Option<(
         Subbuffer<[mesh_shaders::vs::EntityData]>,
         Subbuffer<[DrawIndexedIndirectCommand]>,
     )> {
@@ -1422,7 +1586,9 @@ impl Renderer {
             });
         drop(asset_database_read);
 
-        if indirect_commands.is_empty() { return None }
+        if indirect_commands.is_empty() {
+            return None;
+        }
 
         let indirect_buffer = self
             .indirect_buffer_allocator
@@ -1455,6 +1621,7 @@ impl Renderer {
         lights_from_tile_storage_image_view: &Arc<ImageView>,
         entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
         indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
+        shadow_map_matrices_and_splits: &Option<([f32; SHADOW_MAP_CASCADE_COUNT as usize], [Mat4; SHADOW_MAP_CASCADE_COUNT as usize])>
     ) {
         let view = Mat4::look_to_rh(
             camera.position,
@@ -1481,6 +1648,14 @@ impl Renderer {
                 .extent[1];
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
+            
+            let cascade_splits = shadow_map_matrices_and_splits
+                .map(|tuple| tuple.0)
+                .unwrap_or([0.0; SHADOW_MAP_CASCADE_COUNT as usize]);
+
+            let light_space_matrices = shadow_map_matrices_and_splits
+                .map(|tuple| tuple.1)
+                .unwrap_or([Mat4::IDENTITY; SHADOW_MAP_CASCADE_COUNT as usize]);
 
             let uniform_data = mesh_shaders::vs::FrameUniforms {
                 view: view.to_cols_array_2d(),
@@ -1494,6 +1669,8 @@ impl Renderer {
                     .as_ref()
                     .map(|buffer| buffer.len() as u32)
                     .unwrap_or(0),
+                cutoff_distances: cascade_splits.map(|split| split.into()),
+                light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
             };
 
             let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
@@ -1501,7 +1678,6 @@ impl Renderer {
 
             buffer
         };
-
 
         let frame_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
