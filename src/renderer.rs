@@ -5,6 +5,7 @@ use std::{
 
 use flecs_ecs::prelude::*;
 use glam::{Mat4, UVec3, Vec2, Vec3, Vec4Swizzles};
+use rand::distr::{Distribution, Uniform};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -59,7 +60,7 @@ use crate::{
             AssetDatabase, AssetDatabaseChangeObserver, Cubemap, CubemapId, Material, MaterialId,
             Mesh, MeshId, Texture, TextureId,
         },
-        loaders::mesh_loader::load_mesh_from_buffers_into_new_buffers,
+        loaders::{mesh_loader::load_mesh_from_buffers_into_new_buffers, texture_loader::load_3d_texture_from_buffer},
         vertex::Vertex,
     },
     camera::Camera,
@@ -80,7 +81,8 @@ const SHADOW_MAP_CASCADE_COUNT: u32 = 3;
 pub const SLOW_CHANGING_DESCRIPTOR_SET: usize = 0;
 pub const SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING: u32 = 0;
 pub const SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING: u32 = 4;
-pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 5;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_PCF_OFFSETS_BINDING: u32 = 5;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 6;
 
 /// The index of the descriptor set that changes every frame
 /// Has camera matrices and the transformations and materials indices for every entity
@@ -113,6 +115,7 @@ pub struct Renderer {
     skybox_pipeline: Arc<GraphicsPipeline>,
 
     shadow_map_framebuffer: Arc<Framebuffer>,
+    pcf_offsets_texture: Arc<ImageView>,
 
     /// For tiled rendering
     light_culling_pipeline: Arc<ComputePipeline>,
@@ -180,7 +183,7 @@ fn window_size_dependent_setup(
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
             .unwrap()
-            .descriptor_count = properties.max_descriptor_set_samplers - 4;
+            .descriptor_count = properties.max_descriptor_set_samplers - 5;
         layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
@@ -432,6 +435,48 @@ fn create_shadow_map_pipeline(
     .unwrap()
 }
 
+fn create_pcf_offsets_texture(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue: &Arc<Queue>,
+) -> Arc<ImageView> {
+    let window_size = 16;
+    let sample_grid_size = 4;
+    let mut data = Vec::with_capacity(window_size * window_size * sample_grid_size * sample_grid_size * 2);
+    let mut rng = rand::rng();
+    let random_door = Uniform::new(0.0f32, 1.0f32).unwrap();
+
+    for _window_y in 0..window_size {
+        for _window_x in 0..window_size {
+            for sample_y in 0..sample_grid_size {
+                for sample_x in 0..sample_grid_size {
+                    let u = (sample_x as f32 + random_door.sample(&mut rng)) / sample_grid_size as f32;
+                    let v = (sample_y as f32 + random_door.sample(&mut rng)) / sample_grid_size as f32;
+
+                    let x = v.sqrt() * (2.0 * std::f32::consts::PI * u).cos();
+                    let y = v.sqrt() * (2.0 * std::f32::consts::PI * u).sin();
+
+                    data.push(((x * 127.0).round() + 127.0) as u8);
+                    data.push(((y * 127.0).round() + 127.0) as u8);
+                }
+            }
+        }
+    }
+
+    assert_eq!(sample_grid_size % 2, 0, "We are assuming the sample count is divisible by two");
+    let offsets_texture = load_3d_texture_from_buffer(
+        memory_allocator.clone(),
+        command_buffer_allocator.clone(),
+        queue.clone(),
+        Format::R8G8B8A8_SNORM, 
+        [window_size as u32, window_size as u32, (sample_grid_size * sample_grid_size / 2) as u32],
+        &data,
+    )
+    .unwrap();
+
+    offsets_texture
+}
+
 impl Renderer {
     pub fn new(
         device: Arc<Device>,
@@ -642,6 +687,12 @@ impl Renderer {
             &sampler,
         );
 
+        let pcf_offsets_texture = create_pcf_offsets_texture(
+            &memory_allocator, 
+            &command_buffer_allocator, 
+            &queue,
+        );
+
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
@@ -781,6 +832,10 @@ impl Renderer {
                     SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
                     materials_storage_buffer.clone(),
                 ),
+                WriteDescriptorSet::image_view(
+                    SLOW_CHANGING_DESCRIPTOR_SET_PCF_OFFSETS_BINDING,
+                    pcf_offsets_texture.clone(),
+                ),
                 // WriteDescriptorSet::image_view_array(
                 //     4,
                 //     0,
@@ -832,6 +887,7 @@ impl Renderer {
             environment_cubemap_query,
             meshes_with_materials_query,
             world,
+            pcf_offsets_texture,
         };
 
         renderer
@@ -930,6 +986,10 @@ impl Renderer {
                 WriteDescriptorSet::buffer(
                     SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
                     self.materials_storage_buffer.clone(),
+                ),
+                WriteDescriptorSet::image_view(
+                    SLOW_CHANGING_DESCRIPTOR_SET_PCF_OFFSETS_BINDING,
+                    self.pcf_offsets_texture.clone(),
                 ),
                 WriteDescriptorSet::image_view_array(
                     SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING,
@@ -1044,7 +1104,7 @@ impl Renderer {
         let range = max_z - min_z;
         let ratio: f32 = max_z / min_z;
 
-        let cascade_split_lambda = 0.9;
+        let cascade_split_lambda = 0.65;
 
         let cascade_splits: [f32; SHADOW_MAP_CASCADE_COUNT as usize] = std::array::from_fn(|i| {
             let p = (i + 1) as f32 / SHADOW_MAP_CASCADE_COUNT as f32;

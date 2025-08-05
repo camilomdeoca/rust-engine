@@ -1,4 +1,3 @@
-use smallvec::smallvec;
 use std::sync::Arc;
 
 use vulkano::{
@@ -27,12 +26,39 @@ pub fn load_texture_from_buffer(
         memory_allocator,
         command_buffer_allocator,
         queue,
-        format,
-        extent,
         pixel_data.iter().cloned(),
-        1,
-        ImageCreateFlags::empty(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [extent[0], extent[1], 1],
+            usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
         ImageViewType::Dim2d,
+    )
+}
+
+pub fn load_3d_texture_from_buffer(
+    memory_allocator: Arc<dyn MemoryAllocator>,
+    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
+    queue: Arc<Queue>,
+    format: Format,
+    extent: [u32; 3],
+    pixel_data: &[u8],
+) -> Result<Arc<ImageView>, String> {
+    load_texture_from_buffer_impl(
+        memory_allocator,
+        command_buffer_allocator,
+        queue,
+        pixel_data.iter().cloned(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim3d,
+            format,
+            extent,
+            usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        ImageViewType::Dim3d,
     )
 }
 
@@ -44,15 +70,23 @@ pub fn load_cubemap_from_buffer(
     extent: [u32; 2],
     pixel_data: &[u8],
 ) -> Result<Arc<ImageView>, String> {
+    let mip_levels = extent.iter().max().unwrap().ilog2();
+
     load_texture_from_buffer_impl(
         memory_allocator,
         command_buffer_allocator,
         queue,
-        format,
-        extent,
         pixel_data.iter().cloned(),
-        6,
-        ImageCreateFlags::CUBE_COMPATIBLE,
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [extent[0], extent[1], 1],
+            array_layers: 6,
+            flags: ImageCreateFlags::CUBE_COMPATIBLE,
+            mip_levels,
+            usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
         ImageViewType::Cube,
     )
 }
@@ -92,11 +126,8 @@ fn load_texture_from_buffer_impl<I>(
     memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
-    format: Format,
-    extent: [u32; 2],
     pixel_data: I,
-    array_layers: u32,
-    flags: ImageCreateFlags,
+    create_info: ImageCreateInfo,
     view_type: ImageViewType,
 ) -> Result<Arc<ImageView>, String>
 where
@@ -125,29 +156,15 @@ where
     )
     .unwrap();
 
-    let mip_levels = extent.iter().max().unwrap().ilog2();
-
     let image = Image::new(
         memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format,
-            extent: [extent[0], extent[1], 1],
-            array_layers,
-            flags,
-            mip_levels,
-            usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+        create_info,
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        AllocationCreateInfo::default(),
     )
-    .expect(
-        format!(
-            "Error creating image of size: {}x{} with format {:?}",
-            extent[0], extent[1], format,
-        )
-        .as_str(),
-    );
+    .unwrap();
 
     builder
         .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
