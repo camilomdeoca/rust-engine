@@ -344,7 +344,7 @@ fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
         device.clone(),
         RenderPassCreateInfo {
             attachments: [AttachmentDescription {
-                format: Format::D32_SFLOAT,
+                format: Format::D16_UNORM,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::Store,
                 initial_layout: ImageLayout::DepthStencilAttachmentOptimal,
@@ -530,25 +530,13 @@ impl Renderer {
             .entry_point("main")
             .unwrap();
 
-        let shadow_mapping_pipeline = create_shadow_map_pipeline(
-            Vec2::new(1024.0, 1024.0),
-            &shadow_mapping_render_pass,
-            &memory_allocator,
-            &shadow_mapping_vs,
-            &shadow_mapping_fs,
-        );
-
-        assert_eq!(
-            shadow_mapping_render_pass.attachments()[0].format,
-            Format::D32_SFLOAT
-        );
         let shadow_map = ImageView::new_default(
             Image::new(
                 memory_allocator.clone(),
                 ImageCreateInfo {
                     image_type: ImageType::Dim2d,
                     format: shadow_mapping_render_pass.attachments()[0].format,
-                    extent: [1024, 1024, 1],
+                    extent: [2048, 2048, 1],
                     usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
                     array_layers: SHADOW_MAP_CASCADE_COUNT,
                     ..Default::default()
@@ -566,6 +554,14 @@ impl Renderer {
             },
         )
         .unwrap();
+
+        let shadow_mapping_pipeline = create_shadow_map_pipeline(
+            Vec2::new(shadow_map.image().extent()[0] as f32, shadow_map.image().extent()[1] as f32),
+            &shadow_mapping_render_pass,
+            &memory_allocator,
+            &shadow_mapping_vs,
+            &shadow_mapping_fs,
+        );
 
         let render_pass = vulkano::ordered_passes_renderpass!(
             device.clone(),
@@ -1010,26 +1006,8 @@ impl Renderer {
                     color: directional_light[i].color.to_array().into(),
                     has_shadow_maps: has_shadow_maps.into(),
                 });
-                if has_shadow_maps {
-                    println!("HAS SHADOW MAP");
-                } else {
-                    println!("DOESNT HAVE SHADOW MAP");
-                }
             }
         });
-
-        // query.each(|(directional_light, transform, directional_light_shadow_map)| {
-        //     directional_lights.push(mesh_shaders::fs::DirectionalLight {
-        //         direction: (transform.rotation * Vec3::NEG_Z).to_array().into(),
-        //         color: directional_light.color.to_array().into(),
-        //         has_shadow_maps: directional_light_shadow_map.is_some().into(),
-        //     });
-        //     if directional_light_shadow_map.is_some() {
-        //         println!("HAS SHADOW MAP");
-        //     } else {
-        //         println!("DOESNT HAVE SHADOW MAP");
-        //     }
-        // });
 
         if directional_lights.is_empty() {
             None
@@ -1066,7 +1044,7 @@ impl Renderer {
         let range = max_z - min_z;
         let ratio: f32 = max_z / min_z;
 
-        let cascade_split_lambda = 0.5;
+        let cascade_split_lambda = 0.9;
 
         let cascade_splits: [f32; SHADOW_MAP_CASCADE_COUNT as usize] = std::array::from_fn(|i| {
             let p = (i + 1) as f32 / SHADOW_MAP_CASCADE_COUNT as f32;
@@ -1075,7 +1053,6 @@ impl Renderer {
             let d = cascade_split_lambda * (log - uniform) + uniform;
             (d - near_clip) / clip_range
         });
-        println!("CUTOFF {cascade_splits:?}");
 
         const NDC_CORNERS: [Vec3; 8] = [
             Vec3::new(-1.0, 1.0, 0.0),
@@ -1141,7 +1118,7 @@ impl Renderer {
                     .reduce(|acc, e| acc.max(e))
                     .unwrap();
 
-                let max_extents = Vec3::splat(radius);
+                let max_extents = Vec2::splat(radius);
                 let min_extents = -max_extents;
 
                 let light_projection = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
@@ -1150,15 +1127,15 @@ impl Renderer {
                         max_extents.x,
                         min_extents.y,
                         max_extents.y,
-                        0.0,
-                        max_extents.z - min_extents.z,
+                        -100.0,
+                        100.0,
                     );
 
                 let light_direction = (transform.rotation * Vec3::NEG_Z).normalize();
 
-                let light_view = Mat4::look_at_rh(
-                    frustum_center - light_direction * -min_extents.z, // TODO: Use camera pos?
-                    frustum_center,
+                let light_view = Mat4::look_to_rh(
+                    frustum_center, // TODO: Use camera pos?
+                    light_direction,
                     Vec3::Y,
                 );
 
@@ -1167,8 +1144,6 @@ impl Renderer {
                 last_split_dist = split_dist;
             }
         });
-        
-        println!("SPLITS {split_depths:?}");
 
         assert!(
             count == 0 || count == 1,
