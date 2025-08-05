@@ -4,7 +4,7 @@ use std::{
 };
 
 use flecs_ecs::prelude::*;
-use glam::{Mat4, UVec3, Vec2, Vec3, Vec4Swizzles};
+use glam::{Mat3, Mat4, UVec3, Vec2, Vec3, Vec4Swizzles};
 use rand::distr::{Distribution, Uniform};
 use vulkano::{
     buffer::{
@@ -1133,11 +1133,11 @@ impl Renderer {
         let camera_projection = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
             * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
 
-        let inverse_camera_view_proj = (camera_projection * camera_view).inverse();
+        let inverse_camera_proj = camera_projection.inverse();
 
         let full_frustum_corners = NDC_CORNERS
             .map(|ndc_corner| {
-                let corner = inverse_camera_view_proj * ndc_corner.extend(1.0);
+                let corner = inverse_camera_proj * ndc_corner.extend(1.0);
                 corner.xyz() / corner.w
             });
         
@@ -1166,19 +1166,38 @@ impl Renderer {
                     frustum_corners[j] = frustum_corners[j] + (dist * last_split_dist);
                 }
 
-                let frustum_center = frustum_corners
+                let mut frustum_center = frustum_corners
                     .iter()
                     .cloned()
                     .fold(Vec3::ZERO, |acc, e| acc + e)
                     / 8.0;
 
-                let radius = frustum_corners
-                    .iter()
-                    .map(|corner| corner.distance(frustum_center))
-                    .reduce(|acc, e| acc.max(e))
-                    .unwrap();
+                let mut max_diagonal: f32 = 0.0;
+                for p1 in frustum_corners {
+                    for p2 in frustum_corners {
+                        max_diagonal = max_diagonal.max(p1.distance(p2));
+                    }
+                }
 
-                let max_extents = Vec2::splat(radius);
+                let light_direction = (transform.rotation * Vec3::NEG_Z).normalize();
+
+                let shadow_map_size = self.shadow_map_framebuffer.extent()[0];
+                assert_eq!(shadow_map_size, self.shadow_map_framebuffer.extent()[1]);
+                let pixel_size = max_diagonal / shadow_map_size as f32;
+
+                frustum_center = {
+                    let frustum_center_vec4 = camera_view.inverse() * frustum_center.extend(1.0);
+                    frustum_center_vec4.xyz() / frustum_center_vec4.w
+                };
+
+                // Align frustum_center to pixels so it doesnt move
+                let light_rotation_matrix = Mat3::look_to_rh(light_direction, Vec3::Y);
+                frustum_center = light_rotation_matrix * frustum_center;
+                frustum_center.x = (frustum_center.x / pixel_size).round() * pixel_size;
+                frustum_center.y = (frustum_center.y / pixel_size).round() * pixel_size;
+                frustum_center = light_rotation_matrix.inverse() * frustum_center;
+
+                let max_extents = Vec2::splat(max_diagonal / 2.0);
                 let min_extents = -max_extents;
 
                 let light_projection = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
@@ -1191,7 +1210,6 @@ impl Renderer {
                         100.0,
                     );
 
-                let light_direction = (transform.rotation * Vec3::NEG_Z).normalize();
 
                 let light_view = Mat4::look_to_rh(
                     frustum_center, // TODO: Use camera pos?
