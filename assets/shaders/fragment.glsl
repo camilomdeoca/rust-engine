@@ -58,7 +58,8 @@ layout(set = 0, binding = 3) uniform texture2D environment_brdf_lut;
 layout(std430, set = 0, binding = 4) readonly buffer MaterialBuffer {
     Material materials[];
 };
-layout(set = 0, binding = 5) uniform texture2D textures[];
+layout(set = 0, binding = 5) uniform texture3D pcf_offsets_lut;
+layout(set = 0, binding = 6) uniform texture2D textures[];
 
 // Frame descriptor set
 //   - changes every frame
@@ -189,23 +190,64 @@ vec3 get_light_contribution(
     return (kD * base_color / PI + specular) * radiance * NdotL; // note that we already multiplied the BRDF by the Fresnel (kS) so we won't multiply by kS again
 }
 
-float texture_project(vec3 projCoords, uint level_index, float bias)
+float texture_project(vec3 projCoords, uint level_index, vec2 offset, float bias)
 {
     // transform to [0,1] range
     // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
-    float closestDepth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy, level_index)).r; 
+    float closestDepth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy + offset, level_index)).r; 
     // get depth of current fragment from light's perspective
     float currentDepth = projCoords.z;
     // check whether current frag pos is in shadow
     float shadow;
-    if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+    // if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+    // {
+    //     shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+    //     // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
+    //     // return;
+    // }
+    // else
+    //     shadow = 0.0;
+    shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+
+    return shadow;
+}
+
+float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
+{
+    ivec3 texture_size = textureSize(sampler3D(pcf_offsets_lut, s), 0);
+    ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
+    uint sample_count_div_2 = texture_size.x;
+    uint sample_count = sample_count_div_2 * 2;
+
+    ivec3 jcoord = ivec3(0, mod(gl_FragCoord.xy, vec2(texture_size.yz)));
+
+    vec2 texel_size = vec2(1.0) / shadow_map_size;
+
+    vec2 radius = texel_size * 0.25 * far / cutoff_distances[level_index];
+
+    float shadow = 0.0;
+    for (int i = 0; i < 4; i++)
     {
-        shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
-        // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
-        // return;
+        vec4 offset = texelFetch(sampler3D(pcf_offsets_lut, s), jcoord, 0);
+        jcoord.x = i;
+        shadow += texture_project(projected_coords, level_index, offset.xy * radius, bias);
+        shadow += texture_project(projected_coords, level_index, offset.zw * radius, bias);
+    }
+    if (shadow > 0.0 && shadow < 8.0)
+    {
+        for (int i = 4; i < sample_count_div_2; i++)
+        {
+            vec4 offset = texelFetch(sampler3D(pcf_offsets_lut, s), jcoord, 0);
+            jcoord.x = i;
+            shadow += texture_project(projected_coords, level_index, offset.xy * radius, bias);
+            shadow += texture_project(projected_coords, level_index, offset.zw * radius, bias);
+        }
+        shadow /= float(sample_count);
     }
     else
-        shadow = 0.0;
+    {
+        shadow /= 8.0;
+    }
 
     return shadow;
 }
@@ -328,7 +370,7 @@ void main()
         vec3 radiance = light.color;
 
         float shadow = 0.0;
-        if (light.has_shadow_maps)
+        if (light.has_shadow_maps && dot(N, light_direction) > 0.0)
         {
             uint level = 0;
             for (uint i = 0; i < SHADOW_MAP_CASCADE_COUNT - 1; i++)
@@ -351,7 +393,8 @@ void main()
             float bias = 0.00025;
             bias = max(bias * (1.0 - dot(N, light_direction)), bias);
 
-            shadow = texture_project(projected_coords, level, bias);
+            // shadow = texture_project(projected_coords, level, bias);
+            shadow = pcf_shadows(projected_coords, level, bias);
             // f_color = vec4(1.0, shadow * 0.0, 0.0, 1.0);
             // return;
 		    // switch(level) {
