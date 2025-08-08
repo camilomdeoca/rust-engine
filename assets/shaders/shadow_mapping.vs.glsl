@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_multiview : enable
 
-const uint SHADOW_MAP_LEVELS = 3;
+const uint SHADOW_MAP_LEVELS = 4;
 
 layout(location = 0) in vec3 a_position;
 

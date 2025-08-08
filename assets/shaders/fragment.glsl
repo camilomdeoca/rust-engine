@@ -5,7 +5,7 @@
 layout(constant_id = 0) const uint TILE_SIZE = 16;
 layout(constant_id = 1) const uint Z_SLICES = 32;
 
-const uint SHADOW_MAP_CASCADE_COUNT = 3; // Cant be specialization constant if we still want
+const uint SHADOW_MAP_CASCADE_COUNT = 4; // Cant be specialization constant if we still want
                                          // to have vulkano-shaders do all the nice things
 
 layout(location = 0) in vec3 v_pos;
@@ -58,8 +58,7 @@ layout(set = 0, binding = 3) uniform texture2D environment_brdf_lut;
 layout(std430, set = 0, binding = 4) readonly buffer MaterialBuffer {
     Material materials[];
 };
-layout(set = 0, binding = 5) uniform texture3D pcf_offsets_lut;
-layout(set = 0, binding = 6) uniform texture2D textures[];
+layout(set = 0, binding = 5) uniform texture2D textures[];
 
 // Frame descriptor set
 //   - changes every frame
@@ -194,7 +193,7 @@ float texture_project(vec3 projCoords, uint level_index, vec2 offset, float bias
 {
     // transform to [0,1] range
     // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
-    float closestDepth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy + offset, level_index)).r; 
+    float blocker_depth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy + offset, level_index)).r; 
     // get depth of current fragment from light's perspective
     float currentDepth = projCoords.z;
     // check whether current frag pos is in shadow
@@ -207,47 +206,105 @@ float texture_project(vec3 projCoords, uint level_index, vec2 offset, float bias
     // }
     // else
     //     shadow = 0.0;
-    shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+    shadow = currentDepth - bias > blocker_depth ? 1.0 : 0.0;
 
     return shadow;
 }
 
-float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
+float AvgBlockersDepthToPenumbra(float z_shadowMapView, float avgBlockersDepth)
 {
-    ivec3 texture_size = textureSize(sampler3D(pcf_offsets_lut, s), 0);
-    ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
-    uint sample_count_div_2 = texture_size.x;
-    uint sample_count = sample_count_div_2 * 2;
+    float penumbra = (z_shadowMapView - avgBlockersDepth);
+    // penumbra /= avgBlockersDepth; // If its point light
+    // penumbra *= penumbra;
+    return clamp(0.001 + 5.0 * penumbra, 0.0, 1.0);
+}
 
-    ivec3 jcoord = ivec3(0, mod(gl_FragCoord.xy, vec2(texture_size.yz)));
+float InterleavedGradientNoise(vec2 position_screen)
+{
+    vec3 magic = vec3(0.0671106, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(position_screen, magic.xy)));
+}
 
-    vec2 texel_size = vec2(1.0) / shadow_map_size;
+vec2 VogelDiskSample(int sampleIndex, float sqrtSamplesCount, float phi)
+{
+    const float GOLDEN_ANGLE = 2.4;
+    float r = sqrt(sampleIndex + 0.5) / sqrtSamplesCount;
+    float theta = sampleIndex*GOLDEN_ANGLE + phi;
 
-    vec2 radius = texel_size * 0.25 * far / cutoff_distances[level_index];
+    float sine = sin(theta);
+    float cosine = cos(theta);
+    return vec2(r*cosine, r*sine);
+}
 
-    float shadow = 0.0;
-    for (int i = 0; i < 4; i++)
+// float AvgBlockersDepthToPenumbra(float receiver_depth, float avg_blocker_depth)
+// {
+//     return (receiver_depth - avg_blocker_depth) * 100.0 * 0.25;
+// }
+
+float Penumbra(float gradientNoise, vec2 shadowMapUV, uint level_index, float z_shadowMapView, int samplesCount, float penumbraFilterMaxSize)
+{
+    float avgBlockersDepth = 0.0;
+    float blockersCount = 0.0;
+
+    for (int i = 0; i < samplesCount; i++)
     {
-        vec4 offset = texelFetch(sampler3D(pcf_offsets_lut, s), jcoord, 0);
-        jcoord.x = i;
-        shadow += texture_project(projected_coords, level_index, offset.xy * radius, bias);
-        shadow += texture_project(projected_coords, level_index, offset.zw * radius, bias);
-    }
-    if (shadow > 0.0 && shadow < 8.0)
-    {
-        for (int i = 4; i < sample_count_div_2; i++)
+        vec2 sampleUV = VogelDiskSample(i, samplesCount, gradientNoise);
+        sampleUV = shadowMapUV + penumbraFilterMaxSize*1.2*sampleUV;
+
+        float sampleDepth = texture(sampler2DArray(shadow_map, s), vec3(sampleUV, level_index)).r;
+
+        if (sampleDepth < z_shadowMapView)
         {
-            vec4 offset = texelFetch(sampler3D(pcf_offsets_lut, s), jcoord, 0);
-            jcoord.x = i;
-            shadow += texture_project(projected_coords, level_index, offset.xy * radius, bias);
-            shadow += texture_project(projected_coords, level_index, offset.zw * radius, bias);
+            avgBlockersDepth += sampleDepth;
+            blockersCount += 1.0;
         }
-        shadow /= float(sample_count);
+    }
+
+    if (blockersCount > 0.0)
+    {
+        avgBlockersDepth /= blockersCount;
+        return AvgBlockersDepthToPenumbra(z_shadowMapView, avgBlockersDepth);
     }
     else
     {
-        shadow /= 8.0;
+        return 0.0;
     }
+}
+
+float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
+{
+    int sample_count_per_level[4] = {16, 8, 1, 1};
+    int sample_count = sample_count_per_level[level_index];
+
+    // ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
+    // vec2 texel_size = vec2(1.0) / shadow_map_size;
+    // vec2 radius = texel_size * 0.25 * far / cutoff_distances[level_index];
+
+    // float receiver_depth = projected_coords.z; 
+    // float avg_blocker_depth = 0.0; 
+    // for (int i = 0; i < 4; i++)
+    // {
+    //     vec4 offset = texelFetch(sampler3D(pcf_offsets_lut, s), jcoord, 0);
+    //     min_blocker_depth = min(min_blocker_depth, texture(sampler2DArray(shadow_map, s), vec3(projected_coords.xy + offset.xy * radius, level_index)).r);
+    //     min_blocker_depth = min(min_blocker_depth, texture(sampler2DArray(shadow_map, s), vec3(projected_coords.xy + offset.zw * radius, level_index)).r);
+    // }
+    // radius *= (receiver_depth - min_blocker_depth) * 100.0 * 0.25;
+
+    float gradient_noise = InterleavedGradientNoise(gl_FragCoord.xy);
+
+    const float penumbraFilterMaxSize = 0.0015 * far / cutoff_distances[level_index];
+
+    float penumbra = Penumbra(gradient_noise, projected_coords.xy, level_index, projected_coords.z, sample_count, penumbraFilterMaxSize);
+    float radius = penumbra * penumbraFilterMaxSize;
+
+    float shadow = 0.0;
+    float sqrt_sample_count = sqrt(sample_count);
+    for (int i = 0; i < sample_count; i++)
+    {
+        vec2 offset = VogelDiskSample(i, sqrt_sample_count, gradient_noise);
+        shadow += texture_project(projected_coords, level_index, offset * radius, bias);
+    }
+    shadow /= float(sample_count);
 
     return shadow;
 }

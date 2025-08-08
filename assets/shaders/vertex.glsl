@@ -11,7 +11,7 @@ layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out int v_draw_id;
 layout(location = 4) out mat3 v_TBN;
 
-const uint SHADOW_MAP_CASCADE_COUNT = 3; // Cant be specialization constant if we still want
+const uint SHADOW_MAP_CASCADE_COUNT = 4; // Cant be specialization constant if we still want
                                          // to have vulkano-shaders do all the nice things
 
 struct EntityData {
