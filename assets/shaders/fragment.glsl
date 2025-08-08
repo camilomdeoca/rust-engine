@@ -52,13 +52,14 @@ struct DirectionalLight {
 //   - doesn't change every frame
 //   - changes when a texture is added (a material is added)
 layout(set = 0, binding = 0) uniform sampler s;
-layout(set = 0, binding = 1) uniform textureCube irradiance_map;
-layout(set = 0, binding = 2) uniform textureCube prefiltered_environment_map;
-layout(set = 0, binding = 3) uniform texture2D environment_brdf_lut;
-layout(std430, set = 0, binding = 4) readonly buffer MaterialBuffer {
+layout(set = 0, binding = 1) uniform samplerShadow shadow_map_sampler;
+layout(set = 0, binding = 2) uniform textureCube irradiance_map;
+layout(set = 0, binding = 3) uniform textureCube prefiltered_environment_map;
+layout(set = 0, binding = 4) uniform texture2D environment_brdf_lut;
+layout(std430, set = 0, binding = 5) readonly buffer MaterialBuffer {
     Material materials[];
 };
-layout(set = 0, binding = 5) uniform texture2D textures[];
+layout(set = 0, binding = 6) uniform texture2D textures[];
 
 // Frame descriptor set
 //   - changes every frame
@@ -191,24 +192,28 @@ vec3 get_light_contribution(
 
 float texture_project(vec3 projCoords, uint level_index, vec2 offset, float bias)
 {
-    // transform to [0,1] range
-    // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
-    float blocker_depth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy + offset, level_index)).r; 
-    // get depth of current fragment from light's perspective
-    float currentDepth = projCoords.z;
-    // check whether current frag pos is in shadow
-    float shadow;
-    // if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
-    // {
-    //     shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
-    //     // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
-    //     // return;
-    // }
-    // else
-    //     shadow = 0.0;
-    shadow = currentDepth - bias > blocker_depth ? 1.0 : 0.0;
-
-    return shadow;
+    return 1.0 - texture(
+        sampler2DArrayShadow(shadow_map, shadow_map_sampler),
+        vec4(projCoords.xy + offset, level_index, projCoords.z - bias)
+    ).r; 
+    // // transform to [0,1] range
+    // // get closest depth value from light's perspective (using [0,1] range fragPosLight as coords)
+    // float blocker_depth = texture(sampler2DArray(shadow_map, s), vec3(projCoords.xy + offset, level_index)).r; 
+    // // get depth of current fragment from light's perspective
+    // float currentDepth = projCoords.z;
+    // // check whether current frag pos is in shadow
+    // float shadow;
+    // // if (projCoords.x >= 0.0 && projCoords.x <= 1.0 && projCoords.y >= 0.0 && projCoords.y <= 1.0)
+    // // {
+    // //     shadow = currentDepth - bias > closestDepth ? 1.0 : 0.0;
+    // //     // f_color = vec4(closestDepth, currentDepth, max(closestDepth, currentDepth), 1.0);
+    // //     // return;
+    // // }
+    // // else
+    // //     shadow = 0.0;
+    // shadow = currentDepth - bias > blocker_depth ? 1.0 : 0.0;
+    //
+    // return shadow;
 }
 
 float AvgBlockersDepthToPenumbra(float z_shadowMapView, float avgBlockersDepth)
@@ -235,11 +240,6 @@ vec2 VogelDiskSample(int sampleIndex, float sqrtSamplesCount, float phi)
     float cosine = cos(theta);
     return vec2(r*cosine, r*sine);
 }
-
-// float AvgBlockersDepthToPenumbra(float receiver_depth, float avg_blocker_depth)
-// {
-//     return (receiver_depth - avg_blocker_depth) * 100.0 * 0.25;
-// }
 
 float Penumbra(float gradientNoise, vec2 shadowMapUV, uint level_index, float z_shadowMapView, int samplesCount, float penumbraFilterMaxSize)
 {
@@ -273,7 +273,7 @@ float Penumbra(float gradientNoise, vec2 shadowMapUV, uint level_index, float z_
 
 float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
 {
-    int sample_count_per_level[4] = {16, 8, 1, 1};
+    int sample_count_per_level[4] = {12, 10, 1, 1};
     int sample_count = sample_count_per_level[level_index];
 
     // ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
@@ -449,6 +449,7 @@ void main()
 
             float bias = 0.00025;
             bias = max(bias * (1.0 - dot(N, light_direction)), bias);
+            bias *= sqrt(cutoff_distances[level]/cutoff_distances[0]);
 
             // shadow = texture_project(projected_coords, level, bias);
             shadow = pcf_shadows(projected_coords, level, bias);

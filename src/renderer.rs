@@ -79,8 +79,9 @@ const SHADOW_MAP_CASCADE_COUNT: u32 = 4;
 /// It has textures and materials buffer
 pub const SLOW_CHANGING_DESCRIPTOR_SET: usize = 0;
 pub const SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING: u32 = 0;
-pub const SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING: u32 = 4;
-pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 5;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_SHADOW_MAP_SAMPLER_BINDING: u32 = 1;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING: u32 = 5;
+pub const SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING: u32 = 6;
 
 /// The index of the descriptor set that changes every frame
 /// Has camera matrices and the transformations and materials indices for every entity
@@ -123,6 +124,7 @@ pub struct Renderer {
     asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
 
     sampler: Arc<Sampler>,
+    shadow_map_sampler: Arc<Sampler>,
 
     materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
     slow_changing_descriptor_set: Arc<DescriptorSet>,
@@ -151,6 +153,7 @@ fn window_size_dependent_setup(
     skybox_vs: &EntryPoint,
     skybox_fs: &EntryPoint,
     sampler: &Arc<Sampler>,
+    shadow_map_sampler: &Arc<Sampler>,
 ) -> (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>) {
     let device = memory_allocator.device();
 
@@ -176,6 +179,12 @@ fn window_size_dependent_setup(
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING)
             .unwrap()
             .immutable_samplers = vec![sampler.clone()];
+        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
+            .bindings
+            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SHADOW_MAP_SAMPLER_BINDING)
+            .unwrap()
+            .immutable_samplers = vec![shadow_map_sampler.clone()];
+
         layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
             .bindings
             .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
@@ -630,6 +639,19 @@ impl Renderer {
             },
         )
         .unwrap();
+        
+        let shadow_map_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                compare: Some(CompareOp::Less),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let (mesh_pipeline, skybox_pipeline) = window_size_dependent_setup(
             Vec2::new(1280.0, 720.0),
@@ -640,6 +662,7 @@ impl Renderer {
             &skybox_vs,
             &skybox_fs,
             &sampler,
+            &shadow_map_sampler,
         );
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
@@ -754,7 +777,7 @@ impl Renderer {
             1, // If this is zero for some reason it cant be deallocated
             [
                 WriteDescriptorSet::image_view(
-                    1,
+                    2,
                     asset_database_read
                         .get_cubemap(irradiance_map.clone())
                         .unwrap()
@@ -762,7 +785,7 @@ impl Renderer {
                         .clone(),
                 ),
                 WriteDescriptorSet::image_view(
-                    2,
+                    3,
                     asset_database_read
                         .get_cubemap(prefiltered_environment_map.clone())
                         .unwrap()
@@ -770,7 +793,7 @@ impl Renderer {
                         .clone(),
                 ),
                 WriteDescriptorSet::image_view(
-                    3,
+                    4,
                     asset_database_read
                         .get_cubemap(environment_brdf_lut.clone())
                         .unwrap()
@@ -826,6 +849,7 @@ impl Renderer {
             cube_vertex_buffer,
             cube_index_buffer,
             sampler,
+            shadow_map_sampler,
             materials_storage_buffer,
             slow_changing_descriptor_set: environment_descriptor_set,
             asset_change_listener,
@@ -904,7 +928,7 @@ impl Renderer {
             asset_database_read.textures().len() as u32,
             [
                 WriteDescriptorSet::image_view(
-                    1,
+                    2,
                     asset_database_read
                         .get_cubemap(irradiance_map)
                         .unwrap()
@@ -912,7 +936,7 @@ impl Renderer {
                         .clone(),
                 ),
                 WriteDescriptorSet::image_view(
-                    2,
+                    3,
                     asset_database_read
                         .get_cubemap(prefiltered_environment_map)
                         .unwrap()
@@ -920,7 +944,7 @@ impl Renderer {
                         .clone(),
                 ),
                 WriteDescriptorSet::image_view(
-                    3,
+                    4,
                     asset_database_read
                         .get_cubemap(environment_brdf_lut)
                         .unwrap()
@@ -1228,6 +1252,7 @@ impl Renderer {
             &self.skybox_vs,
             &self.skybox_fs,
             &self.sampler,
+            &self.shadow_map_sampler,
         );
 
         self.create_framebuffers(&image_views)
