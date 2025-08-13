@@ -1,8 +1,6 @@
 #version 460
 
-layout(constant_id = 0) const uint MAX_LIGHTS_PER_TILE = 256;
-layout(constant_id = 1) const uint TILE_SIZE = 16;
-layout(constant_id = 2) const uint Z_SLICES = 32;
+layout(constant_id = 0) const uint MAX_LIGHTS_PER_TILE = 64;
 
 layout (local_size_x = 64) in;
 
@@ -37,11 +35,11 @@ layout(set = 0, binding = 4, rg32ui) writeonly uniform uimage3D light_grid;
 
 float start_depth_for_nth_slice(uint slice)
 {
-    return near * pow(far / near, float(slice) / float(Z_SLICES));
+    return near * pow(far / near, float(slice) / float(gl_WorkGroupSize.z));
 }
 shared uint index_offset_out;
-shared uint light_list[MAX_LIGHTS_PER_TILE];
 shared uint next_index;
+shared uint light_list[MAX_LIGHTS_PER_TILE];
 
 void main()
 {

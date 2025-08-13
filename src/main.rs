@@ -93,7 +93,6 @@ struct RenderingContext {
     recreate_swapchain: bool,
     previous_frame_future: Option<Box<dyn GpuFuture>>,
     previous_fence_index: u32,
-    renderer: Arc<RwLock<Renderer>>,
     start_frame_instant: Instant,
     user_interface: UserInterface,
     frametime: Duration,
@@ -552,6 +551,7 @@ impl ApplicationHandler for App {
                 .collect();
 
             let renderer = Arc::new(RwLock::new(Renderer::new(
+                Default::default(),
                 self.device.clone(),
                 self.queue.clone(),
                 self.asset_database.clone(),
@@ -598,6 +598,7 @@ impl ApplicationHandler for App {
             });
             user_interface.add_log_view();
             user_interface.add_scene_tree(self.world.clone());
+            user_interface.add_renderer_settings_editor(renderer.clone());
 
             self.rendering_context = Some(RenderingContext {
                 window,
@@ -606,7 +607,6 @@ impl ApplicationHandler for App {
                 recreate_swapchain: false,
                 previous_frame_future: Some(sync::now(self.device.clone()).boxed()),
                 previous_fence_index: 0,
-                renderer,
                 start_frame_instant: Instant::now(),
                 user_interface,
                 frametime: Duration::ZERO,

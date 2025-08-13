@@ -2,9 +2,6 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 
-layout(constant_id = 0) const uint TILE_SIZE = 16;
-layout(constant_id = 1) const uint Z_SLICES = 32;
-
 const uint SHADOW_MAP_CASCADE_COUNT = 4; // Cant be specialization constant if we still want
                                          // to have vulkano-shaders do all the nice things
 
@@ -73,6 +70,10 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float height;
     uint directional_light_count;
     float cutoff_distances[SHADOW_MAP_CASCADE_COUNT];
+    uint light_culling_tile_size;
+    uint light_culling_z_slices;
+    uint sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
+    float shadow_map_base_bias;
     mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
@@ -143,8 +144,8 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
 uint slice_for_view_space_depth(float depth)
 {
     float log_far_near = log2(far / near);
-    float scale = float(Z_SLICES) / log_far_near;
-    float bias = - (float(Z_SLICES) * log2(near)) / log_far_near;
+    float scale = float(light_culling_z_slices) / log_far_near;
+    float bias = - (float(light_culling_z_slices) * log2(near)) / log_far_near;
     return uint(floor(log2(depth) * scale + bias));
 }
 
@@ -221,7 +222,7 @@ float AvgBlockersDepthToPenumbra(float z_shadowMapView, float avgBlockersDepth)
     float penumbra = (z_shadowMapView - avgBlockersDepth);
     // penumbra /= avgBlockersDepth; // If its point light
     // penumbra *= penumbra;
-    return clamp(0.001 + 5.0 * penumbra, 0.0, 1.0);
+    return clamp(0.001 + 3.0 * penumbra, 0.0, 1.0);
 }
 
 float InterleavedGradientNoise(vec2 position_screen)
@@ -241,8 +242,14 @@ vec2 VogelDiskSample(int sampleIndex, float sqrtSamplesCount, float phi)
     return vec2(r*cosine, r*sine);
 }
 
-float Penumbra(float gradientNoise, vec2 shadowMapUV, uint level_index, float z_shadowMapView, int samplesCount, float penumbraFilterMaxSize)
-{
+float Penumbra(
+    float gradientNoise,
+    vec2 shadowMapUV,
+    uint level_index,
+    float z_shadowMapView,
+    int samplesCount,
+    float penumbraFilterMaxSize
+) {
     float avgBlockersDepth = 0.0;
     float blockersCount = 0.0;
 
@@ -273,8 +280,8 @@ float Penumbra(float gradientNoise, vec2 shadowMapUV, uint level_index, float z_
 
 float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
 {
-    int sample_count_per_level[4] = {12, 10, 1, 1};
-    int sample_count = sample_count_per_level[level_index];
+    //int sample_count_per_level[4] = {12, 10, 1, 1};
+    int sample_count = int(sample_count_per_level[level_index]);
 
     // ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
     // vec2 texel_size = vec2(1.0) / shadow_map_size;
@@ -402,10 +409,10 @@ void main()
     vec3 F0 = vec3(0.04); 
     F0 = mix(F0, base_color.rgb, metallic);
 
-	uvec2 tile = uvec2(gl_FragCoord.xy / vec2(float(TILE_SIZE)));
+	uvec2 tile = uvec2(gl_FragCoord.xy / vec2(light_culling_tile_size));
     uint slice = slice_for_view_space_depth(-v_view_space_depth);
 
-	uvec2 num_tiles = uvec2(ceil(width / float(TILE_SIZE)), ceil(height / float(TILE_SIZE)));
+	uvec2 num_tiles = uvec2(ceil(width / float(light_culling_tile_size)), ceil(height / float(light_culling_tile_size)));
 	uint index =
         + slice * num_tiles.y * num_tiles.x
         + tile.y * num_tiles.x
@@ -447,9 +454,9 @@ void main()
             vec4 pos_light_space = bias_mat * light_space_matrices[level] * vec4(v_pos, 1.0);
             vec3 projected_coords = pos_light_space.xyz / pos_light_space.w;
 
-            float bias = 0.00025;
+            float bias = shadow_map_base_bias;
             bias = max(bias * (1.0 - dot(N, light_direction)), bias);
-            bias *= sqrt(cutoff_distances[level]/cutoff_distances[0]);
+            // bias *= pow(cutoff_distances[level]/cutoff_distances[0], 1.5);
 
             // shadow = texture_project(projected_coords, level, bias);
             shadow = pcf_shadows(projected_coords, level, bias);

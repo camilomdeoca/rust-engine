@@ -49,7 +49,7 @@ use vulkano::{
         Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass,
         SubpassDescription,
     },
-    shader::EntryPoint,
+    shader::{EntryPoint, ShaderModule},
     DeviceSize,
 };
 
@@ -70,9 +70,9 @@ use crate::{
     profile::ProfileTimer,
 };
 
-const MAX_LIGHTS_PER_TILE: u32 = 64;
-const TILE_SIZE: u32 = 32;
-const Z_SLICES: u32 = 32;
+// const MAX_LIGHTS_PER_TILE: u32 = 64;
+// const TILE_SIZE: u32 = 32;
+// const Z_SLICES: u32 = 32;
 const SHADOW_MAP_CASCADE_COUNT: u32 = 4;
 
 /// The index of the descitptor set that doesnt change every frame
@@ -94,7 +94,34 @@ pub const FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING: u32 = 4;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING: u32 = 5;
 pub const FRAME_DESCRIPTOR_SET_SHADOW_MAP_BINDING: u32 = 6;
 
+#[derive(Clone)]
+pub struct RendererSettings {
+    pub light_culling_max_lights_per_tile: u32,
+    pub light_culling_tile_size: u32,
+    pub light_culling_z_slices: u32,
+    pub cascaded_shadow_map_level_size: u32,
+    pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
+    pub shadow_map_base_bias: f32,
+}
+
+impl Default for RendererSettings {
+    fn default() -> Self {
+        Self {
+            light_culling_max_lights_per_tile: 64,
+            light_culling_tile_size: 32,
+            light_culling_z_slices: 32,
+            cascaded_shadow_map_level_size: 2048,
+            sample_count_per_level: [12, 10, 1, 1],
+            shadow_map_base_bias: 0.0005,
+        }
+    }
+}
+
 pub struct Renderer {
+    settings: RendererSettings,
+
+    device: Arc<Device>,
+
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
@@ -107,16 +134,22 @@ pub struct Renderer {
     render_pass: Arc<RenderPass>,
     mesh_vs: EntryPoint,
     mesh_fs: EntryPoint,
-    shadow_mapping_pipeline: Arc<GraphicsPipeline>,
     mesh_pipeline: Arc<GraphicsPipeline>,
     skybox_vs: EntryPoint,
     skybox_fs: EntryPoint,
     skybox_pipeline: Arc<GraphicsPipeline>,
 
+    shadow_mapping_render_pass: Arc<RenderPass>,
+    shadow_mapping_vs: EntryPoint,
+    shadow_mapping_fs: EntryPoint,
+    shadow_mapping_pipeline: Arc<GraphicsPipeline>,
+
     shadow_map_framebuffer: Arc<Framebuffer>,
 
     /// For tiled rendering
     light_culling_pipeline: Arc<ComputePipeline>,
+    light_culling_cs_module: Arc<ShaderModule>,
+    old_light_culling_max_lights_per_tile: u32,
 
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
@@ -144,166 +177,167 @@ struct RendererAssetChangeListener {
     textures_changed: bool,
 }
 
-fn window_size_dependent_setup(
+fn create_mesh_pipeline(
     extent: Vec2,
-    render_pass: &Arc<RenderPass>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
+    mesh_pass: Subpass,
+    device: &Arc<Device>,
     mesh_vs: &EntryPoint,
     mesh_fs: &EntryPoint,
+    sampler: &Arc<Sampler>,
+    shadow_map_sampler: &Arc<Sampler>,
+) -> Arc<GraphicsPipeline> {
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: extent.into(),
+        depth_range: 0.0..=1.0,
+    };
+    
+    let properties = device.physical_device().properties();
+
+    let mesh_pipeline_stages = [
+        PipelineShaderStageCreateInfo::new(mesh_vs.clone()),
+        PipelineShaderStageCreateInfo::new(mesh_fs.clone()),
+    ];
+    let mut layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
+
+    // SLOW_CHANGING_DESCRIPTOR_SET
+    layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
+        .bindings
+        .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING)
+        .unwrap()
+        .immutable_samplers = vec![sampler.clone()];
+    layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
+        .bindings
+        .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SHADOW_MAP_SAMPLER_BINDING)
+        .unwrap()
+        .immutable_samplers = vec![shadow_map_sampler.clone()];
+
+    layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
+        .bindings
+        .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
+        .unwrap()
+        .descriptor_count = properties.max_descriptor_set_samplers - 5;
+    layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
+        .bindings
+        .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
+        .unwrap()
+        .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+        | DescriptorBindingFlags::PARTIALLY_BOUND;
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: mesh_pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport.clone()].into_iter().collect(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                mesh_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(mesh_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
+}
+
+fn create_skybox_pipeline(
+    extent: Vec2,
+    skybox_pass: Subpass,
+    device: &Arc<Device>,
     skybox_vs: &EntryPoint,
     skybox_fs: &EntryPoint,
     sampler: &Arc<Sampler>,
-    shadow_map_sampler: &Arc<Sampler>,
-) -> (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>) {
-    let device = memory_allocator.device();
-
+) -> Arc<GraphicsPipeline> {
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: extent.into(),
         depth_range: 0.0..=1.0,
     };
 
-    let properties = device.physical_device().properties();
+    let stages = [
+        PipelineShaderStageCreateInfo::new(skybox_vs.clone()),
+        PipelineShaderStageCreateInfo::new(skybox_fs.clone()),
+    ];
+    let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
 
-    let mesh_pipeline = {
-        let mesh_pipeline_stages = [
-            PipelineShaderStageCreateInfo::new(mesh_vs.clone()),
-            PipelineShaderStageCreateInfo::new(mesh_fs.clone()),
-        ];
-        let mut layout_create_info =
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&mesh_pipeline_stages);
-
-        // SLOW_CHANGING_DESCRIPTOR_SET
-        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
-            .bindings
-            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SAMPLER_BINDING)
-            .unwrap()
-            .immutable_samplers = vec![sampler.clone()];
-        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
-            .bindings
-            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_SHADOW_MAP_SAMPLER_BINDING)
-            .unwrap()
-            .immutable_samplers = vec![shadow_map_sampler.clone()];
-
-        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
-            .bindings
-            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
-            .unwrap()
-            .descriptor_count = properties.max_descriptor_set_samplers - 5;
-        layout_create_info.set_layouts[SLOW_CHANGING_DESCRIPTOR_SET]
-            .bindings
-            .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
-            .unwrap()
-            .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-            | DescriptorBindingFlags::PARTIALLY_BOUND;
-
-        let layout = PipelineLayout::new(
-            device.clone(),
-            layout_create_info
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-
-        let mesh_pass = Subpass::from(render_pass.clone(), 0).unwrap();
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: mesh_pipeline_stages.into_iter().collect(),
-                vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs).unwrap()),
-                input_assembly_state: Some(InputAssemblyState::default()),
-                viewport_state: Some(ViewportState {
-                    viewports: [viewport.clone()].into_iter().collect(),
-                    ..Default::default()
-                }),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
-                    ..Default::default()
-                }),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState::simple()),
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    mesh_pass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                subpass: Some(mesh_pass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
+    // Env descriptor set (rebound when the skybox changes, not too often)
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&0)
         .unwrap()
-    };
+        .immutable_samplers = vec![sampler.clone()];
 
-    let skybox_pipeline = {
-        let stages = [
-            PipelineShaderStageCreateInfo::new(skybox_vs.clone()),
-            PipelineShaderStageCreateInfo::new(skybox_fs.clone()),
-        ];
-        let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-
-        // Env descriptor set (rebound when the skybox changes, not too often)
-        layout_create_info.set_layouts[0]
-            .bindings
-            .get_mut(&0)
-            .unwrap()
-            .immutable_samplers = vec![sampler.clone()];
-
-        // Frame descriptor set (bound during the whole frame)
-        layout_create_info.set_layouts[1]
-            .bindings
-            .get_mut(&0)
-            .unwrap()
-            .descriptor_type = DescriptorType::UniformBuffer;
-
-        let layout = PipelineLayout::new(
-            device.clone(),
-            layout_create_info
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-
-        let skybox_pass = Subpass::from(render_pass.clone(), 1).unwrap();
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs).unwrap()),
-                input_assembly_state: Some(InputAssemblyState::default()),
-                viewport_state: Some(ViewportState {
-                    viewports: [viewport.clone()].into_iter().collect(),
-                    ..Default::default()
-                }),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::None,
-                    ..Default::default()
-                }),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState {
-                        write_enable: false,
-                        compare_op: CompareOp::LessOrEqual,
-                    }),
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    skybox_pass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                subpass: Some(skybox_pass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
+    // Frame descriptor set (bound during the whole frame)
+    layout_create_info.set_layouts[1]
+        .bindings
+        .get_mut(&0)
         .unwrap()
-    };
+        .descriptor_type = DescriptorType::UniformBuffer;
 
-    (mesh_pipeline, skybox_pipeline)
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs).unwrap()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport.clone()].into_iter().collect(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::LessOrEqual,
+                }),
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                skybox_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(skybox_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
 }
 
 impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
@@ -333,22 +367,6 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 }
 
 fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
-    // vulkano::single_pass_renderpass!(
-    //     device.clone(),
-    //     attachments: {
-    //         depth_stencil: {
-    //             format: Format::D32_SFLOAT,
-    //             samples: 1,
-    //             load_op: Clear,
-    //             store_op: Store,
-    //         },
-    //     },
-    //     pass: {
-    //         color: [],
-    //         depth_stencil: {depth_stencil},
-    //     },
-    // )
-    // .unwrap()
     RenderPass::new(
         device.clone(),
         RenderPassCreateInfo {
@@ -368,12 +386,6 @@ fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
                     layout: ImageLayout::DepthStencilAttachmentOptimal,
                     ..Default::default()
                 }),
-                // depth_stencil_resolve_attachment: Some(AttachmentReference {
-                //     attachment: 0,
-                //     layout: ImageLayout::DepthStencilAttachmentOptimal,
-                //     ..Default::default()
-                // }),
-                // depth_resolve_mode: Some(ResolveMode::Min),
                 ..Default::default()
             }]
             .into(),
@@ -441,8 +453,75 @@ fn create_shadow_map_pipeline(
     .unwrap()
 }
 
+fn create_light_culling_pipeline(
+    device: &Arc<Device>,
+    light_culling_cs_module: &Arc<ShaderModule>,
+    max_lights_per_tile: u32,
+) -> Arc<ComputePipeline> {
+    let light_culling_cs = light_culling_cs_module
+        .specialize(
+            [
+                (0, max_lights_per_tile.into()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+
+    let stage = PipelineShaderStageCreateInfo::new(light_culling_cs.clone());
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .unwrap()
+}
+
+fn create_shadow_map_framebuffer(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    shadow_mapping_render_pass: &Arc<RenderPass>,
+    size: u32,
+) -> Arc<Framebuffer> {
+    let shadow_map = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: shadow_mapping_render_pass.attachments()[0].format,
+                extent: [size, size, 1],
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
+                array_layers: SHADOW_MAP_CASCADE_COUNT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Framebuffer::new(
+        shadow_mapping_render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![shadow_map.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
 impl Renderer {
     pub fn new(
+        settings: RendererSettings,
         device: Arc<Device>,
         queue: Arc<Queue>,
         asset_database: Arc<RwLock<AssetDatabase>>,
@@ -499,34 +578,14 @@ impl Renderer {
             },
         );
 
-        let light_culling_cs = light_culling::cs::load(device.clone())
-            .unwrap()
-            .specialize(
-                [
-                    (0, MAX_LIGHTS_PER_TILE.into()),
-                    (1, TILE_SIZE.into()),
-                    (2, Z_SLICES.into()),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap()
-            .entry_point("main")
+        let light_culling_cs_module = light_culling::cs::load(device.clone())
             .unwrap();
-        let stage = PipelineShaderStageCreateInfo::new(light_culling_cs.clone());
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-        let light_culling_pipeline = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .unwrap();
+
+        let light_culling_pipeline = create_light_culling_pipeline(
+            &device,
+            &light_culling_cs_module,
+            settings.light_culling_max_lights_per_tile,
+        );
 
         let shadow_mapping_render_pass = create_shadow_map_renderpass(&device);
 
@@ -539,33 +598,14 @@ impl Renderer {
             .entry_point("main")
             .unwrap();
 
-        let shadow_map = ImageView::new_default(
-            Image::new(
-                memory_allocator.clone(),
-                ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
-                    format: shadow_mapping_render_pass.attachments()[0].format,
-                    extent: [2048, 2048, 1],
-                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
-                    array_layers: SHADOW_MAP_CASCADE_COUNT,
-                    ..Default::default()
-                },
-                AllocationCreateInfo::default(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let shadow_map_framebuffer = Framebuffer::new(
-            shadow_mapping_render_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![shadow_map.clone()],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let shadow_map_framebuffer = create_shadow_map_framebuffer(
+            &memory_allocator, 
+            &shadow_mapping_render_pass, 
+            settings.cascaded_shadow_map_level_size,
+        );
 
         let shadow_mapping_pipeline = create_shadow_map_pipeline(
-            Vec2::new(shadow_map.image().extent()[0] as f32, shadow_map.image().extent()[1] as f32),
+            Vec2::from(shadow_map_framebuffer.extent().map(|x| x as f32)),
             &shadow_mapping_render_pass,
             &memory_allocator,
             &shadow_mapping_vs,
@@ -609,16 +649,12 @@ impl Renderer {
             .unwrap()
             .entry_point("main")
             .unwrap();
+    
         let mesh_fs = mesh_shaders::fs::load(device.clone())
-            .unwrap()
-            .specialize(
-                [(0, TILE_SIZE.into()), (1, Z_SLICES.into())]
-                    .into_iter()
-                    .collect(),
-            )
             .unwrap()
             .entry_point("main")
             .unwrap();
+
         let skybox_vs = skybox_shaders::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
@@ -653,16 +689,25 @@ impl Renderer {
         )
         .unwrap();
 
-        let (mesh_pipeline, skybox_pipeline) = window_size_dependent_setup(
-            Vec2::new(1280.0, 720.0),
-            &render_pass,
-            &memory_allocator,
-            &mesh_vs,
-            &mesh_fs,
-            &skybox_vs,
-            &skybox_fs,
-            &sampler,
+        let extent = Vec2::new(1280.0, 720.0);
+
+        let mesh_pipeline = create_mesh_pipeline(
+            extent, 
+            Subpass::from(render_pass.clone(), 0).unwrap(), 
+            &device, 
+            &mesh_vs, 
+            &mesh_fs, 
+            &sampler, 
             &shadow_map_sampler,
+        );
+
+        let skybox_pipeline = create_skybox_pipeline(
+            extent, 
+            Subpass::from(render_pass.clone(), 1).unwrap(), 
+            &device, 
+            &skybox_vs, 
+            &skybox_fs, 
+            &sampler,
         );
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
@@ -829,6 +874,10 @@ impl Renderer {
             .add_asset_database_change_observer(asset_change_listener.clone());
 
         let renderer = Self {
+            settings: settings.clone(),
+
+            device,
+
             memory_allocator,
             descriptor_set_allocator,
             uniform_buffer_allocator,
@@ -836,16 +885,24 @@ impl Renderer {
             in_device_storage_buffer_allocator,
             indirect_buffer_allocator,
             asset_database,
+
             render_pass,
             mesh_vs,
             mesh_fs,
             skybox_vs,
             skybox_fs,
-            shadow_mapping_pipeline,
             mesh_pipeline,
             skybox_pipeline,
+            
+            shadow_mapping_render_pass,
+            shadow_mapping_pipeline,
+            shadow_mapping_vs,
+            shadow_mapping_fs,
             shadow_map_framebuffer,
+
             light_culling_pipeline,
+            light_culling_cs_module,
+            old_light_culling_max_lights_per_tile: settings.light_culling_max_lights_per_tile,
             cube_vertex_buffer,
             cube_index_buffer,
             sampler,
@@ -859,6 +916,14 @@ impl Renderer {
         };
 
         renderer
+    }
+
+    pub fn settings(&self) -> &RendererSettings {
+        &self.settings
+    }
+    
+    pub fn settings_mut(&mut self) -> &mut RendererSettings {
+        &mut self.settings
     }
 
     fn add_materials_and_textures_to_descriptor_set(&mut self) {
@@ -1068,7 +1133,7 @@ impl Renderer {
         let range = max_z - min_z;
         let ratio: f32 = max_z / min_z;
 
-        let cascade_split_lambda = 0.8;
+        let cascade_split_lambda = 0.65;
 
         let cascade_splits: [f32; SHADOW_MAP_CASCADE_COUNT as usize] = std::array::from_fn(|i| {
             let p = (i + 1) as f32 / SHADOW_MAP_CASCADE_COUNT as f32;
@@ -1170,8 +1235,8 @@ impl Renderer {
                         max_extents.x,
                         min_extents.y,
                         max_extents.y,
-                        -100.0,
-                        100.0,
+                        -50.0,
+                        50.0,
                     );
 
 
@@ -1243,19 +1308,53 @@ impl Renderer {
             image_views[0].image().extent()[0] as f32,
             image_views[0].image().extent()[1] as f32,
         );
-        (self.mesh_pipeline, self.skybox_pipeline) = window_size_dependent_setup(
+
+        self.mesh_pipeline = create_mesh_pipeline(
             extent,
-            &self.render_pass,
-            &self.memory_allocator,
+            Subpass::from(self.render_pass.clone(), 0).unwrap(),
+            &self.device,
             &self.mesh_vs,
             &self.mesh_fs,
-            &self.skybox_vs,
-            &self.skybox_fs,
             &self.sampler,
             &self.shadow_map_sampler,
         );
+        
+        self.skybox_pipeline = create_skybox_pipeline(
+            extent,
+            Subpass::from(self.render_pass.clone(), 1).unwrap(),
+            &self.device,
+            &self.skybox_vs,
+            &self.skybox_fs,
+            &self.sampler,
+        );
 
         self.create_framebuffers(&image_views)
+    }
+
+    pub fn apply_changed_settings(&mut self) {
+        if self.settings.light_culling_max_lights_per_tile != self.old_light_culling_max_lights_per_tile {
+            self.light_culling_pipeline = create_light_culling_pipeline(
+                &self.device,
+                &self.light_culling_cs_module, 
+                self.settings.light_culling_max_lights_per_tile,
+            );
+            self.old_light_culling_max_lights_per_tile = self.settings.light_culling_max_lights_per_tile;
+        }
+
+        if self.settings.cascaded_shadow_map_level_size != self.shadow_map_framebuffer.extent()[0] {
+            self.shadow_map_framebuffer = create_shadow_map_framebuffer(
+                &self.memory_allocator, 
+                &self.shadow_mapping_render_pass,
+                self.settings.cascaded_shadow_map_level_size,
+            );
+            self.shadow_mapping_pipeline = create_shadow_map_pipeline(
+                Vec2::from(self.shadow_map_framebuffer.extent().map(|x| x as f32)),
+                &self.shadow_mapping_render_pass,
+                &self.memory_allocator,
+                &self.shadow_mapping_vs,
+                &self.shadow_mapping_fs,
+            );
+        }
     }
 
     /// Returns true if the swapchain needs to be recreated
@@ -1270,6 +1369,8 @@ impl Renderer {
         self.add_materials_and_textures_to_descriptor_set();
         let point_lights_buffer = self.create_point_lights_storage_buffer();
         let directional_lights_buffer = self.create_directional_lights_storage_buffer();
+
+        self.apply_changed_settings();
 
         let shadow_map_matrices_and_splits =
             self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
@@ -1466,15 +1567,15 @@ impl Renderer {
             .extent[1] as u32;
 
         let num_tiles = UVec3::new(
-            width.div_ceil(TILE_SIZE),
-            height.div_ceil(TILE_SIZE),
-            Z_SLICES,
+            width.div_ceil(self.settings.light_culling_tile_size),
+            height.div_ceil(self.settings.light_culling_tile_size),
+            self.settings.light_culling_z_slices,
         );
 
         let visible_light_indices_storage_buffer = self
             .in_device_storage_buffer_allocator
             .allocate_slice::<u32>(
-                (num_tiles.x * num_tiles.y * num_tiles.z * MAX_LIGHTS_PER_TILE) as DeviceSize,
+                (num_tiles.x * num_tiles.y * num_tiles.z * self.settings.light_culling_max_lights_per_tile) as DeviceSize,
             )
             .unwrap();
 
@@ -1688,6 +1789,10 @@ impl Renderer {
                     .map(|buffer| buffer.len() as u32)
                     .unwrap_or(0),
                 cutoff_distances: cascade_splits.map(|split| split.into()),
+                light_culling_tile_size: self.settings.light_culling_tile_size,
+                light_culling_z_slices: self.settings.light_culling_z_slices.into(),
+                sample_count_per_level: self.settings.sample_count_per_level.map(|x| x.into()),
+                shadow_map_base_bias: self.settings.shadow_map_base_bias.into(),
                 light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
             };
 

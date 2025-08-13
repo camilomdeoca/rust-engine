@@ -6,6 +6,7 @@ use egui_tiles::Tree;
 use egui_winit_vulkano::Gui;
 use flecs_ecs::core::World;
 use scene_tree::SceneTree;
+use renderer_settings_edit::RendererSettingsEdit;
 use vulkano::{
     command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer},
     image::
@@ -22,11 +23,14 @@ use crate::{camera::Camera, renderer::Renderer};
 pub mod logger;
 pub mod camera_view;
 pub mod scene_tree;
+pub mod renderer_settings_edit;
+pub mod edit_widgets;
 
 pub enum Pane {
     CameraView(CameraView),
     SceneTree(SceneTree),
     LogView,
+    RendererSettingsEdit(RendererSettingsEdit),
 }
 
 pub struct UserInterface {
@@ -126,6 +130,15 @@ impl UserInterface {
             tiles.insert_tab_tile(vec![old_root, id])
         });
     }
+    
+    pub fn add_renderer_settings_editor(&mut self, renderer: Arc<RwLock<Renderer>>) {
+        let id = self.tree.tiles.insert_pane(Pane::RendererSettingsEdit(RendererSettingsEdit::new(renderer)));
+        self.tree.root = Some({
+            let old_root = self.tree.root().unwrap();
+            let tiles = &mut self.tree.tiles;
+            tiles.insert_tab_tile(vec![old_root, id])
+        });
+    }
 
     pub fn get_focused_camera(&mut self) -> Option<&mut Camera> {
         let tile = self.tree.tiles.get_mut(self.behavior.focused_camera?).unwrap();
@@ -162,6 +175,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
             Pane::CameraView(_) => "Camera view",
             Pane::SceneTree(_) => "Scene tree",
             Pane::LogView => "Log",
+            Pane::RendererSettingsEdit(_) => "Renderer settings",
         }
         .into()
     }
@@ -207,6 +221,9 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
             }
             Pane::LogView => {
                 logger::ui(ui);
+            }
+            Pane::RendererSettingsEdit(renderer_settings_edit) => {
+                renderer_settings_edit.draw(ui);
             }
         }
 
