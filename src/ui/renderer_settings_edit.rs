@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use crate::renderer::Renderer;
 use egui::Ui;
 
-use super::edit_widgets::edit_array_ui;
+use super::edit_widgets::ArrayDragEdit;
 
 pub struct RendererSettingsEdit {
     renderer: Arc<RwLock<Renderer>>,
@@ -60,13 +60,40 @@ impl RendererSettingsEdit {
         ui.horizontal(|ui| {
             let label = ui.label("Shadow map bias");
             ui.add(
-                egui::DragValue::new(&mut settings.shadow_map_base_bias)
+                egui::DragValue::new(&mut settings.shadow_map_bias)
+                    .range(0.0..=1.0)
+                    .speed(0.00001),
+            )
+            .labelled_by(label.id);
+            // ui.separator();
+            let label = ui.label("slope bias");
+            ui.add(
+                egui::DragValue::new(&mut settings.shadow_map_slope_bias)
                     .range(0.0..=1.0)
                     .speed(0.00001),
             )
             .labelled_by(label.id);
         });
+        
+        ui.horizontal(|ui| {
+            let label = ui.label("Penumbra max size");
+            ui.add(
+                egui::DragValue::new(&mut settings.penumbra_max_size)
+                    .range(0.0..=1.0)
+                    .speed(0.00001),
+            )
+            .labelled_by(label.id);
+        });
+        ui.horizontal(|ui| {
+            let label = ui.label("Shadow map cascade split lambda");
+            ui.add(
+                egui::DragValue::new(&mut settings.shadow_map_cascade_split_lambda)
+                    .range(0.0..=1.0)
+                    .speed(0.001),
+            )
+            .labelled_by(label.id);
+        });
 
-        edit_array_ui(ui, &mut settings.sample_count_per_level);
+        ui.add(ArrayDragEdit::new(&mut settings.sample_count_per_level));
     }
 }

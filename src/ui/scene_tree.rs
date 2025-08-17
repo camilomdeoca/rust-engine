@@ -9,7 +9,7 @@ use crate::ecs::components::{
     SceneEntity, Transform,
 };
 
-use super::edit_widgets::edit_ui;
+use super::edit_widgets::{QuatDragEditAsEulerAngles, Vec3DragEdit};
 
 pub struct SceneTree {
     query: Query<()>,
@@ -32,10 +32,14 @@ impl SceneTree {
                             entity.try_get::<&mut Transform>(|transform| {
                                 ui.collapsing("Transform", |ui| {
                                     let label = ui.label("Position");
-                                    edit_ui(ui, &mut transform.translation).labelled_by(label.id);
-                                    ui.label(format!("Rotation: {}", transform.rotation));
+                                    ui.add(Vec3DragEdit::new(&mut transform.translation))
+                                        .labelled_by(label.id);
+                                    let label = ui.label("Rotation");
+                                    ui.add(QuatDragEditAsEulerAngles::new(&mut transform.rotation))
+                                        .labelled_by(label.id);
                                     let label = ui.label("Scale");
-                                    edit_ui(ui, &mut transform.scale).labelled_by(label.id);
+                                    ui.add(Vec3DragEdit::new(&mut transform.scale))
+                                        .labelled_by(label.id);
                                 });
                             });
 
@@ -50,7 +54,8 @@ impl SceneTree {
                             entity.try_get::<&mut PointLight>(|point_light| {
                                 ui.collapsing("PointLight", |ui| {
                                     let label = ui.label("Color");
-                                    edit_ui(ui, &mut point_light.color).labelled_by(label.id);
+                                    ui.add(Vec3DragEdit::new(&mut point_light.color))
+                                        .labelled_by(label.id);
                                     let label = ui.label("Radius");
                                     ui.add(
                                         egui::DragValue::new(&mut point_light.radius).speed(0.1),
@@ -62,7 +67,8 @@ impl SceneTree {
                             entity.try_get::<&mut DirectionalLight>(|directional_light| {
                                 ui.collapsing("DirectionalLight", |ui| {
                                     let label = ui.label("Color");
-                                    edit_ui(ui, &mut directional_light.color).labelled_by(label.id);
+                                    ui.add(Vec3DragEdit::new(&mut directional_light.color))
+                                        .labelled_by(label.id);
                                 });
                             });
 

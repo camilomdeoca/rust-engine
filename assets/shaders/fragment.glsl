@@ -72,8 +72,10 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float cutoff_distances[SHADOW_MAP_CASCADE_COUNT];
     uint light_culling_tile_size;
     uint light_culling_z_slices;
-    uint sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
-    float shadow_map_base_bias;
+    uint light_culling_sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
+    float shadow_map_bias;
+    float shadow_map_slope_bias;
+    float penumbra_filter_size;
     mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
@@ -222,7 +224,7 @@ float AvgBlockersDepthToPenumbra(float z_shadowMapView, float avgBlockersDepth)
     float penumbra = (z_shadowMapView - avgBlockersDepth);
     // penumbra /= avgBlockersDepth; // If its point light
     // penumbra *= penumbra;
-    return clamp(0.001 + 3.0 * penumbra, 0.0, 1.0);
+    return clamp(3.0 * penumbra, 0.0, 1.0);
 }
 
 float InterleavedGradientNoise(vec2 position_screen)
@@ -281,7 +283,7 @@ float Penumbra(
 float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
 {
     //int sample_count_per_level[4] = {12, 10, 1, 1};
-    int sample_count = int(sample_count_per_level[level_index]);
+    int sample_count = int(light_culling_sample_count_per_level[level_index]);
 
     // ivec2 shadow_map_size = textureSize(sampler2DArray(shadow_map, s), 0).xy;
     // vec2 texel_size = vec2(1.0) / shadow_map_size;
@@ -299,7 +301,7 @@ float pcf_shadows(vec3 projected_coords, uint level_index, float bias)
 
     float gradient_noise = InterleavedGradientNoise(gl_FragCoord.xy);
 
-    const float penumbraFilterMaxSize = 0.0015 * far / cutoff_distances[level_index];
+    const float penumbraFilterMaxSize = penumbra_filter_size * far / cutoff_distances[level_index];
 
     float penumbra = Penumbra(gradient_noise, projected_coords.xy, level_index, projected_coords.z, sample_count, penumbraFilterMaxSize);
     float radius = penumbra * penumbraFilterMaxSize;
@@ -432,9 +434,11 @@ void main()
         // calculate per-light radiance
         vec3 light_direction = normalize(-light.direction);
         vec3 radiance = light.color;
+        
+        float NdotL = dot(N, light_direction);
 
         float shadow = 0.0;
-        if (light.has_shadow_maps && dot(N, light_direction) > 0.0)
+        if (light.has_shadow_maps && NdotL > 0.0)
         {
             uint level = 0;
             for (uint i = 0; i < SHADOW_MAP_CASCADE_COUNT - 1; i++)
@@ -454,9 +458,18 @@ void main()
             vec4 pos_light_space = bias_mat * light_space_matrices[level] * vec4(v_pos, 1.0);
             vec3 projected_coords = pos_light_space.xyz / pos_light_space.w;
 
-            float bias = shadow_map_base_bias;
-            bias = max(bias * (1.0 - dot(N, light_direction)), bias);
-            // bias *= pow(cutoff_distances[level]/cutoff_distances[0], 1.5);
+            //float bias = shadow_map_base_bias;
+            //bias = max(bias * (1.0 - dot(N, light_direction)), bias);
+            
+            // float dzdx = dFdx(projected_coords.z);
+            // float dzdy = dFdy(projected_coords.z);
+            // float maxSlope = max(abs(dzdx), abs(dzdy));
+            // float bias = shadow_map_bias + shadow_map_slope_bias * maxSlope;
+
+            float bias = shadow_map_bias + shadow_map_slope_bias * (1.0 - NdotL);
+
+            //bias *= cutoff_distances[level]/cutoff_distances[0];
+            bias *= sqrt(sqrt(cutoff_distances[level]/cutoff_distances[0]));
 
             // shadow = texture_project(projected_coords, level, bias);
             shadow = pcf_shadows(projected_coords, level, bias);

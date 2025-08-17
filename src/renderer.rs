@@ -101,7 +101,10 @@ pub struct RendererSettings {
     pub light_culling_z_slices: u32,
     pub cascaded_shadow_map_level_size: u32,
     pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
-    pub shadow_map_base_bias: f32,
+    pub shadow_map_bias: f32,
+    pub shadow_map_slope_bias: f32,
+    pub penumbra_max_size: f32,
+    pub shadow_map_cascade_split_lambda: f32,
 }
 
 impl Default for RendererSettings {
@@ -112,7 +115,10 @@ impl Default for RendererSettings {
             light_culling_z_slices: 32,
             cascaded_shadow_map_level_size: 2048,
             sample_count_per_level: [12, 10, 1, 1],
-            shadow_map_base_bias: 0.0005,
+            shadow_map_bias: 0.0005,
+            shadow_map_slope_bias: 0.0005,
+            penumbra_max_size: 0.0015,
+            shadow_map_cascade_split_lambda: 0.65,
         }
     }
 }
@@ -918,10 +924,6 @@ impl Renderer {
         renderer
     }
 
-    pub fn settings(&self) -> &RendererSettings {
-        &self.settings
-    }
-    
     pub fn settings_mut(&mut self) -> &mut RendererSettings {
         &mut self.settings
     }
@@ -1133,13 +1135,11 @@ impl Renderer {
         let range = max_z - min_z;
         let ratio: f32 = max_z / min_z;
 
-        let cascade_split_lambda = 0.65;
-
         let cascade_splits: [f32; SHADOW_MAP_CASCADE_COUNT as usize] = std::array::from_fn(|i| {
             let p = (i + 1) as f32 / SHADOW_MAP_CASCADE_COUNT as f32;
             let log = min_z * ratio.powf(p);
             let uniform = min_z + range * p;
-            let d = cascade_split_lambda * (log - uniform) + uniform;
+            let d = self.settings.shadow_map_cascade_split_lambda * (log - uniform) + uniform;
             (d - near_clip) / clip_range
         });
 
@@ -1791,8 +1791,10 @@ impl Renderer {
                 cutoff_distances: cascade_splits.map(|split| split.into()),
                 light_culling_tile_size: self.settings.light_culling_tile_size,
                 light_culling_z_slices: self.settings.light_culling_z_slices.into(),
-                sample_count_per_level: self.settings.sample_count_per_level.map(|x| x.into()),
-                shadow_map_base_bias: self.settings.shadow_map_base_bias.into(),
+                light_culling_sample_count_per_level: self.settings.sample_count_per_level.map(|x| x.into()),
+                shadow_map_bias: self.settings.shadow_map_bias.into(),
+                shadow_map_slope_bias: self.settings.shadow_map_slope_bias.into(),
+                penumbra_filter_size: self.settings.penumbra_max_size.into(),
                 light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
             };
 

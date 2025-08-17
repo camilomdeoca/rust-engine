@@ -34,8 +34,10 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     float cutoff_distances[SHADOW_MAP_CASCADE_COUNT];
     uint light_culling_tile_size;
     uint light_culling_z_slices;
-    uint sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
-    float shadow_map_base_bias;
+    uint light_culling_sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
+    float shadow_map_bias;
+    float shadow_map_slope_bias;
+    float penumbra_filter_size;
     mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
 layout(std430, set = 1, binding = 1) readonly buffer EntityDataBuffer {
