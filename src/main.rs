@@ -550,15 +550,18 @@ impl ApplicationHandler for App {
                 .map(|image| ImageView::new_default(image.clone()).unwrap())
                 .collect();
 
-            let renderer = Arc::new(RwLock::new(Renderer::new(
-                Default::default(),
-                self.device.clone(),
-                self.queue.clone(),
-                self.asset_database.clone(),
-                self.memory_allocator.clone(),
-                self.world.clone(),
-                Format::R8G8B8A8_UNORM,
-            )));
+            let renderer = Arc::new(RwLock::new(
+                Renderer::new(
+                    Default::default(),
+                    self.device.clone(),
+                    self.queue.clone(),
+                    self.asset_database.clone(),
+                    self.memory_allocator.clone(),
+                    self.world.clone(),
+                    Format::R8G8B8A8_UNORM,
+                )
+                .unwrap(),
+            ));
 
             let asset_database_clone = self.asset_database.clone();
             let entities_to_add_queue_clone = self.entities_to_add_queue.clone();

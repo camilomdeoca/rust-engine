@@ -5,6 +5,7 @@ use std::{
 
 use flecs_ecs::prelude::*;
 use glam::{Mat3, Mat4, UVec3, Vec2, Vec3, Vec4Swizzles};
+use thiserror::Error;
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
@@ -50,7 +51,7 @@ use vulkano::{
         SubpassDescription,
     },
     shader::{EntryPoint, ShaderModule},
-    DeviceSize,
+    DeviceSize, Validated, ValidationError, VulkanError,
 };
 
 use crate::{
@@ -93,6 +94,14 @@ pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_BUFFER_BINDING: u32 = 3;
 pub const FRAME_DESCRIPTOR_SET_VISIBLE_POINT_LIGHTS_BUFFER_BINDING: u32 = 4;
 pub const FRAME_DESCRIPTOR_SET_POINT_LIGHTS_FROM_TILE_STORAGE_IMAGE_BINDING: u32 = 5;
 pub const FRAME_DESCRIPTOR_SET_SHADOW_MAP_BINDING: u32 = 6;
+
+#[derive(Error, Debug)]
+pub enum RendererError {
+    #[error("{0}")]
+    VulkanoVulkanError(#[from] Validated<VulkanError>),
+    #[error("{0}")]
+    VulkanoValidationError(#[from] Box<ValidationError>),
+}
 
 #[derive(Clone)]
 pub struct RendererSettings {
@@ -191,13 +200,13 @@ fn create_mesh_pipeline(
     mesh_fs: &EntryPoint,
     sampler: &Arc<Sampler>,
     shadow_map_sampler: &Arc<Sampler>,
-) -> Arc<GraphicsPipeline> {
+) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: extent.into(),
         depth_range: 0.0..=1.0,
     };
-    
+
     let properties = device.physical_device().properties();
 
     let mesh_pipeline_stages = [
@@ -228,23 +237,22 @@ fn create_mesh_pipeline(
         .bindings
         .get_mut(&SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING)
         .unwrap()
-        .binding_flags = DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-        | DescriptorBindingFlags::PARTIALLY_BOUND;
+        .binding_flags =
+        DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT | DescriptorBindingFlags::PARTIALLY_BOUND;
 
     let layout = PipelineLayout::new(
         device.clone(),
         layout_create_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
-    )
-    .unwrap();
+    )?;
 
     GraphicsPipeline::new(
         device.clone(),
         None,
         GraphicsPipelineCreateInfo {
             stages: mesh_pipeline_stages.into_iter().collect(),
-            vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs).unwrap()),
+            vertex_input_state: Some(Vertex::per_vertex().definition(mesh_vs)?),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState {
                 viewports: [viewport.clone()].into_iter().collect(),
@@ -267,7 +275,6 @@ fn create_mesh_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .unwrap()
 }
 
 fn create_skybox_pipeline(
@@ -277,7 +284,7 @@ fn create_skybox_pipeline(
     skybox_vs: &EntryPoint,
     skybox_fs: &EntryPoint,
     sampler: &Arc<Sampler>,
-) -> Arc<GraphicsPipeline> {
+) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: extent.into(),
@@ -309,15 +316,14 @@ fn create_skybox_pipeline(
         layout_create_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
-    )
-    .unwrap();
+    )?;
 
     GraphicsPipeline::new(
         device.clone(),
         None,
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
-            vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs).unwrap()),
+            vertex_input_state: Some(Vertex::per_vertex().definition(skybox_vs)?),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState {
                 viewports: [viewport.clone()].into_iter().collect(),
@@ -343,7 +349,6 @@ fn create_skybox_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .unwrap()
 }
 
 impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
@@ -372,7 +377,9 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
     }
 }
 
-fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
+fn create_shadow_map_renderpass(
+    device: &Arc<Device>,
+) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
     RenderPass::new(
         device.clone(),
         RenderPassCreateInfo {
@@ -399,7 +406,6 @@ fn create_shadow_map_renderpass(device: &Arc<Device>) -> Arc<RenderPass> {
             ..Default::default()
         },
     )
-    .unwrap()
 }
 
 fn create_shadow_map_pipeline(
@@ -408,7 +414,7 @@ fn create_shadow_map_pipeline(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     shadow_mapping_vs: &EntryPoint,
     shadow_mapping_fs: &EntryPoint,
-) -> Arc<GraphicsPipeline> {
+) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
     let device = memory_allocator.device();
     let stages = [
         PipelineShaderStageCreateInfo::new(shadow_mapping_vs.clone()),
@@ -421,8 +427,7 @@ fn create_shadow_map_pipeline(
         layout_create_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
-    )
-    .unwrap();
+    )?;
 
     let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
 
@@ -437,7 +442,7 @@ fn create_shadow_map_pipeline(
         None,
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
-            vertex_input_state: Some(Vertex::per_vertex().definition(shadow_mapping_vs).unwrap()),
+            vertex_input_state: Some(Vertex::per_vertex().definition(shadow_mapping_vs)?),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState {
                 viewports: [viewport.clone()].into(),
@@ -456,23 +461,15 @@ fn create_shadow_map_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .unwrap()
 }
 
 fn create_light_culling_pipeline(
     device: &Arc<Device>,
     light_culling_cs_module: &Arc<ShaderModule>,
     max_lights_per_tile: u32,
-) -> Arc<ComputePipeline> {
+) -> Result<Arc<ComputePipeline>, Validated<VulkanError>> {
     let light_culling_cs = light_culling_cs_module
-        .specialize(
-            [
-                (0, max_lights_per_tile.into()),
-            ]
-            .into_iter()
-            .collect(),
-        )
-        .unwrap()
+        .specialize([(0, max_lights_per_tile.into())].into_iter().collect())?
         .entry_point("main")
         .unwrap();
 
@@ -483,22 +480,20 @@ fn create_light_culling_pipeline(
         PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
-    )
-    .unwrap();
+    )?;
 
     ComputePipeline::new(
         device.clone(),
         None,
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .unwrap()
 }
 
 fn create_shadow_map_framebuffer(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     shadow_mapping_render_pass: &Arc<RenderPass>,
     size: u32,
-) -> Arc<Framebuffer> {
+) -> Result<Arc<Framebuffer>, Validated<VulkanError>> {
     let shadow_map = ImageView::new_default(
         Image::new(
             memory_allocator.clone(),
@@ -513,8 +508,8 @@ fn create_shadow_map_framebuffer(
             AllocationCreateInfo::default(),
         )
         .unwrap(),
-    )
-    .unwrap();
+    )?;
+
     Framebuffer::new(
         shadow_mapping_render_pass.clone(),
         FramebufferCreateInfo {
@@ -522,7 +517,6 @@ fn create_shadow_map_framebuffer(
             ..Default::default()
         },
     )
-    .unwrap()
 }
 
 impl Renderer {
@@ -534,7 +528,7 @@ impl Renderer {
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
         format: Format,
-    ) -> Self {
+    ) -> Result<Self, RendererError> {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
             Default::default(),
@@ -584,31 +578,28 @@ impl Renderer {
             },
         );
 
-        let light_culling_cs_module = light_culling::cs::load(device.clone())
-            .unwrap();
+        let light_culling_cs_module = light_culling::cs::load(device.clone())?;
 
         let light_culling_pipeline = create_light_culling_pipeline(
             &device,
             &light_culling_cs_module,
             settings.light_culling_max_lights_per_tile,
-        );
+        )?;
 
-        let shadow_mapping_render_pass = create_shadow_map_renderpass(&device);
+        let shadow_mapping_render_pass = create_shadow_map_renderpass(&device)?;
 
-        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(device.clone())
-            .unwrap()
+        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(device.clone())?
             .entry_point("main")
             .unwrap();
-        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(device.clone())
-            .unwrap()
+        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(device.clone())?
             .entry_point("main")
             .unwrap();
 
         let shadow_map_framebuffer = create_shadow_map_framebuffer(
-            &memory_allocator, 
-            &shadow_mapping_render_pass, 
+            &memory_allocator,
+            &shadow_mapping_render_pass,
             settings.cascaded_shadow_map_level_size,
-        );
+        )?;
 
         let shadow_mapping_pipeline = create_shadow_map_pipeline(
             Vec2::from(shadow_map_framebuffer.extent().map(|x| x as f32)),
@@ -616,7 +607,7 @@ impl Renderer {
             &memory_allocator,
             &shadow_mapping_vs,
             &shadow_mapping_fs,
-        );
+        )?;
 
         let render_pass = vulkano::ordered_passes_renderpass!(
             device.clone(),
@@ -648,25 +639,20 @@ impl Renderer {
                     input: []
                 }
             ]
-        )
-        .unwrap();
+        )?;
 
-        let mesh_vs = mesh_shaders::vs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-    
-        let mesh_fs = mesh_shaders::fs::load(device.clone())
-            .unwrap()
+        let mesh_vs = mesh_shaders::vs::load(device.clone())?
             .entry_point("main")
             .unwrap();
 
-        let skybox_vs = skybox_shaders::vs::load(device.clone())
-            .unwrap()
+        let mesh_fs = mesh_shaders::fs::load(device.clone())?
             .entry_point("main")
             .unwrap();
-        let skybox_fs = skybox_shaders::fs::load(device.clone())
-            .unwrap()
+
+        let skybox_vs = skybox_shaders::vs::load(device.clone())?
+            .entry_point("main")
+            .unwrap();
+        let skybox_fs = skybox_shaders::fs::load(device.clone())?
             .entry_point("main")
             .unwrap();
 
@@ -679,9 +665,8 @@ impl Renderer {
                 address_mode: [SamplerAddressMode::Repeat; 3],
                 ..Default::default()
             },
-        )
-        .unwrap();
-        
+        )?;
+
         let shadow_map_sampler = Sampler::new(
             device.clone(),
             SamplerCreateInfo {
@@ -692,29 +677,28 @@ impl Renderer {
                 compare: Some(CompareOp::Less),
                 ..Default::default()
             },
-        )
-        .unwrap();
+        )?;
 
         let extent = Vec2::new(1280.0, 720.0);
 
         let mesh_pipeline = create_mesh_pipeline(
-            extent, 
-            Subpass::from(render_pass.clone(), 0).unwrap(), 
-            &device, 
-            &mesh_vs, 
-            &mesh_fs, 
-            &sampler, 
+            extent,
+            Subpass::from(render_pass.clone(), 0).unwrap(),
+            &device,
+            &mesh_vs,
+            &mesh_fs,
+            &sampler,
             &shadow_map_sampler,
-        );
+        )?;
 
         let skybox_pipeline = create_skybox_pipeline(
-            extent, 
-            Subpass::from(render_pass.clone(), 1).unwrap(), 
-            &device, 
-            &skybox_vs, 
-            &skybox_fs, 
+            extent,
+            Subpass::from(render_pass.clone(), 1).unwrap(),
+            &device,
+            &skybox_vs,
+            &skybox_fs,
             &sampler,
-        );
+        )?;
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
@@ -865,8 +849,7 @@ impl Renderer {
                 // ),
             ],
             [],
-        )
-        .unwrap();
+        )?;
         drop(asset_database_read);
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
@@ -899,7 +882,7 @@ impl Renderer {
             skybox_fs,
             mesh_pipeline,
             skybox_pipeline,
-            
+
             shadow_mapping_render_pass,
             shadow_mapping_pipeline,
             shadow_mapping_vs,
@@ -921,21 +904,21 @@ impl Renderer {
             world,
         };
 
-        renderer
+        Ok(renderer)
     }
 
     pub fn settings_mut(&mut self) -> &mut RendererSettings {
         &mut self.settings
     }
 
-    fn add_materials_and_textures_to_descriptor_set(&mut self) {
+    fn add_materials_and_textures_to_descriptor_set(&mut self) -> Result<(), RendererError> {
         let asset_change_listener_read = self.asset_change_listener.read().unwrap();
         let textures_changed = asset_change_listener_read.textures_changed;
         let materials_changed = asset_change_listener_read.materials_changed;
         drop(asset_change_listener_read);
 
         if !textures_changed && !materials_changed {
-            return;
+            return Ok(());
         }
 
         if materials_changed {
@@ -1032,13 +1015,13 @@ impl Renderer {
                 ),
             ],
             [],
-        )
-        .unwrap();
+        )?;
         drop(asset_database_read);
 
         let mut asset_change_listener_write = self.asset_change_listener.write().unwrap();
         asset_change_listener_write.materials_changed = false;
         asset_change_listener_write.textures_changed = false;
+        Ok(())
     }
 
     fn create_point_lights_storage_buffer(
@@ -1077,26 +1060,26 @@ impl Renderer {
     ) -> Option<Subbuffer<[mesh_shaders::fs::DirectionalLight]>> {
         let mut directional_lights = vec![];
 
-        let query = self.world
-            .query::<(
-                &DirectionalLight,
-                &Transform,
-            )>()
+        let query = self
+            .world
+            .query::<(&DirectionalLight, &Transform)>()
             .with::<DirectionalLightShadowMap>()
             .optional()
             .build();
 
-        query.run(|mut it| while it.next() {
-            let directional_light = it.field::<&DirectionalLight>(0).unwrap();
-            let transform = it.field::<&Transform>(1).unwrap();
-            let has_shadow_maps = it.is_set(2); // DirectionalLightShadowMap
+        query.run(|mut it| {
+            while it.next() {
+                let directional_light = it.field::<&DirectionalLight>(0).unwrap();
+                let transform = it.field::<&Transform>(1).unwrap();
+                let has_shadow_maps = it.is_set(2); // DirectionalLightShadowMap
 
-            for i in it.iter() {
-                directional_lights.push(mesh_shaders::fs::DirectionalLight {
-                    direction: (transform[i].rotation * Vec3::NEG_Z).to_array().into(),
-                    color: directional_light[i].color.to_array().into(),
-                    has_shadow_maps: has_shadow_maps.into(),
-                });
+                for i in it.iter() {
+                    directional_lights.push(mesh_shaders::fs::DirectionalLight {
+                        direction: (transform[i].rotation * Vec3::NEG_Z).to_array().into(),
+                        color: directional_light[i].color.to_array().into(),
+                        has_shadow_maps: has_shadow_maps.into(),
+                    });
+                }
             }
         });
 
@@ -1164,12 +1147,11 @@ impl Renderer {
 
         let inverse_camera_proj = camera_projection.inverse();
 
-        let full_frustum_corners = NDC_CORNERS
-            .map(|ndc_corner| {
-                let corner = inverse_camera_proj * ndc_corner.extend(1.0);
-                corner.xyz() / corner.w
-            });
-        
+        let full_frustum_corners = NDC_CORNERS.map(|ndc_corner| {
+            let corner = inverse_camera_proj * ndc_corner.extend(1.0);
+            corner.xyz() / corner.w
+        });
+
         let mut light_space_matrices = [Mat4::IDENTITY; SHADOW_MAP_CASCADE_COUNT as usize];
         let mut split_depths = [0.0; SHADOW_MAP_CASCADE_COUNT as usize];
 
@@ -1239,7 +1221,6 @@ impl Renderer {
                         50.0,
                     );
 
-
                 let light_view = Mat4::look_to_rh(
                     frustum_center, // TODO: Use camera pos?
                     light_direction,
@@ -1264,7 +1245,10 @@ impl Renderer {
         }
     }
 
-    fn create_framebuffers(&self, image_views: &[Arc<ImageView>]) -> Vec<Arc<Framebuffer>> {
+    fn create_framebuffers(
+        &self,
+        image_views: &[Arc<ImageView>],
+    ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
         let extent = image_views[0].image().extent();
 
         let depth_buffer = ImageView::new_default(
@@ -1280,8 +1264,7 @@ impl Renderer {
                 AllocationCreateInfo::default(),
             )
             .unwrap(),
-        )
-        .unwrap();
+        )?;
 
         let framebuffers = image_views
             .iter()
@@ -1297,13 +1280,13 @@ impl Renderer {
             })
             .collect::<Vec<_>>();
 
-        framebuffers
+        Ok(framebuffers)
     }
 
     pub fn resize_and_create_framebuffers(
         &mut self,
         image_views: &[Arc<ImageView>],
-    ) -> Vec<Arc<Framebuffer>> {
+    ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
         let extent = Vec2::new(
             image_views[0].image().extent()[0] as f32,
             image_views[0].image().extent()[1] as f32,
@@ -1317,8 +1300,8 @@ impl Renderer {
             &self.mesh_fs,
             &self.sampler,
             &self.shadow_map_sampler,
-        );
-        
+        )?;
+
         self.skybox_pipeline = create_skybox_pipeline(
             extent,
             Subpass::from(self.render_pass.clone(), 1).unwrap(),
@@ -1326,35 +1309,40 @@ impl Renderer {
             &self.skybox_vs,
             &self.skybox_fs,
             &self.sampler,
-        );
+        )?;
 
-        self.create_framebuffers(&image_views)
+        Ok(self.create_framebuffers(&image_views)?)
     }
 
-    pub fn apply_changed_settings(&mut self) {
-        if self.settings.light_culling_max_lights_per_tile != self.old_light_culling_max_lights_per_tile {
+    pub fn apply_changed_settings(&mut self) -> Result<(), RendererError> {
+        if self.settings.light_culling_max_lights_per_tile
+            != self.old_light_culling_max_lights_per_tile
+        {
             self.light_culling_pipeline = create_light_culling_pipeline(
                 &self.device,
-                &self.light_culling_cs_module, 
+                &self.light_culling_cs_module,
                 self.settings.light_culling_max_lights_per_tile,
-            );
-            self.old_light_culling_max_lights_per_tile = self.settings.light_culling_max_lights_per_tile;
+            )?;
+            self.old_light_culling_max_lights_per_tile =
+                self.settings.light_culling_max_lights_per_tile;
         }
 
         if self.settings.cascaded_shadow_map_level_size != self.shadow_map_framebuffer.extent()[0] {
             self.shadow_map_framebuffer = create_shadow_map_framebuffer(
-                &self.memory_allocator, 
+                &self.memory_allocator,
                 &self.shadow_mapping_render_pass,
                 self.settings.cascaded_shadow_map_level_size,
-            );
+            )?;
             self.shadow_mapping_pipeline = create_shadow_map_pipeline(
                 Vec2::from(self.shadow_map_framebuffer.extent().map(|x| x as f32)),
                 &self.shadow_mapping_render_pass,
                 &self.memory_allocator,
                 &self.shadow_mapping_vs,
                 &self.shadow_mapping_fs,
-            );
+            )?;
         }
+
+        Ok(())
     }
 
     /// Returns true if the swapchain needs to be recreated
@@ -1363,21 +1351,21 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         framebuffer: &Arc<Framebuffer>,
         camera: &Camera,
-    ) {
+    ) -> Result<(), RendererError> {
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
-        self.add_materials_and_textures_to_descriptor_set();
+        self.add_materials_and_textures_to_descriptor_set()?;
         let point_lights_buffer = self.create_point_lights_storage_buffer();
         let directional_lights_buffer = self.create_directional_lights_storage_buffer();
 
-        self.apply_changed_settings();
+        self.apply_changed_settings()?;
 
         let shadow_map_matrices_and_splits =
             self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
 
         let timer = ProfileTimer::start("cull_lights");
         let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
-            self.cull_lights(builder, &camera, aspect_ratio, &point_lights_buffer);
+            self.cull_lights(builder, &camera, aspect_ratio, &point_lights_buffer)?;
         drop(timer);
 
         let entities_data_and_indirect_commands =
@@ -1393,25 +1381,23 @@ impl Renderer {
                     &entities_data,
                     &indirect_commands,
                     &light_space_matrices,
-                );
+                )?;
                 drop(timer);
             }
         }
 
         let timer = ProfileTimer::start("begin_render_pass");
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into()), Some(1f32.into())],
+        builder.begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into()), Some(1f32.into())],
 
-                    ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )?;
         drop(timer);
 
         if let Some((entities_data, indirect_commands)) =
@@ -1429,29 +1415,29 @@ impl Renderer {
                 &entities_data,
                 &indirect_commands,
                 &shadow_map_matrices_and_splits,
-            );
+            )?;
             drop(timer);
         }
 
         let timer = ProfileTimer::start("next_subpass");
-        builder
-            .next_subpass(
-                SubpassEndInfo::default(),
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        builder.next_subpass(
+            SubpassEndInfo::default(),
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )?;
         drop(timer);
 
         let timer = ProfileTimer::start("draw_skybox");
-        self.draw_skybox(builder, &camera, aspect_ratio);
+        self.draw_skybox(builder, &camera, aspect_ratio)?;
         drop(timer);
 
         let timer = ProfileTimer::start("end_render_pass");
-        builder.end_render_pass(Default::default()).unwrap();
+        builder.end_render_pass(Default::default())?;
         drop(timer);
+
+        Ok(())
     }
 
     fn render_shadow_maps(
@@ -1460,20 +1446,18 @@ impl Renderer {
         entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
         indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
         light_space_matrices: &[Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
-    ) {
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some(1f32.into())],
+    ) -> Result<(), RendererError> {
+        builder.begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(1f32.into())],
 
-                    ..RenderPassBeginInfo::framebuffer(self.shadow_map_framebuffer.clone())
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+                ..RenderPassBeginInfo::framebuffer(self.shadow_map_framebuffer.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )?;
 
         let light_data_buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
         *light_data_buffer.write().unwrap() = shadow_mapping_shaders::vs::LightData {
@@ -1488,21 +1472,16 @@ impl Renderer {
                 WriteDescriptorSet::buffer(1, entities_data.clone()),
             ],
             [],
-        )
-        .unwrap();
+        )?;
 
-        builder
-            .bind_pipeline_graphics(self.shadow_mapping_pipeline.clone())
-            .unwrap();
+        builder.bind_pipeline_graphics(self.shadow_mapping_pipeline.clone())?;
 
-        builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.shadow_mapping_pipeline.layout().clone(),
-                0,
-                descriptor_set.clone(),
-            )
-            .unwrap();
+        builder.bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            self.shadow_mapping_pipeline.layout().clone(),
+            0,
+            descriptor_set.clone(),
+        )?;
 
         let vertex_buffer;
         let index_buffer;
@@ -1513,14 +1492,14 @@ impl Renderer {
         }
 
         builder
-            .bind_vertex_buffers(0, vertex_buffer.clone())
-            .unwrap()
-            .bind_index_buffer(index_buffer.clone())
-            .unwrap();
+            .bind_vertex_buffers(0, vertex_buffer.clone())?
+            .bind_index_buffer(index_buffer.clone())?;
 
-        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }.unwrap();
+        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }?;
 
-        builder.end_render_pass(Default::default()).unwrap();
+        builder.end_render_pass(Default::default())?;
+
+        Ok(())
     }
 
     fn cull_lights(
@@ -1529,7 +1508,7 @@ impl Renderer {
         camera: &Camera,
         aspect_ratio: f32,
         point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
-    ) -> (Subbuffer<[u32]>, Arc<ImageView>) {
+    ) -> Result<(Subbuffer<[u32]>, Arc<ImageView>), RendererError> {
         let next_ligth_index_global_storage_buffer = self
             .in_device_storage_buffer_allocator
             .allocate_slice::<light_culling::cs::NextLigthIndexGlobal>(4) // allocating 1 freezes
@@ -1540,14 +1519,12 @@ impl Renderer {
             size_of::<light_culling::cs::NextLigthIndexGlobal>(),
             size_of::<u32>()
         );
-        builder
-            .fill_buffer(
-                next_ligth_index_global_storage_buffer
-                    .clone()
-                    .reinterpret::<[u32]>(),
-                0,
-            )
-            .unwrap();
+        builder.fill_buffer(
+            next_ligth_index_global_storage_buffer
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )?;
 
         let width = self
             .mesh_pipeline
@@ -1575,7 +1552,11 @@ impl Renderer {
         let visible_light_indices_storage_buffer = self
             .in_device_storage_buffer_allocator
             .allocate_slice::<u32>(
-                (num_tiles.x * num_tiles.y * num_tiles.z * self.settings.light_culling_max_lights_per_tile) as DeviceSize,
+                (num_tiles.x
+                    * num_tiles.y
+                    * num_tiles.z
+                    * self.settings.light_culling_max_lights_per_tile)
+                    as DeviceSize,
             )
             .unwrap();
 
@@ -1593,7 +1574,7 @@ impl Renderer {
         .unwrap();
 
         let lights_from_tile_storage_image_view =
-            ImageView::new_default(lights_from_tile_storage_image).unwrap();
+            ImageView::new_default(lights_from_tile_storage_image)?;
 
         let frame_uniform_buffer = {
             let view = Mat4::look_to_rh(
@@ -1646,26 +1627,23 @@ impl Renderer {
                 WriteDescriptorSet::image_view(4, lights_from_tile_storage_image_view.clone()),
             ],
             [],
-        )
-        .unwrap();
+        )?;
 
         builder
-            .bind_pipeline_compute(self.light_culling_pipeline.clone())
-            .unwrap()
+            .bind_pipeline_compute(self.light_culling_pipeline.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
                 self.light_culling_pipeline.layout().clone(),
                 0,
                 set,
-            )
-            .unwrap();
+            )?;
 
-        unsafe { builder.dispatch(num_tiles.to_array()) }.unwrap();
+        unsafe { builder.dispatch(num_tiles.to_array()) }?;
 
-        (
+        Ok((
             visible_light_indices_storage_buffer,
             lights_from_tile_storage_image_view,
-        )
+        ))
     }
 
     fn get_entities_data_and_indirect_draw_commands(
@@ -1740,8 +1718,11 @@ impl Renderer {
         lights_from_tile_storage_image_view: &Arc<ImageView>,
         entities_data: &Subbuffer<[mesh_shaders::vs::EntityData]>,
         indirect_commands: &Subbuffer<[DrawIndexedIndirectCommand]>,
-        shadow_map_matrices_and_splits: &Option<([f32; SHADOW_MAP_CASCADE_COUNT as usize], [Mat4; SHADOW_MAP_CASCADE_COUNT as usize])>
-    ) {
+        shadow_map_matrices_and_splits: &Option<(
+            [f32; SHADOW_MAP_CASCADE_COUNT as usize],
+            [Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
+        )>,
+    ) -> Result<(), RendererError> {
         let view = Mat4::look_to_rh(
             camera.position,
             (camera.rotation * Vec3::NEG_Z).normalize(),
@@ -1767,7 +1748,7 @@ impl Renderer {
                 .extent[1];
             let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
                 * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
-            
+
             let cascade_splits = shadow_map_matrices_and_splits
                 .map(|tuple| tuple.0)
                 .unwrap_or([0.0; SHADOW_MAP_CASCADE_COUNT as usize]);
@@ -1791,7 +1772,10 @@ impl Renderer {
                 cutoff_distances: cascade_splits.map(|split| split.into()),
                 light_culling_tile_size: self.settings.light_culling_tile_size,
                 light_culling_z_slices: self.settings.light_culling_z_slices.into(),
-                light_culling_sample_count_per_level: self.settings.sample_count_per_level.map(|x| x.into()),
+                light_culling_sample_count_per_level: self
+                    .settings
+                    .sample_count_per_level
+                    .map(|x| x.into()),
                 shadow_map_bias: self.settings.shadow_map_bias.into(),
                 shadow_map_slope_bias: self.settings.shadow_map_slope_bias.into(),
                 penumbra_filter_size: self.settings.penumbra_max_size.into(),
@@ -1854,34 +1838,29 @@ impl Renderer {
                 ),
             ],
             [],
-        )
-        .unwrap();
+        )?;
 
-        builder
-            .bind_pipeline_graphics(self.mesh_pipeline.clone())
-            .unwrap();
+        builder.bind_pipeline_graphics(self.mesh_pipeline.clone())?;
 
-        builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.mesh_pipeline.layout().clone(),
-                0,
-                (
-                    self.slow_changing_descriptor_set.clone(),
-                    frame_descriptor_set.clone(),
-                ),
-            )
-            .unwrap();
+        builder.bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            self.mesh_pipeline.layout().clone(),
+            0,
+            (
+                self.slow_changing_descriptor_set.clone(),
+                frame_descriptor_set.clone(),
+            ),
+        )?;
 
         let asset_database_read = self.asset_database.read().unwrap();
         builder
-            .bind_vertex_buffers(0, asset_database_read.vertex_buffer().clone())
-            .unwrap()
-            .bind_index_buffer(asset_database_read.index_buffer().clone())
-            .unwrap();
+            .bind_vertex_buffers(0, asset_database_read.vertex_buffer().clone())?
+            .bind_index_buffer(asset_database_read.index_buffer().clone())?;
         drop(asset_database_read);
 
-        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }.unwrap();
+        unsafe { builder.draw_indexed_indirect(indirect_commands.clone()) }?;
+
+        Ok(())
     }
 
     fn draw_skybox(
@@ -1889,10 +1868,8 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         camera: &Camera,
         aspect_ratio: f32,
-    ) {
-        builder
-            .bind_pipeline_graphics(self.skybox_pipeline.clone())
-            .unwrap();
+    ) -> Result<(), RendererError> {
+        builder.bind_pipeline_graphics(self.skybox_pipeline.clone())?;
 
         let mut environment_map = None;
         self.world
@@ -1918,8 +1895,7 @@ impl Renderer {
                     .clone(),
             )],
             [],
-        )
-        .unwrap();
+        )?;
         drop(asset_database_read);
 
         let frame_uniform_buffer = {
@@ -1947,8 +1923,7 @@ impl Renderer {
             self.skybox_pipeline.layout().set_layouts()[1].clone(),
             [WriteDescriptorSet::buffer(0, frame_uniform_buffer)],
             [],
-        )
-        .unwrap();
+        )?;
 
         builder
             .bind_descriptor_sets(
@@ -1959,14 +1934,13 @@ impl Renderer {
                     environment_descriptor_set.clone(),
                     frame_descriptor_set.clone(),
                 ),
-            )
-            .unwrap()
-            .bind_vertex_buffers(0, self.cube_vertex_buffer.clone())
-            .unwrap()
-            .bind_index_buffer(self.cube_index_buffer.clone())
-            .unwrap();
+            )?
+            .bind_vertex_buffers(0, self.cube_vertex_buffer.clone())?
+            .bind_index_buffer(self.cube_index_buffer.clone())?;
 
-        unsafe { builder.draw_indexed(self.cube_index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
+        unsafe { builder.draw_indexed(self.cube_index_buffer.len() as u32, 1, 0, 0, 0) }?;
+
+        Ok(())
     }
 }
 

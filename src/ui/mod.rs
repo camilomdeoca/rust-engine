@@ -1,17 +1,18 @@
-use std::{sync::{Arc, RwLock}, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use camera_view::CameraView;
 use egui::{Frame, Margin};
 use egui_tiles::Tree;
 use egui_winit_vulkano::Gui;
 use flecs_ecs::core::World;
-use scene_tree::SceneTree;
 use renderer_settings_edit::RendererSettingsEdit;
+use scene_tree::SceneTree;
 use vulkano::{
     command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer},
-    image::
-        view::ImageView
-    ,
+    image::view::ImageView,
     memory::allocator::MemoryAllocator,
     render_pass::Framebuffer,
     sync::GpuFuture,
@@ -20,11 +21,11 @@ use winit::event::WindowEvent;
 
 use crate::{camera::Camera, renderer::Renderer};
 
-pub mod logger;
 pub mod camera_view;
-pub mod scene_tree;
-pub mod renderer_settings_edit;
 pub mod edit_widgets;
+pub mod logger;
+pub mod renderer_settings_edit;
+pub mod scene_tree;
 
 pub enum Pane {
     CameraView(CameraView),
@@ -88,7 +89,8 @@ impl UserInterface {
                 .renderer
                 .write()
                 .unwrap()
-                .draw(builder, &framebuffer, &camera);
+                .draw(builder, &framebuffer, &camera)
+                .unwrap();
         }
         self.behavior.cameras_to_draw.clear();
     }
@@ -121,18 +123,26 @@ impl UserInterface {
             tiles.insert_tab_tile(vec![old_root, id])
         });
     }
-    
+
     pub fn add_scene_tree(&mut self, world: World) {
-        let id = self.tree.tiles.insert_pane(Pane::SceneTree(SceneTree::new(world)));
+        let id = self
+            .tree
+            .tiles
+            .insert_pane(Pane::SceneTree(SceneTree::new(world)));
         self.tree.root = Some({
             let old_root = self.tree.root().unwrap();
             let tiles = &mut self.tree.tiles;
             tiles.insert_tab_tile(vec![old_root, id])
         });
     }
-    
+
     pub fn add_renderer_settings_editor(&mut self, renderer: Arc<RwLock<Renderer>>) {
-        let id = self.tree.tiles.insert_pane(Pane::RendererSettingsEdit(RendererSettingsEdit::new(renderer)));
+        let id =
+            self.tree
+                .tiles
+                .insert_pane(Pane::RendererSettingsEdit(RendererSettingsEdit::new(
+                    renderer,
+                )));
         self.tree.root = Some({
             let old_root = self.tree.root().unwrap();
             let tiles = &mut self.tree.tiles;
@@ -141,7 +151,11 @@ impl UserInterface {
     }
 
     pub fn get_focused_camera(&mut self) -> Option<&mut Camera> {
-        let tile = self.tree.tiles.get_mut(self.behavior.focused_camera?).unwrap();
+        let tile = self
+            .tree
+            .tiles
+            .get_mut(self.behavior.focused_camera?)
+            .unwrap();
 
         let pane = match tile {
             egui_tiles::Tile::Pane(pane) => pane,
@@ -234,4 +248,3 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
         }
     }
 }
-

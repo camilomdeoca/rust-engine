@@ -3,7 +3,14 @@ use std::sync::{Arc, RwLock};
 use egui::{load::SizedTexture, ImageSource, Sense, Ui};
 use egui_winit_vulkano::Gui;
 use glam::UVec2;
-use vulkano::{format::Format, image::{sampler::SamplerCreateInfo, view::ImageView, Image, ImageCreateInfo, ImageType, ImageUsage}, memory::allocator::{AllocationCreateInfo, MemoryAllocator}, render_pass::Framebuffer};
+use vulkano::{
+    format::Format,
+    image::{
+        sampler::SamplerCreateInfo, view::ImageView, Image, ImageCreateInfo, ImageType, ImageUsage,
+    },
+    memory::allocator::{AllocationCreateInfo, MemoryAllocator},
+    render_pass::Framebuffer,
+};
 
 use crate::{camera::Camera, renderer::Renderer};
 
@@ -27,7 +34,7 @@ impl CameraView {
     pub fn camera(&self) -> &Camera {
         &self.camera
     }
-    
+
     pub fn camera_mut(&mut self) -> &mut Camera {
         &mut self.camera
     }
@@ -61,13 +68,15 @@ impl CameraView {
         }
 
         // Render the renderer framebuffer
-        let response = ui.image(ImageSource::Texture(SizedTexture::new(
-            self.egui_texture_ids[image_index as usize].clone(),
-            (
-                self.image_views[image_index].image().extent()[0] as f32,
-                self.image_views[image_index].image().extent()[1] as f32,
-            ),
-        ))).interact(Sense::click());
+        let response = ui
+            .image(ImageSource::Texture(SizedTexture::new(
+                self.egui_texture_ids[image_index as usize].clone(),
+                (
+                    self.image_views[image_index].image().extent()[0] as f32,
+                    self.image_views[image_index].image().extent()[1] as f32,
+                ),
+            )))
+            .interact(Sense::click());
         cameras_to_draw.push((self.camera.clone(), self.framebuffers[image_index].clone()));
 
         return response.clicked();
@@ -110,7 +119,11 @@ impl CameraView {
             );
         }
 
-        self.framebuffers = renderer.write().unwrap().resize_and_create_framebuffers(&self.image_views);
+        self.framebuffers = renderer
+            .write()
+            .unwrap()
+            .resize_and_create_framebuffers(&self.image_views)
+            .unwrap();
 
         self.egui_texture_ids = self
             .image_views
