@@ -73,8 +73,9 @@ layout(set = 1, binding = 0) uniform FrameUniforms {
     uint light_culling_tile_size;
     uint light_culling_z_slices;
     uint light_culling_sample_count_per_level[SHADOW_MAP_CASCADE_COUNT];
-    float shadow_map_bias;
-    float shadow_map_slope_bias;
+    float shadow_bias;
+    float shadow_slope_bias;
+    float shadow_normal_bias;
     float penumbra_filter_size;
     mat4 light_space_matrices[SHADOW_MAP_CASCADE_COUNT];
 };
@@ -435,10 +436,11 @@ void main()
         vec3 light_direction = normalize(-light.direction);
         vec3 radiance = light.color;
         
-        float NdotL = dot(N, light_direction);
+        vec3 beforeNormalMappingNormal = normalize(v_TBN * vec3(0.0, 0.0, 1.0));
+        float beforeNormalMappingNdotL = dot(N, light_direction);
 
         float shadow = 0.0;
-        if (light.has_shadow_maps && NdotL > 0.0)
+        if (light.has_shadow_maps && beforeNormalMappingNdotL > 0.0)
         {
             uint level = 0;
             for (uint i = 0; i < SHADOW_MAP_CASCADE_COUNT - 1; i++)
@@ -455,8 +457,6 @@ void main()
                 0.0, 0.0, 1.0, 0.0,
                 0.5, 0.5, 0.0, 1.0
             );
-            vec4 pos_light_space = bias_mat * light_space_matrices[level] * vec4(v_pos, 1.0);
-            vec3 projected_coords = pos_light_space.xyz / pos_light_space.w;
 
             //float bias = shadow_map_base_bias;
             //bias = max(bias * (1.0 - dot(N, light_direction)), bias);
@@ -466,10 +466,18 @@ void main()
             // float maxSlope = max(abs(dzdx), abs(dzdy));
             // float bias = shadow_map_bias + shadow_map_slope_bias * maxSlope;
 
-            float bias = shadow_map_bias + shadow_map_slope_bias * (1.0 - NdotL);
+            // from level cutoff_distance
+            float bias_growth = sqrt(cutoff_distances[level]/cutoff_distances[0]);
+            // float bias_growth = 1.0;
 
-            //bias *= cutoff_distances[level]/cutoff_distances[0];
-            bias *= sqrt(sqrt(cutoff_distances[level]/cutoff_distances[0]));
+            float bias = shadow_bias + shadow_slope_bias * (1.0 - beforeNormalMappingNdotL);
+
+            bias *= bias_growth;
+
+            vec4 pos_light_space = bias_mat
+                * light_space_matrices[level]
+                * vec4(v_pos + beforeNormalMappingNormal * shadow_normal_bias * bias_growth, 1.0);
+            vec3 projected_coords = pos_light_space.xyz / pos_light_space.w;
 
             // shadow = texture_project(projected_coords, level, bias);
             shadow = pcf_shadows(projected_coords, level, bias);

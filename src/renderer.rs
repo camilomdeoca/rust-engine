@@ -110,8 +110,9 @@ pub struct RendererSettings {
     pub light_culling_z_slices: u32,
     pub cascaded_shadow_map_level_size: u32,
     pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
-    pub shadow_map_bias: f32,
-    pub shadow_map_slope_bias: f32,
+    pub shadow_bias: f32,
+    pub shadow_slope_bias: f32,
+    pub shadow_normal_bias: f32,
     pub penumbra_max_size: f32,
     pub shadow_map_cascade_split_lambda: f32,
 }
@@ -122,12 +123,13 @@ impl Default for RendererSettings {
             light_culling_max_lights_per_tile: 64,
             light_culling_tile_size: 32,
             light_culling_z_slices: 32,
-            cascaded_shadow_map_level_size: 2048,
-            sample_count_per_level: [12, 10, 1, 1],
-            shadow_map_bias: 0.0005,
-            shadow_map_slope_bias: 0.0005,
+            cascaded_shadow_map_level_size: 1536,
+            sample_count_per_level: [10, 8, 2, 2],
+            shadow_bias: 0.0005,
+            shadow_slope_bias: 0.0005,
+            shadow_normal_bias: 0.012,
             penumbra_max_size: 0.0015,
-            shadow_map_cascade_split_lambda: 0.65,
+            shadow_map_cascade_split_lambda: 0.75,
         }
     }
 }
@@ -1776,8 +1778,9 @@ impl Renderer {
                     .settings
                     .sample_count_per_level
                     .map(|x| x.into()),
-                shadow_map_bias: self.settings.shadow_map_bias.into(),
-                shadow_map_slope_bias: self.settings.shadow_map_slope_bias.into(),
+                shadow_bias: self.settings.shadow_bias.into(),
+                shadow_slope_bias: self.settings.shadow_slope_bias.into(),
+                shadow_normal_bias: self.settings.shadow_normal_bias.into(),
                 penumbra_filter_size: self.settings.penumbra_max_size.into(),
                 light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
             };

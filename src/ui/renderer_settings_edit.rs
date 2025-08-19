@@ -58,9 +58,9 @@ impl RendererSettingsEdit {
         });
         
         ui.horizontal(|ui| {
-            let label = ui.label("Shadow map bias");
+            let label = ui.label("Shadow bias");
             ui.add(
-                egui::DragValue::new(&mut settings.shadow_map_bias)
+                egui::DragValue::new(&mut settings.shadow_bias)
                     .range(0.0..=1.0)
                     .speed(0.00001),
             )
@@ -68,7 +68,14 @@ impl RendererSettingsEdit {
             // ui.separator();
             let label = ui.label("slope bias");
             ui.add(
-                egui::DragValue::new(&mut settings.shadow_map_slope_bias)
+                egui::DragValue::new(&mut settings.shadow_slope_bias)
+                    .range(0.0..=1.0)
+                    .speed(0.00001),
+            )
+            .labelled_by(label.id);
+            let label = ui.label("normal bias");
+            ui.add(
+                egui::DragValue::new(&mut settings.shadow_normal_bias)
                     .range(0.0..=1.0)
                     .speed(0.00001),
             )
