@@ -191,7 +191,7 @@ pub fn load_gltf_scene(
                     .metallic_roughness_texture()
                     .map(|texture_info| get_texture_from_gltf_texture(&texture_info.texture()));
 
-                let ambient_oclussion = gltf_material
+                let ambient_occlusion = gltf_material
                     .occlusion_texture()
                     .map(|occlusion_texture| get_texture_from_gltf_texture(&occlusion_texture.texture()));
 
@@ -211,7 +211,7 @@ pub fn load_gltf_scene(
                     metallic_factor,
                     roughness_factor,
                     metallic_roughness,
-                    ambient_oclussion,
+                    ambient_occlusion,
                     emissive_factor,
                     emissive,
                     normal,

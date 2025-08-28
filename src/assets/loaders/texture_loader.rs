@@ -22,6 +22,8 @@ pub fn load_texture_from_buffer(
     extent: [u32; 2],
     pixel_data: &[u8],
 ) -> Result<Arc<ImageView>, String> {
+    let mip_levels = extent.iter().max().unwrap().ilog2();
+
     load_texture_from_buffer_impl(
         memory_allocator,
         command_buffer_allocator,
@@ -31,6 +33,7 @@ pub fn load_texture_from_buffer(
             image_type: ImageType::Dim2d,
             format,
             extent: [extent[0], extent[1], 1],
+            mip_levels,
             usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
             ..Default::default()
         },

@@ -24,9 +24,7 @@ use vulkano::{
     device::{Device, DeviceOwned, Queue},
     format::Format,
     image::{
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
-        view::ImageView,
-        Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage,
+        sampler::{BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE}, view::{ImageView, ImageViewCreateInfo}, Image, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageType, ImageUsage
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -68,7 +66,6 @@ use crate::{
         self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent,
         PointLight, Transform,
     },
-    profile::ProfileTimer,
 };
 
 // const MAX_LIGHTS_PER_TILE: u32 = 64;
@@ -115,6 +112,9 @@ pub struct RendererSettings {
     pub shadow_normal_bias: f32,
     pub penumbra_max_size: f32,
     pub shadow_map_cascade_split_lambda: f32,
+    pub sample_count: u32,
+    pub sample_radius: f32,
+    pub ambient_occlusion_intensity: f32,
 }
 
 impl Default for RendererSettings {
@@ -130,6 +130,9 @@ impl Default for RendererSettings {
             shadow_normal_bias: 0.012,
             penumbra_max_size: 0.0015,
             shadow_map_cascade_split_lambda: 0.75,
+            sample_count: 16,
+            sample_radius: 0.5,
+            ambient_occlusion_intensity: 1.0,
         }
     }
 }
@@ -148,6 +151,9 @@ pub struct Renderer {
 
     asset_database: Arc<RwLock<AssetDatabase>>,
 
+    g_buffer: Arc<Framebuffer>,
+    ambient_occlusion_buffer: Arc<Framebuffer>,
+
     render_pass: Arc<RenderPass>,
     mesh_vs: EntryPoint,
     mesh_fs: EntryPoint,
@@ -155,6 +161,14 @@ pub struct Renderer {
     skybox_vs: EntryPoint,
     skybox_fs: EntryPoint,
     skybox_pipeline: Arc<GraphicsPipeline>,
+
+    full_screen_quad_vs: EntryPoint,
+    post_processing_fs: EntryPoint,
+    ambient_occlusion_fs: EntryPoint,
+    post_processing_render_pass: Arc<RenderPass>,
+    post_processing_pipeline: Arc<GraphicsPipeline>,
+    ambient_occlusion_render_pass: Arc<RenderPass>,
+    ambient_occlusion_pipeline: Arc<GraphicsPipeline>,
 
     shadow_mapping_render_pass: Arc<RenderPass>,
     shadow_mapping_vs: EntryPoint,
@@ -171,8 +185,13 @@ pub struct Renderer {
     cube_vertex_buffer: Subbuffer<[Vertex]>,
     cube_index_buffer: Subbuffer<[u32]>,
 
+    full_screen_vertex_buffer: Subbuffer<[Vertex]>,
+    full_screen_index_buffer: Subbuffer<[u32]>,
+
     asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
 
+    nearest_sampler_float: Arc<Sampler>,
+    nearest_sampler_any: Arc<Sampler>,
     sampler: Arc<Sampler>,
     shadow_map_sampler: Arc<Sampler>,
 
@@ -192,6 +211,137 @@ pub struct Renderer {
 struct RendererAssetChangeListener {
     materials_changed: bool,
     textures_changed: bool,
+}
+
+fn create_g_buffer_framebuffer(
+    render_pass: &Arc<RenderPass>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    extent: [u32; 3],
+) -> Result<Arc<Framebuffer>, RendererError> {
+    // We need to build mip chain for rendering SSAO at lower resolution and to then upscale it
+    // with Joint Bilateral upsampling. We will also use it to sample smaller levels first:
+    // We will store the min of 4 pixels in each next mip level, and if when comparing the depth it
+    // is outside the radius then we dont sample bigger level as all will be bigger (they are
+    // behind)
+    let mip_levels = extent.iter().max().unwrap().ilog2();
+    let depth_buffer_image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::D32_SFLOAT,
+            extent,
+            mip_levels,
+            usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        AllocationCreateInfo::default(),
+    )
+    .unwrap();
+
+    let depth_buffer = ImageView::new(
+        depth_buffer_image.clone(),
+        ImageViewCreateInfo {
+            subresource_range: ImageSubresourceRange {
+                mip_levels: 0..1,
+                ..depth_buffer_image.subresource_range()
+            },
+            ..ImageViewCreateInfo::from_image(&depth_buffer_image)
+        },
+    )?;
+
+    let g_buffer = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R32G32_UINT,
+                extent,
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )?;
+
+    Ok(Framebuffer::new(
+        render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![g_buffer.clone(), depth_buffer.clone()],
+            ..Default::default()
+        },
+    )?)
+}
+
+fn create_ambient_occlusion_framebuffer(
+    render_pass: &Arc<RenderPass>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    extent: [u32; 3],
+) -> Result<Arc<Framebuffer>, RendererError> {
+    let extent = [
+        (extent[0] as f32 * 1.0) as u32,
+        (extent[1] as f32 * 1.0) as u32,
+        extent[2],
+    ];
+
+    let ambient_occlusion_buffer = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R8_UNORM,
+                extent,
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )?;
+
+    Ok(Framebuffer::new(
+        render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![ambient_occlusion_buffer.clone()],
+            ..Default::default()
+        },
+    )?)
+}
+
+fn create_main_render_pass(
+    device: &Arc<Device>,
+) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
+    vulkano::ordered_passes_renderpass!(
+        device.clone(),
+        attachments: {
+            g_buffer: {
+                format: Format::R32G32_UINT,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+            depth_stencil: {
+                format: Format::D32_SFLOAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        passes: [
+            // Mesh rendering
+            {
+                color: [g_buffer],
+                depth_stencil: {depth_stencil},
+                input: []
+            },
+            // Skybox (after so it doesnt draw behind the meshes)
+            {
+                color: [g_buffer],
+                depth_stencil: {depth_stencil},
+                input: []
+            }
+        ]
+    )
 }
 
 fn create_mesh_pipeline(
@@ -348,6 +498,184 @@ fn create_skybox_pipeline(
                 ColorBlendAttachmentState::default(),
             )),
             subpass: Some(skybox_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+}
+
+fn create_post_processing_render_pass(
+    device: &Arc<Device>,
+    output_format: Format,
+) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
+    vulkano::ordered_passes_renderpass!(
+        device.clone(),
+        attachments: {
+            final_color: {
+                format: output_format,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        passes: [
+            {
+                color: [final_color],
+                depth_stencil: {},
+                input: []
+            },
+        ]
+    )
+}
+
+fn create_post_processing_pipeline(
+    extent: Vec2,
+    sub_pass: Subpass,
+    device: &Arc<Device>,
+    vs: &EntryPoint,
+    fs: &EntryPoint,
+    sampler: &Arc<Sampler>,
+) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: extent.into(),
+        depth_range: 0.0..=1.0,
+    };
+
+    let pipeline_stages = [
+        PipelineShaderStageCreateInfo::new(vs.clone()),
+        PipelineShaderStageCreateInfo::new(fs.clone()),
+    ];
+    let mut layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&pipeline_stages);
+
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .immutable_samplers = vec![sampler.clone()];
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )?;
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(vs)?),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport.clone()].into_iter().collect(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                sub_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(sub_pass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+}
+
+fn create_ambient_occlusion_render_pass(
+    device: &Arc<Device>,
+) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
+    vulkano::ordered_passes_renderpass!(
+        device.clone(),
+        attachments: {
+            ao_output: {
+                format: Format::R8_UNORM,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        passes: [
+            // Ambient occlusion
+            {
+                color: [ao_output],
+                depth_stencil: {},
+                input: []
+            },
+        ]
+    )
+}
+
+fn create_ambient_occlusion_pipeline(
+    extent: Vec2,
+    sub_pass: Subpass,
+    device: &Arc<Device>,
+    vs: &EntryPoint,
+    fs: &EntryPoint,
+    sampler_float: &Arc<Sampler>,
+    sampler_uint: &Arc<Sampler>,
+) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
+    let extent = Vec2::new(
+        (extent.x * 1.0).trunc(),
+        (extent.y * 1.0).trunc(),
+    );
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: extent.into(),
+        depth_range: 0.0..=1.0,
+    };
+
+    let pipeline_stages = [
+        PipelineShaderStageCreateInfo::new(vs.clone()),
+        PipelineShaderStageCreateInfo::new(fs.clone()),
+    ];
+    let mut layout_create_info =
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&pipeline_stages);
+
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&0)
+        .unwrap()
+        .immutable_samplers = vec![sampler_float.clone()];
+    layout_create_info.set_layouts[0]
+        .bindings
+        .get_mut(&1)
+        .unwrap()
+        .immutable_samplers = vec![sampler_uint.clone()];
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        layout_create_info
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )?;
+
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(Vertex::per_vertex().definition(vs)?),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState {
+                viewports: [viewport.clone()].into_iter().collect(),
+                ..Default::default()
+            }),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                sub_pass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(sub_pass.into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -611,42 +939,11 @@ impl Renderer {
             &shadow_mapping_fs,
         )?;
 
-        let render_pass = vulkano::ordered_passes_renderpass!(
-            device.clone(),
-            attachments: {
-                color: {
-                    format: format,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: Store,
-                },
-                depth_stencil: {
-                    format: Format::D32_SFLOAT,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-            },
-            passes: [
-                // Mesh rendering
-                {
-                    color: [color],
-                    depth_stencil: {depth_stencil},
-                    input: []
-                },
-                // Skybox (after so it doesnt draw behind the meshes)
-                {
-                    color: [color],
-                    depth_stencil: {depth_stencil},
-                    input: []
-                }
-            ]
-        )?;
+        let render_pass = create_main_render_pass(&device)?;
 
         let mesh_vs = mesh_shaders::vs::load(device.clone())?
             .entry_point("main")
             .unwrap();
-
         let mesh_fs = mesh_shaders::fs::load(device.clone())?
             .entry_point("main")
             .unwrap();
@@ -657,6 +954,40 @@ impl Renderer {
         let skybox_fs = skybox_shaders::fs::load(device.clone())?
             .entry_point("main")
             .unwrap();
+
+        let full_screen_quad_vs = full_screen_quad::vs::load(device.clone())?
+            .entry_point("main")
+            .unwrap();
+        let post_processing_fs = post_processing_shaders::fs::load(device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let ambient_occlusion_fs = ambient_occlusion_shaders::fs::load(device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let nearest_sampler_float = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::ClampToBorder; 3],
+                border_color: BorderColor::FloatOpaqueWhite,
+                ..Default::default()
+            },
+        )?;
+        
+        let nearest_sampler_any = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )?;
 
         let sampler = Sampler::new(
             device.clone(),
@@ -683,6 +1014,22 @@ impl Renderer {
 
         let extent = Vec2::new(1280.0, 720.0);
 
+        let post_processing_render_pass = create_post_processing_render_pass(&device, format)?;
+        let post_processing_pipeline = create_post_processing_pipeline(
+            extent,
+            Subpass::from(post_processing_render_pass.clone(), 0).unwrap(),
+            &device,
+            &full_screen_quad_vs,
+            &post_processing_fs,
+            &nearest_sampler_any,
+        )?;
+
+        let g_buffer = create_g_buffer_framebuffer(
+            &render_pass,
+            &memory_allocator,
+            [extent.x as u32, extent.y as u32, 1],
+        )?;
+
         let mesh_pipeline = create_mesh_pipeline(
             extent,
             Subpass::from(render_pass.clone(), 0).unwrap(),
@@ -700,6 +1047,23 @@ impl Renderer {
             &skybox_vs,
             &skybox_fs,
             &sampler,
+        )?;
+
+        let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&device)?;
+        let ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
+            extent,
+            Subpass::from(ambient_occlusion_render_pass.clone(), 0).unwrap(),
+            &device,
+            &full_screen_quad_vs,
+            &ambient_occlusion_fs,
+            &nearest_sampler_float,
+            &nearest_sampler_any,
+        )?;
+
+        let ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
+            &ambient_occlusion_render_pass,
+            &memory_allocator,
+            [extent.x as u32, extent.y as u32, 1],
         )?;
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
@@ -767,6 +1131,41 @@ impl Renderer {
             ],
         )
         .unwrap();
+
+        let (full_screen_vertex_buffer, full_screen_index_buffer) =
+            load_mesh_from_buffers_into_new_buffers(
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                &queue,
+                vec![
+                    Vertex {
+                        a_position: [-1.0, -1.0, 0.5],
+                        a_normal: [0.0; 3],
+                        a_tangent: [0.0; 3],
+                        a_uv: [0.0; 2],
+                    },
+                    Vertex {
+                        a_position: [1.0, -1.0, 0.5],
+                        a_normal: [0.0; 3],
+                        a_tangent: [0.0; 3],
+                        a_uv: [0.0; 2],
+                    },
+                    Vertex {
+                        a_position: [-1.0, 1.0, 0.5],
+                        a_normal: [0.0; 3],
+                        a_tangent: [0.0; 3],
+                        a_uv: [0.0; 2],
+                    },
+                    Vertex {
+                        a_position: [1.0, 1.0, 0.5],
+                        a_normal: [0.0; 3],
+                        a_tangent: [0.0; 3],
+                        a_uv: [0.0; 2],
+                    },
+                ],
+                vec![2, 1, 0, 3, 1, 2],
+            )
+            .unwrap();
 
         let environment_cubemap_query = world
             .query::<&components::EnvironmentCubemap>()
@@ -877,13 +1276,24 @@ impl Renderer {
             indirect_buffer_allocator,
             asset_database,
 
+            g_buffer,
+            ambient_occlusion_buffer,
+
             render_pass,
             mesh_vs,
             mesh_fs,
+            mesh_pipeline,
             skybox_vs,
             skybox_fs,
-            mesh_pipeline,
             skybox_pipeline,
+
+            full_screen_quad_vs,
+            post_processing_fs,
+            ambient_occlusion_fs,
+            post_processing_render_pass,
+            post_processing_pipeline,
+            ambient_occlusion_render_pass,
+            ambient_occlusion_pipeline,
 
             shadow_mapping_render_pass,
             shadow_mapping_pipeline,
@@ -894,8 +1304,15 @@ impl Renderer {
             light_culling_pipeline,
             light_culling_cs_module,
             old_light_culling_max_lights_per_tile: settings.light_culling_max_lights_per_tile,
+
             cube_vertex_buffer,
             cube_index_buffer,
+
+            full_screen_vertex_buffer,
+            full_screen_index_buffer,
+
+            nearest_sampler_float,
+            nearest_sampler_any,
             sampler,
             shadow_map_sampler,
             materials_storage_buffer,
@@ -932,7 +1349,7 @@ impl Renderer {
                 .map(|material| {
                     let diffuse = material.diffuse.clone().map(|id| id.0);
                     let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
-                    let ambient_oclussion = material.ambient_oclussion.clone().map(|id| id.0);
+                    let ambient_occlusion = material.ambient_occlusion.clone().map(|id| id.0);
                     let emissive = material.emissive.clone().map(|id| id.0);
                     let normal = material.normal.clone().map(|id| id.0);
                     mesh_shaders::fs::Material {
@@ -942,7 +1359,7 @@ impl Renderer {
                         roughness_factor: material.roughness_factor.into(),
                         base_color_texture_id: diffuse.unwrap_or(u32::MAX),
                         metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
-                        ambient_oclussion_texture_id: ambient_oclussion.unwrap_or(u32::MAX).into(),
+                        ambient_occlusion_texture_id: ambient_occlusion.unwrap_or(u32::MAX).into(),
                         emissive_texture_id: emissive.unwrap_or(u32::MAX),
                         normal_texture_id: normal.unwrap_or(u32::MAX),
                         pad: [0; 3],
@@ -1251,30 +1668,13 @@ impl Renderer {
         &self,
         image_views: &[Arc<ImageView>],
     ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
-        let extent = image_views[0].image().extent();
-
-        let depth_buffer = ImageView::new_default(
-            Image::new(
-                self.memory_allocator.clone(),
-                ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
-                    format: Format::D32_SFLOAT,
-                    extent,
-                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                    ..Default::default()
-                },
-                AllocationCreateInfo::default(),
-            )
-            .unwrap(),
-        )?;
-
         let framebuffers = image_views
             .iter()
             .map(|image_view| {
                 Framebuffer::new(
-                    self.render_pass.clone(),
+                    self.post_processing_render_pass.clone(),
                     FramebufferCreateInfo {
-                        attachments: vec![image_view.clone(), depth_buffer.clone()],
+                        attachments: vec![image_view.clone()],
                         ..Default::default()
                     },
                 )
@@ -1289,6 +1689,16 @@ impl Renderer {
         &mut self,
         image_views: &[Arc<ImageView>],
     ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
+        let extent = image_views[0].image().extent();
+        self.g_buffer =
+            create_g_buffer_framebuffer(&self.render_pass, &self.memory_allocator, extent)?;
+
+        self.ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
+            &self.ambient_occlusion_render_pass,
+            &self.memory_allocator,
+            extent,
+        )?;
+
         let extent = Vec2::new(
             image_views[0].image().extent()[0] as f32,
             image_views[0].image().extent()[1] as f32,
@@ -1311,6 +1721,25 @@ impl Renderer {
             &self.skybox_vs,
             &self.skybox_fs,
             &self.sampler,
+        )?;
+
+        self.ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
+            extent,
+            Subpass::from(self.ambient_occlusion_render_pass.clone(), 0).unwrap(),
+            &self.device,
+            &self.full_screen_quad_vs,
+            &self.ambient_occlusion_fs,
+            &self.nearest_sampler_float,
+            &self.nearest_sampler_any,
+        )?;
+
+        self.post_processing_pipeline = create_post_processing_pipeline(
+            extent,
+            Subpass::from(self.post_processing_render_pass.clone(), 0).unwrap(),
+            &self.device,
+            &self.full_screen_quad_vs,
+            &self.post_processing_fs,
+            &self.nearest_sampler_any,
         )?;
 
         Ok(self.create_framebuffers(&image_views)?)
@@ -1365,10 +1794,8 @@ impl Renderer {
         let shadow_map_matrices_and_splits =
             self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
 
-        let timer = ProfileTimer::start("cull_lights");
         let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
             self.cull_lights(builder, &camera, aspect_ratio, &point_lights_buffer)?;
-        drop(timer);
 
         let entities_data_and_indirect_commands =
             self.get_entities_data_and_indirect_draw_commands();
@@ -1377,35 +1804,27 @@ impl Renderer {
             entities_data_and_indirect_commands.as_ref()
         {
             if let Some((_depth_splits, light_space_matrices)) = shadow_map_matrices_and_splits {
-                let timer = ProfileTimer::start("render_shadow_maps");
                 self.render_shadow_maps(
                     builder,
                     &entities_data,
                     &indirect_commands,
                     &light_space_matrices,
                 )?;
-                drop(timer);
             }
         }
 
-        let timer = ProfileTimer::start("begin_render_pass");
+        // main pass
         builder.begin_render_pass(
             RenderPassBeginInfo {
-                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into()), Some(1f32.into())],
-
-                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+                clear_values: vec![Some([0u32; 2].into()), Some(1f32.into())],
+                ..RenderPassBeginInfo::framebuffer(self.g_buffer.clone())
             },
-            SubpassBeginInfo {
-                contents: SubpassContents::Inline,
-                ..Default::default()
-            },
+            SubpassBeginInfo::default(),
         )?;
-        drop(timer);
 
         if let Some((entities_data, indirect_commands)) =
             entities_data_and_indirect_commands.as_ref()
         {
-            let timer = ProfileTimer::start("draw_meshes");
             self.draw_meshes(
                 builder,
                 &camera,
@@ -1418,26 +1837,39 @@ impl Renderer {
                 &indirect_commands,
                 &shadow_map_matrices_and_splits,
             )?;
-            drop(timer);
         }
 
-        let timer = ProfileTimer::start("next_subpass");
-        builder.next_subpass(
-            SubpassEndInfo::default(),
-            SubpassBeginInfo {
-                contents: SubpassContents::Inline,
-                ..Default::default()
-            },
-        )?;
-        drop(timer);
+        builder.next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?;
 
-        let timer = ProfileTimer::start("draw_skybox");
         self.draw_skybox(builder, &camera, aspect_ratio)?;
-        drop(timer);
 
-        let timer = ProfileTimer::start("end_render_pass");
         builder.end_render_pass(Default::default())?;
-        drop(timer);
+
+        // Ambient occlusion
+        builder.begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(self.ambient_occlusion_buffer.clone())
+            },
+            SubpassBeginInfo::default(),
+        )?;
+
+        self.ambient_occlusion_pass(builder, &camera, aspect_ratio)?;
+
+        builder.end_render_pass(Default::default())?;
+
+        // Post processing pass
+        builder.begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+            },
+            SubpassBeginInfo::default(),
+        )?;
+
+        self.post_processing_pass(builder)?;
+
+        builder.end_render_pass(Default::default())?;
 
         Ok(())
     }
@@ -1866,6 +2298,91 @@ impl Renderer {
         Ok(())
     }
 
+    fn ambient_occlusion_pass(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        camera: &Camera,
+        aspect_ratio: f32,
+    ) -> Result<(), RendererError> {
+        builder.bind_pipeline_graphics(self.ambient_occlusion_pipeline.clone())?;
+
+        let uniform_buffer = {
+            let view = Mat4::look_to_rh(
+                camera.position,
+                (camera.rotation * Vec3::NEG_Z).normalize(),
+                (camera.rotation * Vec3::Y).normalize(),
+            );
+            let proj = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::perspective_rh(camera.fov, aspect_ratio, 0.01, 100.0);
+
+            let uniform_data = ambient_occlusion_shaders::fs::Uniforms {
+                inverse_projection: proj.inverse().to_cols_array_2d(),
+                view: view.to_cols_array_2d(),
+                projection: proj.to_cols_array_2d(),
+                sample_count: self.settings.sample_count as f32,
+                sample_radius: self.settings.sample_radius,
+                intensity: self.settings.ambient_occlusion_intensity,
+            };
+
+            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *buffer.write().unwrap() = uniform_data;
+
+            buffer
+        };
+
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.ambient_occlusion_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::image_view(2, self.g_buffer.attachments()[0].clone()),
+                WriteDescriptorSet::image_view(3, self.g_buffer.attachments()[1].clone()),
+                WriteDescriptorSet::buffer(4, uniform_buffer.clone()),
+            ],
+            [],
+        )?;
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.ambient_occlusion_pipeline.layout().clone(),
+                0,
+                descriptor_set,
+            )?
+            .bind_vertex_buffers(0, self.full_screen_vertex_buffer.clone())?
+            .bind_index_buffer(self.full_screen_index_buffer.clone())?;
+        assert_eq!(self.full_screen_index_buffer.len(), 6);
+        unsafe { builder.draw_indexed(self.full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
+
+        Ok(())
+    }
+
+    fn post_processing_pass(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), RendererError> {
+        builder.bind_pipeline_graphics(self.post_processing_pipeline.clone())?;
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.post_processing_pipeline.layout().set_layouts()[0].clone(),
+            [
+                WriteDescriptorSet::image_view(1, self.g_buffer.attachments()[0].clone()),
+                WriteDescriptorSet::image_view(2, self.ambient_occlusion_buffer.attachments()[0].clone()),
+            ],
+            [],
+        )?;
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.post_processing_pipeline.layout().clone(),
+                0,
+                descriptor_set,
+            )?
+            .bind_vertex_buffers(0, self.full_screen_vertex_buffer.clone())?
+            .bind_index_buffer(self.full_screen_index_buffer.clone())?;
+        unsafe { builder.draw_indexed(self.full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
+
+        Ok(())
+    }
+
     fn draw_skybox(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
@@ -1984,6 +2501,33 @@ mod mesh_shaders {
         vulkano_shaders::shader! {
             ty: "fragment",
             path: "assets/shaders/fragment.glsl",
+        }
+    }
+}
+
+mod full_screen_quad {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            path: "assets/shaders/full_screen_quad.vs.glsl",
+        }
+    }
+}
+
+mod post_processing_shaders {
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/post_processing.fs.glsl",
+        }
+    }
+}
+
+mod ambient_occlusion_shaders {
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/ambient_occlusion.fs.glsl",
         }
     }
 }

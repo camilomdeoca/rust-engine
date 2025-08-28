@@ -101,6 +101,36 @@ impl RendererSettingsEdit {
             .labelled_by(label.id);
         });
 
+        ui.collapsing("Ambient occlusion", |ui| {
+            ui.horizontal(|ui| {
+                let label = ui.label("Sample count");
+                ui.add(
+                    egui::DragValue::new(&mut settings.sample_count)
+                        .range(0..=128)
+                        .speed(0.1),
+                )
+                .labelled_by(label.id);
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label("Sample radius");
+                ui.add(
+                    egui::DragValue::new(&mut settings.sample_radius)
+                        .range(0.0..=30.0)
+                        .speed(0.01),
+                )
+                .labelled_by(label.id);
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label("Intensity");
+                ui.add(
+                    egui::DragValue::new(&mut settings.ambient_occlusion_intensity)
+                        .range(0.0..=10.0)
+                        .speed(0.01),
+                )
+                .labelled_by(label.id);
+            });
+        });
+
         ui.add(ArrayDragEdit::new(&mut settings.sample_count_per_level));
     }
 }

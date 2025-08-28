@@ -527,7 +527,7 @@ impl ApplicationHandler for App {
                     SwapchainCreateInfo {
                         min_image_count: surface_capabilities.min_image_count.max(2),
                         image_format,
-                        present_mode: PresentMode::Fifo,
+                        present_mode: PresentMode::Immediate,
                         image_extent: window_size.into(),
                         image_usage: ImageUsage::COLOR_ATTACHMENT,
                         composite_alpha: surface_capabilities

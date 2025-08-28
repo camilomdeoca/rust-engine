@@ -1,6 +1,9 @@
 #version 460
 
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_ARB_shading_language_include : require
+
+#include "packing.glsl"
 
 const uint SHADOW_MAP_CASCADE_COUNT = 4; // Cant be specialization constant if we still want
                                          // to have vulkano-shaders do all the nice things
@@ -11,7 +14,7 @@ layout(location = 2) in vec2 v_uv;
 layout(location = 3) flat in int v_draw_id;
 layout(location = 4) in mat3 v_TBN;
 
-layout(location = 0) out vec4 f_color;
+layout(location = 0) out uvec2 g_buffer;
 
 struct Material {
     vec4 base_color_factor;
@@ -19,7 +22,7 @@ struct Material {
     float metallic_factor;
     float roughness_factor;
     uint metallic_roughness_texture_id;
-    uint ambient_oclussion_texture_id;
+    uint ambient_occlusion_texture_id;
     vec3 emissive_factor;
     uint emissive_texture_id;
     uint normal_texture_id;
@@ -363,11 +366,11 @@ void main()
         roughness = material.roughness_factor;
     }
 
-    if (material.ambient_oclussion_texture_id != UINT_MAX)
+    if (material.ambient_occlusion_texture_id != UINT_MAX)
     {
         ao =
             texture(
-                nonuniformEXT(sampler2D(textures[material.ambient_oclussion_texture_id], s)),
+                nonuniformEXT(sampler2D(textures[material.ambient_occlusion_texture_id], s)),
                 v_uv
             ).r;
     }
@@ -390,6 +393,7 @@ void main()
         emissive = material.emissive_factor.rgb;
     }
 
+    vec3 beforeNormalMappingNormal = v_TBN[2];
     if (material.normal_texture_id != UINT_MAX)
     {
         N =
@@ -436,7 +440,6 @@ void main()
         vec3 light_direction = normalize(-light.direction);
         vec3 radiance = light.color;
         
-        vec3 beforeNormalMappingNormal = normalize(v_TBN * vec3(0.0, 0.0, 1.0));
         float beforeNormalMappingNdotL = dot(N, light_direction);
 
         float shadow = 0.0;
@@ -539,12 +542,14 @@ void main()
     // rendering to the screen it needs to be working
     //color = pow(color, vec3(1.0/2.2)); 
 
-    f_color = vec4(color, 1.0);
+    uint packed_color = pack11_10_11(color);
+    uint packed_normal = packHalf2x16(EncodeNormal(beforeNormalMappingNormal));
+    g_buffer = uvec2(packed_color, packed_normal);
 
     // float intensity = num_lights / (64 / 2.0);
     // f_color = vec4(vec3(intensity, intensity * 0.5, intensity * 0.5) + f_color.rgb * 0.25, 1.0); //light culling debug
-    if (num_lights >= 64)
-        f_color = vec4(1.0, 0.0, 0.0, 1.0);
+    // if (num_lights >= 64)
+    //     f_color = vec4(1.0, 0.0, 0.0, 1.0);
 
     // vec3 colors[] = {
     //     vec3(0.0, 1.0, 0.0),
