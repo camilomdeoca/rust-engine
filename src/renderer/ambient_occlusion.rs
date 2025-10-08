@@ -194,14 +194,14 @@ impl Renderer {
                 intensity: self.settings.ambient_occlusion_intensity,
             };
 
-            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            let buffer = self.context.uniform_buffer_allocator.allocate_sized().unwrap();
             *buffer.write().unwrap() = uniform_data;
 
             buffer
         };
 
         let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
+            self.context.descriptor_set_allocator.clone(),
             self.ambient_occlusion_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::image_view(2, self.g_buffer.attachments()[0].clone()),

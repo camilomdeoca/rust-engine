@@ -7,14 +7,14 @@ use vulkano::{
         BufferUsage, Subbuffer,
     },
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
+        PrimaryAutoCommandBuffer, RenderPassBeginInfo,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, layout::DescriptorType, DescriptorBufferInfo,
         DescriptorSet, WriteDescriptorSet,
     },
-    device::{Device, Queue},
+    device::Device,
     format::Format,
     image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
@@ -37,7 +37,6 @@ use vulkano::{
         PipelineShaderStageCreateInfo,
     },
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    sync::GpuFuture,
     DeviceSize,
 };
 
@@ -47,7 +46,6 @@ use crate::assets::{
 
 pub struct ImageBasedLightingMapsGenerator {
     device: Arc<Device>,
-    queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
@@ -345,7 +343,7 @@ fn create_prefiltered_environment_map_generation_pipeline(
 impl ImageBasedLightingMapsGenerator {
     pub fn new(
         device: Arc<Device>,
-        queue: Arc<Queue>,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         dst_image_format: Format,
     ) -> Self {
@@ -371,8 +369,7 @@ impl ImageBasedLightingMapsGenerator {
 
         let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            &queue,
+            builder,
             vec![
                 Vertex {
                     a_position: [-1.0, -1.0, 1.0],
@@ -437,8 +434,7 @@ impl ImageBasedLightingMapsGenerator {
 
         let (quad_vertex_buffer, quad_index_buffer) = load_mesh_from_buffers_into_new_buffers(
             memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            &queue,
+            builder,
             vec![
                 Vertex {
                     a_position: [-1.0, -1.0, 0.0],
@@ -483,7 +479,6 @@ impl ImageBasedLightingMapsGenerator {
 
         Self {
             device,
-            queue,
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
@@ -876,35 +871,19 @@ impl ImageBasedLightingMapsGenerator {
     // TODO: make this return a future of when it finishes rendering
     pub fn render_to_image(
         &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         environment_map: Arc<ImageView>,
         irradiance_map_image: Arc<Image>,
         prefiltered_environment_map_image: Arc<Image>,
         environment_brdf_lut_image: Arc<Image>,
     ) {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.command_buffer_allocator.clone(),
-            self.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        self.generate_maps(&mut builder, environment_map.clone(), irradiance_map_image);
+        self.generate_maps(builder, environment_map.clone(), irradiance_map_image);
         self.generate_prefiltered_environment_map(
-            &mut builder,
+            builder,
             environment_map.clone(),
             prefiltered_environment_map_image,
         );
-        self.generate_environment_brdf_lut(&mut builder, environment_brdf_lut_image);
-
-        let command_buffer = builder.build().unwrap();
-
-        command_buffer
-            .execute(self.queue.clone())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
+        self.generate_environment_brdf_lut(builder, environment_brdf_lut_image);
     }
 }
 

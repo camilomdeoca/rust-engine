@@ -8,36 +8,30 @@ use ambient_occlusion::{
     create_ambient_occlusion_pipeline, create_ambient_occlusion_render_pass,
 };
 use flecs_ecs::prelude::*;
-use glam::{Mat4, Vec2, Vec3};
-use light_culling::{create_light_culling_pipeline, light_culling_shader};
+use glam::{Mat4, UVec2, Vec2, Vec3};
+use light_culling::{create_light_culling_pipeline, light_culling_shader, LightCullingSettings};
 use main_pass::{
-    create_g_buffer_framebuffer, create_main_render_pass, create_mesh_pipeline,
-    create_skybox_pipeline, mesh_shaders, skybox_shaders, SLOW_CHANGING_DESCRIPTOR_SET,
-    SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
-    SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING,
+    create_g_buffer_framebuffer, create_main_render_pass, mesh_shaders, skybox_shaders, MeshesPass,
 };
 use post_process::{
     create_post_processing_pipeline, create_post_processing_render_pass, post_processing_shaders,
 };
 use shadow_maps::{
     create_shadow_map_framebuffer, create_shadow_map_pipeline, create_shadow_map_renderpass,
-    shadow_mapping_shaders, SHADOW_MAP_CASCADE_COUNT,
+    shadow_mapping_shaders, ShadowMappingSettings, SHADOW_MAP_CASCADE_COUNT,
 };
 use thiserror::Error;
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
-        Buffer, BufferCreateInfo, BufferUsage, Subbuffer,
+        BufferUsage, Subbuffer,
     },
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
-        SubpassBeginInfo, SubpassEndInfo,
+        DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer,
     },
-    descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
-    },
-    device::{Device, Queue},
+    descriptor_set::allocator::StandardDescriptorSetAllocator,
+    device::{Device, DeviceOwned},
     format::Format,
     image::{
         sampler::{
@@ -45,8 +39,8 @@ use vulkano::{
         },
         view::ImageView,
     },
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    pipeline::{graphics::depth_stencil::CompareOp, ComputePipeline, GraphicsPipeline, Pipeline},
+    memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{graphics::depth_stencil::CompareOp, ComputePipeline, GraphicsPipeline},
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     shader::{EntryPoint, ShaderModule},
     DeviceSize, Validated, ValidationError, VulkanError,
@@ -119,9 +113,7 @@ impl Default for RendererSettings {
     }
 }
 
-pub struct Renderer {
-    settings: RendererSettings,
-
+struct RendererContext {
     device: Arc<Device>,
 
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -130,19 +122,33 @@ pub struct Renderer {
     host_writable_storage_buffer_allocator: SubbufferAllocator,
     in_device_storage_buffer_allocator: SubbufferAllocator,
     indirect_buffer_allocator: SubbufferAllocator,
+}
 
+// trait RendererPass {
+//     type Input;
+//     type Output;
+//
+//     fn run(&mut self, context: &RendererContext, input: &Self::Input) -> Result<Self::Output, RendererError>;
+// }
+
+pub struct Renderer {
+    settings: RendererSettings,
+
+    context: RendererContext,
+    // device: Arc<Device>,
+    //
+    // memory_allocator: Arc<StandardMemoryAllocator>,
+    // descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    // uniform_buffer_allocator: SubbufferAllocator,
+    // host_writable_storage_buffer_allocator: SubbufferAllocator,
+    // in_device_storage_buffer_allocator: SubbufferAllocator,
+    // indirect_buffer_allocator: SubbufferAllocator,
     asset_database: Arc<RwLock<AssetDatabase>>,
 
     g_buffer: Arc<Framebuffer>,
     ambient_occlusion_buffer: Arc<Framebuffer>,
 
-    render_pass: Arc<RenderPass>,
-    mesh_vs: EntryPoint,
-    mesh_fs: EntryPoint,
-    mesh_pipeline: Arc<GraphicsPipeline>,
-    skybox_vs: EntryPoint,
-    skybox_fs: EntryPoint,
-    skybox_pipeline: Arc<GraphicsPipeline>,
+    meshes_pass: MeshesPass,
 
     full_screen_quad_vs: EntryPoint,
     post_processing_fs: EntryPoint,
@@ -164,21 +170,12 @@ pub struct Renderer {
     light_culling_cs_module: Arc<ShaderModule>,
     old_light_culling_max_lights_per_tile: u32,
 
-    cube_vertex_buffer: Subbuffer<[Vertex]>,
-    cube_index_buffer: Subbuffer<[u32]>,
-
     full_screen_vertex_buffer: Subbuffer<[Vertex]>,
     full_screen_index_buffer: Subbuffer<[u32]>,
-
-    asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
 
     nearest_sampler_float: Arc<Sampler>,
     nearest_sampler_any: Arc<Sampler>,
     sampler: Arc<Sampler>,
-    shadow_map_sampler: Arc<Sampler>,
-
-    materials_storage_buffer: Subbuffer<[mesh_shaders::fs::Material]>,
-    slow_changing_descriptor_set: Arc<DescriptorSet>,
 
     environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
@@ -224,81 +221,93 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 impl Renderer {
     pub fn new(
         settings: RendererSettings,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         world: World,
         format: Format,
     ) -> Result<Self, RendererError> {
-        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
+        let context = {
+            let device = memory_allocator.device().clone();
+            let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+                device.clone(),
+                Default::default(),
+            ));
 
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
+            let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+                device.clone(),
+                Default::default(),
+            ));
 
-        let uniform_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+            let uniform_buffer_allocator = SubbufferAllocator::new(
+                memory_allocator.clone(),
+                SubbufferAllocatorCreateInfo {
+                    buffer_usage: BufferUsage::UNIFORM_BUFFER,
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+            );
 
-        let host_writable_storage_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+            let host_writable_storage_buffer_allocator = SubbufferAllocator::new(
+                memory_allocator.clone(),
+                SubbufferAllocatorCreateInfo {
+                    buffer_usage: BufferUsage::STORAGE_BUFFER,
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+            );
 
-        let in_device_storage_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-        );
+            let in_device_storage_buffer_allocator = SubbufferAllocator::new(
+                memory_allocator.clone(),
+                SubbufferAllocatorCreateInfo {
+                    buffer_usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                    ..Default::default()
+                },
+            );
 
-        let indirect_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+            let indirect_buffer_allocator = SubbufferAllocator::new(
+                memory_allocator.clone(),
+                SubbufferAllocatorCreateInfo {
+                    buffer_usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+            );
 
-        let light_culling_cs_module = light_culling_shader::cs::load(device.clone())?;
+            RendererContext {
+                device,
+                memory_allocator: memory_allocator.clone(),
+                descriptor_set_allocator,
+                uniform_buffer_allocator,
+                host_writable_storage_buffer_allocator,
+                in_device_storage_buffer_allocator,
+                indirect_buffer_allocator,
+            }
+        };
+
+        let light_culling_cs_module = light_culling_shader::cs::load(context.device.clone())?;
 
         let light_culling_pipeline = create_light_culling_pipeline(
-            &device,
+            &context.device,
             &light_culling_cs_module,
             settings.light_culling_max_lights_per_tile,
         )?;
 
-        let shadow_mapping_render_pass = create_shadow_map_renderpass(&device)?;
+        let shadow_mapping_render_pass = create_shadow_map_renderpass(&context.device)?;
 
-        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(device.clone())?
+        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
-        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(device.clone())?
+        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
 
         let shadow_map_framebuffer = create_shadow_map_framebuffer(
-            &memory_allocator,
+            &context.memory_allocator,
             &shadow_mapping_render_pass,
             settings.cascaded_shadow_map_level_size,
         )?;
@@ -306,40 +315,40 @@ impl Renderer {
         let shadow_mapping_pipeline = create_shadow_map_pipeline(
             Vec2::from(shadow_map_framebuffer.extent().map(|x| x as f32)),
             &shadow_mapping_render_pass,
-            &memory_allocator,
+            &context.memory_allocator,
             &shadow_mapping_vs,
             &shadow_mapping_fs,
         )?;
 
-        let render_pass = create_main_render_pass(&device)?;
+        let render_pass = create_main_render_pass(&context.device)?;
 
-        let mesh_vs = mesh_shaders::vs::load(device.clone())?
+        let mesh_vs = mesh_shaders::vs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
-        let mesh_fs = mesh_shaders::fs::load(device.clone())?
-            .entry_point("main")
-            .unwrap();
-
-        let skybox_vs = skybox_shaders::vs::load(device.clone())?
-            .entry_point("main")
-            .unwrap();
-        let skybox_fs = skybox_shaders::fs::load(device.clone())?
+        let mesh_fs = mesh_shaders::fs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
 
-        let full_screen_quad_vs = full_screen_quad::vs::load(device.clone())?
+        let skybox_vs = skybox_shaders::vs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
-        let post_processing_fs = post_processing_shaders::fs::load(device.clone())?
+        let skybox_fs = skybox_shaders::fs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
 
-        let ambient_occlusion_fs = ambient_occlusion_shaders::fs::load(device.clone())?
+        let full_screen_quad_vs = full_screen_quad::vs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+        let post_processing_fs = post_processing_shaders::fs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let ambient_occlusion_fs = ambient_occlusion_shaders::fs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
 
         let nearest_sampler_float = Sampler::new(
-            device.clone(),
+            context.device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Nearest,
                 min_filter: Filter::Nearest,
@@ -351,7 +360,7 @@ impl Renderer {
         )?;
 
         let nearest_sampler_any = Sampler::new(
-            device.clone(),
+            context.device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Nearest,
                 min_filter: Filter::Nearest,
@@ -362,7 +371,7 @@ impl Renderer {
         )?;
 
         let sampler = Sampler::new(
-            device.clone(),
+            context.device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
@@ -373,7 +382,7 @@ impl Renderer {
         )?;
 
         let shadow_map_sampler = Sampler::new(
-            device.clone(),
+            context.device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
@@ -386,11 +395,12 @@ impl Renderer {
 
         let extent = Vec2::new(1280.0, 720.0);
 
-        let post_processing_render_pass = create_post_processing_render_pass(&device, format)?;
+        let post_processing_render_pass =
+            create_post_processing_render_pass(&context.device, format)?;
         let post_processing_pipeline = create_post_processing_pipeline(
             extent,
             Subpass::from(post_processing_render_pass.clone(), 0).unwrap(),
-            &device,
+            &context.device,
             &full_screen_quad_vs,
             &post_processing_fs,
             &nearest_sampler_any,
@@ -402,30 +412,11 @@ impl Renderer {
             [extent.x as u32, extent.y as u32, 1],
         )?;
 
-        let mesh_pipeline = create_mesh_pipeline(
-            extent,
-            Subpass::from(render_pass.clone(), 0).unwrap(),
-            &device,
-            &mesh_vs,
-            &mesh_fs,
-            &sampler,
-            &shadow_map_sampler,
-        )?;
-
-        let skybox_pipeline = create_skybox_pipeline(
-            extent,
-            Subpass::from(render_pass.clone(), 1).unwrap(),
-            &device,
-            &skybox_vs,
-            &skybox_fs,
-            &sampler,
-        )?;
-
-        let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&device)?;
+        let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&context.device)?;
         let ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
             extent,
             Subpass::from(ambient_occlusion_render_pass.clone(), 0).unwrap(),
-            &device,
+            &context.device,
             &full_screen_quad_vs,
             &ambient_occlusion_fs,
             &nearest_sampler_float,
@@ -438,77 +429,10 @@ impl Renderer {
             [extent.x as u32, extent.y as u32, 1],
         )?;
 
-        let (cube_vertex_buffer, cube_index_buffer) = load_mesh_from_buffers_into_new_buffers(
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            &queue,
-            vec![
-                Vertex {
-                    a_position: [-1.0, -1.0, 1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [1.0, -1.0, 1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [-1.0, 1.0, 1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [1.0, 1.0, 1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [-1.0, -1.0, -1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [1.0, -1.0, -1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [-1.0, 1.0, -1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-                Vertex {
-                    a_position: [1.0, 1.0, -1.0],
-                    a_normal: [0.0; 3],
-                    a_tangent: [0.0; 3],
-                    a_uv: [0.0; 2],
-                },
-            ],
-            vec![
-                // Front face (inverted)
-                2, 1, 0, 3, 1, 2, // Back face (inverted)
-                5, 6, 4, 7, 6, 5, // Left face (inverted)
-                4, 2, 0, 6, 2, 4, // Right face (inverted)
-                3, 5, 1, 7, 5, 3, // Top face (inverted)
-                6, 3, 2, 7, 3, 6, // Bottom face (inverted)
-                1, 4, 0, 5, 4, 1,
-            ],
-        )
-        .unwrap();
-
         let (full_screen_vertex_buffer, full_screen_index_buffer) =
             load_mesh_from_buffers_into_new_buffers(
                 memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                &queue,
+                builder,
                 vec![
                     Vertex {
                         a_position: [-1.0, -1.0, 0.5],
@@ -550,80 +474,7 @@ impl Renderer {
 
         assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
 
-        let materials_storage_buffer = Buffer::new_slice(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        let mut irradiance_map = None;
-        let mut prefiltered_environment_map = None;
-        let mut environment_brdf_lut = None;
-
-        environment_cubemap_query.each(|env_cubemap| {
-            irradiance_map = Some(env_cubemap.irradiance_map.clone());
-            prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
-            environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
-        });
-        let irradiance_map = irradiance_map.unwrap();
-        let prefiltered_environment_map = prefiltered_environment_map.unwrap();
-        let environment_brdf_lut = environment_brdf_lut.unwrap();
-
-        let asset_database_read = asset_database.read().unwrap();
-        let environment_descriptor_set = DescriptorSet::new_variable(
-            descriptor_set_allocator.clone(),
-            mesh_pipeline.layout().set_layouts()[SLOW_CHANGING_DESCRIPTOR_SET].clone(),
-            1, // If this is zero for some reason it cant be deallocated
-            [
-                WriteDescriptorSet::image_view(
-                    2,
-                    asset_database_read
-                        .get_cubemap(irradiance_map.clone())
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::image_view(
-                    3,
-                    asset_database_read
-                        .get_cubemap(prefiltered_environment_map.clone())
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::image_view(
-                    4,
-                    asset_database_read
-                        .get_cubemap(environment_brdf_lut.clone())
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::buffer(
-                    SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
-                    materials_storage_buffer.clone(),
-                ),
-                // WriteDescriptorSet::image_view_array(
-                //     4,
-                //     0,
-                //     asset_database_read
-                //         .textures()
-                //         .iter()
-                //         .map(|texture| texture.texture.clone()),
-                // ),
-            ],
-            [],
-        )?;
-        drop(asset_database_read);
+        let meshes_pass = MeshesPass::new(builder, &context, extent, &asset_database, &world)?;
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
             textures_changed: false,
@@ -638,26 +489,14 @@ impl Renderer {
         let renderer = Self {
             settings: settings.clone(),
 
-            device,
+            context,
 
-            memory_allocator,
-            descriptor_set_allocator,
-            uniform_buffer_allocator,
-            host_writable_storage_buffer_allocator,
-            in_device_storage_buffer_allocator,
-            indirect_buffer_allocator,
             asset_database,
 
             g_buffer,
             ambient_occlusion_buffer,
 
-            render_pass,
-            mesh_vs,
-            mesh_fs,
-            mesh_pipeline,
-            skybox_vs,
-            skybox_fs,
-            skybox_pipeline,
+            meshes_pass,
 
             full_screen_quad_vs,
             post_processing_fs,
@@ -677,19 +516,12 @@ impl Renderer {
             light_culling_cs_module,
             old_light_culling_max_lights_per_tile: settings.light_culling_max_lights_per_tile,
 
-            cube_vertex_buffer,
-            cube_index_buffer,
-
             full_screen_vertex_buffer,
             full_screen_index_buffer,
 
             nearest_sampler_float,
             nearest_sampler_any,
             sampler,
-            shadow_map_sampler,
-            materials_storage_buffer,
-            slow_changing_descriptor_set: environment_descriptor_set,
-            asset_change_listener,
             environment_cubemap_query,
             meshes_with_materials_query,
             world,
@@ -700,119 +532,6 @@ impl Renderer {
 
     pub fn settings_mut(&mut self) -> &mut RendererSettings {
         &mut self.settings
-    }
-
-    fn add_materials_and_textures_to_descriptor_set(&mut self) -> Result<(), RendererError> {
-        let asset_change_listener_read = self.asset_change_listener.read().unwrap();
-        let textures_changed = asset_change_listener_read.textures_changed;
-        let materials_changed = asset_change_listener_read.materials_changed;
-        drop(asset_change_listener_read);
-
-        if !textures_changed && !materials_changed {
-            return Ok(());
-        }
-
-        if materials_changed {
-            let asset_database_read = self.asset_database.read().unwrap();
-
-            let materials: Vec<_> = asset_database_read
-                .materials()
-                .iter()
-                .map(|material| {
-                    let diffuse = material.diffuse.clone().map(|id| id.0);
-                    let metallic_roughness = material.metallic_roughness.clone().map(|id| id.0);
-                    let ambient_occlusion = material.ambient_occlusion.clone().map(|id| id.0);
-                    let emissive = material.emissive.clone().map(|id| id.0);
-                    let normal = material.normal.clone().map(|id| id.0);
-                    mesh_shaders::fs::Material {
-                        base_color_factor: material.color_factor.into(),
-                        emissive_factor: material.emissive_factor.into(),
-                        metallic_factor: material.metallic_factor.into(),
-                        roughness_factor: material.roughness_factor.into(),
-                        base_color_texture_id: diffuse.unwrap_or(u32::MAX),
-                        metallic_roughness_texture_id: metallic_roughness.unwrap_or(u32::MAX),
-                        ambient_occlusion_texture_id: ambient_occlusion.unwrap_or(u32::MAX).into(),
-                        emissive_texture_id: emissive.unwrap_or(u32::MAX),
-                        normal_texture_id: normal.unwrap_or(u32::MAX),
-                        pad: [0; 3],
-                    }
-                })
-                .collect();
-
-            self.materials_storage_buffer = self
-                .host_writable_storage_buffer_allocator
-                .allocate_slice(materials.len() as DeviceSize)
-                .unwrap();
-            self.materials_storage_buffer
-                .write()
-                .unwrap()
-                .copy_from_slice(&materials);
-        }
-
-        let mut irradiance_map = None;
-        let mut prefiltered_environment_map = None;
-        let mut environment_brdf_lut = None;
-
-        self.environment_cubemap_query.each(|env_cubemap| {
-            irradiance_map = Some(env_cubemap.irradiance_map.clone());
-            prefiltered_environment_map = Some(env_cubemap.prefiltered_environment_map.clone());
-            environment_brdf_lut = Some(env_cubemap.environment_brdf_lut.clone());
-        });
-        let irradiance_map = irradiance_map.unwrap();
-        let prefiltered_environment_map = prefiltered_environment_map.unwrap();
-        let environment_brdf_lut = environment_brdf_lut.unwrap();
-
-        let asset_database_read = self.asset_database.read().unwrap();
-        self.slow_changing_descriptor_set = DescriptorSet::new_variable(
-            self.descriptor_set_allocator.clone(),
-            self.mesh_pipeline.layout().set_layouts()[SLOW_CHANGING_DESCRIPTOR_SET].clone(),
-            asset_database_read.textures().len() as u32,
-            [
-                WriteDescriptorSet::image_view(
-                    2,
-                    asset_database_read
-                        .get_cubemap(irradiance_map)
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::image_view(
-                    3,
-                    asset_database_read
-                        .get_cubemap(prefiltered_environment_map)
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::image_view(
-                    4,
-                    asset_database_read
-                        .get_cubemap(environment_brdf_lut)
-                        .unwrap()
-                        .cubemap
-                        .clone(),
-                ),
-                WriteDescriptorSet::buffer(
-                    SLOW_CHANGING_DESCRIPTOR_SET_MATERIALS_BUFFER_BINDING,
-                    self.materials_storage_buffer.clone(),
-                ),
-                WriteDescriptorSet::image_view_array(
-                    SLOW_CHANGING_DESCRIPTOR_SET_TEXTURES_BINDING,
-                    0,
-                    asset_database_read
-                        .textures()
-                        .iter()
-                        .map(|texture| texture.texture.clone()),
-                ),
-            ],
-            [],
-        )?;
-        drop(asset_database_read);
-
-        let mut asset_change_listener_write = self.asset_change_listener.write().unwrap();
-        asset_change_listener_write.materials_changed = false;
-        asset_change_listener_write.textures_changed = false;
-        Ok(())
     }
 
     fn create_directional_lights_storage_buffer(
@@ -847,6 +566,7 @@ impl Renderer {
             None
         } else {
             let directional_lights_storage_buffer = self
+                .context
                 .host_writable_storage_buffer_allocator
                 .allocate_slice(directional_lights.len() as DeviceSize)
                 .unwrap();
@@ -886,12 +606,13 @@ impl Renderer {
         image_views: &[Arc<ImageView>],
     ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
         let extent = image_views[0].image().extent();
-        self.g_buffer =
-            create_g_buffer_framebuffer(&self.render_pass, &self.memory_allocator, extent)?;
+        self.g_buffer = self
+            .meshes_pass
+            .resize_and_create_g_buffer(&self.context, UVec2::new(extent[0], extent[1]))?;
 
         self.ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
             &self.ambient_occlusion_render_pass,
-            &self.memory_allocator,
+            &self.context.memory_allocator,
             extent,
         )?;
 
@@ -900,29 +621,10 @@ impl Renderer {
             image_views[0].image().extent()[1] as f32,
         );
 
-        self.mesh_pipeline = create_mesh_pipeline(
-            extent,
-            Subpass::from(self.render_pass.clone(), 0).unwrap(),
-            &self.device,
-            &self.mesh_vs,
-            &self.mesh_fs,
-            &self.sampler,
-            &self.shadow_map_sampler,
-        )?;
-
-        self.skybox_pipeline = create_skybox_pipeline(
-            extent,
-            Subpass::from(self.render_pass.clone(), 1).unwrap(),
-            &self.device,
-            &self.skybox_vs,
-            &self.skybox_fs,
-            &self.sampler,
-        )?;
-
         self.ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
             extent,
             Subpass::from(self.ambient_occlusion_render_pass.clone(), 0).unwrap(),
-            &self.device,
+            &self.context.device,
             &self.full_screen_quad_vs,
             &self.ambient_occlusion_fs,
             &self.nearest_sampler_float,
@@ -932,7 +634,7 @@ impl Renderer {
         self.post_processing_pipeline = create_post_processing_pipeline(
             extent,
             Subpass::from(self.post_processing_render_pass.clone(), 0).unwrap(),
-            &self.device,
+            &self.context.device,
             &self.full_screen_quad_vs,
             &self.post_processing_fs,
             &self.nearest_sampler_any,
@@ -946,7 +648,7 @@ impl Renderer {
             != self.old_light_culling_max_lights_per_tile
         {
             self.light_culling_pipeline = create_light_culling_pipeline(
-                &self.device,
+                &self.context.device,
                 &self.light_culling_cs_module,
                 self.settings.light_culling_max_lights_per_tile,
             )?;
@@ -956,14 +658,14 @@ impl Renderer {
 
         if self.settings.cascaded_shadow_map_level_size != self.shadow_map_framebuffer.extent()[0] {
             self.shadow_map_framebuffer = create_shadow_map_framebuffer(
-                &self.memory_allocator,
+                &self.context.memory_allocator,
                 &self.shadow_mapping_render_pass,
                 self.settings.cascaded_shadow_map_level_size,
             )?;
             self.shadow_mapping_pipeline = create_shadow_map_pipeline(
                 Vec2::from(self.shadow_map_framebuffer.extent().map(|x| x as f32)),
                 &self.shadow_mapping_render_pass,
-                &self.memory_allocator,
+                &self.context.memory_allocator,
                 &self.shadow_mapping_vs,
                 &self.shadow_mapping_fs,
             )?;
@@ -981,7 +683,6 @@ impl Renderer {
     ) -> Result<(), RendererError> {
         let aspect_ratio = framebuffer.extent()[0] as f32 / framebuffer.extent()[1] as f32;
 
-        self.add_materials_and_textures_to_descriptor_set()?;
         let point_lights_buffer = self.create_point_lights_storage_buffer();
         let directional_lights_buffer = self.create_directional_lights_storage_buffer();
 
@@ -1010,37 +711,35 @@ impl Renderer {
         }
 
         // main pass
-        builder.begin_render_pass(
-            RenderPassBeginInfo {
-                clear_values: vec![Some([0u32; 2].into()), Some(1f32.into())],
-                ..RenderPassBeginInfo::framebuffer(self.g_buffer.clone())
+        self.meshes_pass.run(
+            builder,
+            &self.context,
+            camera,
+            aspect_ratio,
+            &point_lights_buffer,
+            &directional_lights_buffer,
+            &visible_light_indices_storage_buffer,
+            &lights_from_tile_storage_image_view,
+            &self.shadow_map_framebuffer.attachments()[0],
+            &shadow_map_matrices_and_splits,
+            &self.asset_database,
+            &LightCullingSettings {
+                max_lights_per_tile: self.settings.light_culling_max_lights_per_tile,
+                tile_size: self.settings.light_culling_tile_size,
+                z_slices: self.settings.light_culling_z_slices,
             },
-            SubpassBeginInfo::default(),
+            &ShadowMappingSettings {
+                cascade_level_size: self.settings.cascaded_shadow_map_level_size,
+                sample_count_per_level: self.settings.sample_count_per_level,
+                bias: self.settings.shadow_bias,
+                slope_bias: self.settings.shadow_slope_bias,
+                normal_bias: self.settings.shadow_normal_bias,
+                penumbra_max_size: self.settings.penumbra_max_size,
+                cascade_split_lambda: self.settings.shadow_map_cascade_split_lambda,
+            },
+            &self.g_buffer,
+            &self.world,
         )?;
-
-        if let Some((entities_data, indirect_commands)) =
-            entities_data_and_indirect_commands.as_ref()
-        {
-            self.draw_meshes(
-                builder,
-                &camera,
-                aspect_ratio,
-                &point_lights_buffer,
-                &directional_lights_buffer,
-                &visible_light_indices_storage_buffer,
-                &lights_from_tile_storage_image_view,
-                &entities_data,
-                &indirect_commands,
-                &shadow_map_matrices_and_splits,
-            )?;
-        }
-
-        builder.next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?;
-
-        self.draw_skybox(builder, &camera, aspect_ratio)?;
-
-        builder.end_render_pass(Default::default())?;
-
         self.ambient_occlusion_pass(builder, &camera, aspect_ratio)?;
 
         self.post_processing_pass(builder, framebuffer)?;
@@ -1090,6 +789,7 @@ impl Renderer {
         }
 
         let indirect_buffer = self
+            .context
             .indirect_buffer_allocator
             .allocate_slice(indirect_commands.len() as DeviceSize)
             .unwrap();
@@ -1099,6 +799,7 @@ impl Renderer {
             .copy_from_slice(&indirect_commands);
 
         let entity_data_storage_buffer = self
+            .context
             .host_writable_storage_buffer_allocator
             .allocate_slice(entities_data.len() as DeviceSize)
             .unwrap();

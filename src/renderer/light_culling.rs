@@ -25,6 +25,12 @@ use crate::{
 
 use super::{main_pass::mesh_shaders, Renderer, RendererError};
 
+pub struct LightCullingSettings {
+    pub max_lights_per_tile: u32,
+    pub tile_size: u32,
+    pub z_slices: u32,
+}
+
 pub fn create_light_culling_pipeline(
     device: &Arc<Device>,
     light_culling_cs_module: &Arc<ShaderModule>,
@@ -70,6 +76,7 @@ impl Renderer {
             None
         } else {
             let point_lights_storage_buffer = self
+                .context
                 .host_writable_storage_buffer_allocator
                 .allocate_slice(point_lights.len() as DeviceSize)
                 .unwrap();
@@ -91,6 +98,7 @@ impl Renderer {
         point_lights_storage_buffer: &Option<Subbuffer<[mesh_shaders::fs::PointLight]>>,
     ) -> Result<(Subbuffer<[u32]>, Arc<ImageView>), RendererError> {
         let next_ligth_index_global_storage_buffer = self
+            .context
             .in_device_storage_buffer_allocator
             .allocate_slice::<light_culling_shader::cs::NextLigthIndexGlobal>(4) // allocating 1 freezes
             .unwrap();
@@ -107,22 +115,8 @@ impl Renderer {
             0,
         )?;
 
-        let width = self
-            .mesh_pipeline
-            .viewport_state()
-            .unwrap()
-            .viewports
-            .get(0)
-            .unwrap()
-            .extent[0] as u32;
-        let height = self
-            .mesh_pipeline
-            .viewport_state()
-            .unwrap()
-            .viewports
-            .get(0)
-            .unwrap()
-            .extent[1] as u32;
+        let width = self.g_buffer.extent()[0];
+        let height = self.g_buffer.extent()[0];
 
         let num_tiles = UVec3::new(
             width.div_ceil(self.settings.light_culling_tile_size),
@@ -131,6 +125,7 @@ impl Renderer {
         );
 
         let visible_light_indices_storage_buffer = self
+            .context
             .in_device_storage_buffer_allocator
             .allocate_slice::<u32>(
                 (num_tiles.x
@@ -142,7 +137,7 @@ impl Renderer {
             .unwrap();
 
         let lights_from_tile_storage_image = Image::new(
-            self.memory_allocator.clone(),
+            self.context.memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim3d,
                 format: Format::R32G32_UINT,
@@ -181,14 +176,18 @@ impl Renderer {
                 far: 100.0,
             };
 
-            let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            let buffer = self
+                .context
+                .uniform_buffer_allocator
+                .allocate_sized()
+                .unwrap();
             *buffer.write().unwrap() = uniform_data;
 
             buffer
         };
 
         let set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
+            self.context.descriptor_set_allocator.clone(),
             self.light_culling_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::buffer(0, frame_uniform_buffer.clone()),
@@ -198,7 +197,8 @@ impl Renderer {
                         .as_ref()
                         .map(|buf| buf.clone())
                         .unwrap_or_else(|| {
-                            self.in_device_storage_buffer_allocator
+                            self.context
+                                .in_device_storage_buffer_allocator
                                 .allocate_slice(1)
                                 .unwrap()
                         }),

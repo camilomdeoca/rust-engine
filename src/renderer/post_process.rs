@@ -2,7 +2,14 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use vulkano::{
-    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo}, descriptor_set::{DescriptorSet, WriteDescriptorSet}, device::Device, format::Format, image::sampler::Sampler, pipeline::{
+    command_buffer::{
+        AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
+    },
+    descriptor_set::{DescriptorSet, WriteDescriptorSet},
+    device::Device,
+    format::Format,
+    image::sampler::Sampler,
+    pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::InputAssemblyState,
@@ -11,8 +18,14 @@ use vulkano::{
             vertex_input::{Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        }, layout::PipelineDescriptorSetLayoutCreateInfo, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
-    }, render_pass::{Framebuffer, RenderPass, Subpass}, shader::EntryPoint, Validated, VulkanError
+        },
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+        GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, RenderPass, Subpass},
+    shader::EntryPoint,
+    Validated, VulkanError,
 };
 
 use crate::assets::vertex::Vertex;
@@ -119,7 +132,7 @@ impl Renderer {
             )?
             .bind_pipeline_graphics(self.post_processing_pipeline.clone())?;
         let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
+            self.context.descriptor_set_allocator.clone(),
             self.post_processing_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::image_view(1, self.g_buffer.attachments()[0].clone()),
@@ -140,7 +153,7 @@ impl Renderer {
             .bind_vertex_buffers(0, self.full_screen_vertex_buffer.clone())?
             .bind_index_buffer(self.full_screen_index_buffer.clone())?;
         unsafe { builder.draw_indexed(self.full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
-        
+
         builder.end_render_pass(Default::default())?;
 
         Ok(())

@@ -43,6 +43,7 @@ use ui::{logger, UserInterface};
 use vulkano::{
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
+        PrimaryCommandBufferAbstract,
     },
     device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
@@ -429,14 +430,22 @@ impl App {
             .unwrap();
         info!("Loaded skybox");
 
+        let mut builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
         let irradiance_map_renderer = ImageBasedLightingMapsGenerator::new(
             device.clone(),
-            queue.clone(),
+            &mut builder,
             memory_allocator.clone(),
             irradiance_map_image.format(),
         );
 
         irradiance_map_renderer.render_to_image(
+            &mut builder,
             asset_database
                 .read()
                 .unwrap()
@@ -449,6 +458,16 @@ impl App {
             environment_brdf_lut_image.clone(),
         );
         info!("Created ibl maps");
+
+        builder
+            .build()
+            .unwrap()
+            .execute(queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
 
         let mut asset_database_write = asset_database.write().unwrap();
         world.set(EnvironmentCubemap {
@@ -550,11 +569,17 @@ impl ApplicationHandler for App {
                 .map(|image| ImageView::new_default(image.clone()).unwrap())
                 .collect();
 
+            let mut builder = AutoCommandBufferBuilder::primary(
+                self.command_buffer_allocator.clone(),
+                self.queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
             let renderer = Arc::new(RwLock::new(
                 Renderer::new(
                     Default::default(),
-                    self.device.clone(),
-                    self.queue.clone(),
+                    &mut builder,
                     self.asset_database.clone(),
                     self.memory_allocator.clone(),
                     self.world.clone(),
@@ -562,6 +587,16 @@ impl ApplicationHandler for App {
                 )
                 .unwrap(),
             ));
+
+            builder
+                .build()
+                .unwrap()
+                .execute(self.queue.clone())
+                .unwrap()
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)
+                .unwrap();
 
             let asset_database_clone = self.asset_database.clone();
             let entities_to_add_queue_clone = self.entities_to_add_queue.clone();

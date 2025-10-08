@@ -2,19 +2,14 @@ use std::sync::Arc;
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
-    command_buffer::{
-        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        CopyBufferInfo, PrimaryCommandBufferAbstract,
-    },
-    device::Queue,
+    command_buffer::{AutoCommandBufferBuilder, CopyBufferInfo, PrimaryAutoCommandBuffer},
     memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter},
-    sync::GpuFuture, DeviceSize,
+    DeviceSize,
 };
 
 pub fn load_mesh_from_buffers<VI, II, Vertex>(
     memory_allocator: Arc<dyn MemoryAllocator>,
-    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: &Arc<Queue>,
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     vertices: VI,
     indices: II,
     vertex_buffer: Subbuffer<[Vertex]>,
@@ -60,33 +55,13 @@ where
     assert!(staging_vertex_buffer.len() <= vertex_buffer.len());
     assert!(staging_index_buffer.len() <= index_buffer.len());
 
-    let mut builder = AutoCommandBufferBuilder::primary(
-        command_buffer_allocator.clone(),
-        queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
-
     builder
         .copy_buffer(CopyBufferInfo::buffers(
             staging_vertex_buffer,
             vertex_buffer,
         ))
         .unwrap()
-        .copy_buffer(CopyBufferInfo::buffers(
-            staging_index_buffer,
-            index_buffer,
-        ))
-        .unwrap();
-
-    let command_buffer = builder.build().unwrap();
-
-    command_buffer
-        .execute(queue.clone())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
+        .copy_buffer(CopyBufferInfo::buffers(staging_index_buffer, index_buffer))
         .unwrap();
 
     Ok(())
@@ -94,8 +69,7 @@ where
 
 pub fn load_mesh_from_buffers_into_new_buffers<VI, II, Vertex>(
     memory_allocator: Arc<dyn MemoryAllocator>,
-    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: &Arc<Queue>,
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     vertices: VI,
     indices: II,
 ) -> Result<(Subbuffer<[Vertex]>, Subbuffer<[u32]>), String>
@@ -139,8 +113,7 @@ where
 
     load_mesh_from_buffers(
         memory_allocator,
-        command_buffer_allocator,
-        queue,
+        builder,
         vertices,
         indices,
         vertex_buffer.clone(),

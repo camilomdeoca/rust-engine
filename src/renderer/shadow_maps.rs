@@ -46,6 +46,16 @@ use super::{main_pass::mesh_shaders, Renderer, RendererError};
 
 pub const SHADOW_MAP_CASCADE_COUNT: u32 = 4;
 
+pub struct ShadowMappingSettings {
+    pub cascade_level_size: u32,
+    pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
+    pub bias: f32,
+    pub slope_bias: f32,
+    pub normal_bias: f32,
+    pub penumbra_max_size: f32,
+    pub cascade_split_lambda: f32,
+}
+
 pub fn create_shadow_map_renderpass(
     device: &Arc<Device>,
 ) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
@@ -327,13 +337,13 @@ impl Renderer {
             },
         )?;
 
-        let light_data_buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+        let light_data_buffer = self.context.uniform_buffer_allocator.allocate_sized().unwrap();
         *light_data_buffer.write().unwrap() = shadow_mapping_shaders::vs::LightData {
             light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
         };
 
         let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
+            self.context.descriptor_set_allocator.clone(),
             self.shadow_mapping_pipeline.layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::buffer(0, light_data_buffer),
