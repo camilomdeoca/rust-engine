@@ -14,6 +14,7 @@ mod image_based_lighting_maps_generator;
 mod input;
 mod profile;
 mod renderer;
+mod settings;
 mod ui;
 
 use assets::{

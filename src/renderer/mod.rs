@@ -7,18 +7,13 @@ use ambient_occlusion::{
     ambient_occlusion_shaders, create_ambient_occlusion_framebuffer,
     create_ambient_occlusion_pipeline, create_ambient_occlusion_render_pass,
 };
+use cascaded_shadow_maps_pass::{CascadedShadowMapsPass, CascadedShadowMapsPassError};
 use flecs_ecs::prelude::*;
-use glam::{Mat4, UVec2, Vec2, Vec3};
-use light_culling::{create_light_culling_pipeline, light_culling_shader, LightCullingSettings};
-use main_pass::{
-    create_g_buffer_framebuffer, create_main_render_pass, mesh_shaders, skybox_shaders, MeshesPass,
-};
+use glam::{uvec2, Mat4, UVec2, Vec2, Vec3};
+use light_culling::LightCullingPass;
+use main_pass::{mesh_shaders, MeshesPass};
 use post_process::{
     create_post_processing_pipeline, create_post_processing_render_pass, post_processing_shaders,
-};
-use shadow_maps::{
-    create_shadow_map_framebuffer, create_shadow_map_pipeline, create_shadow_map_renderpass,
-    shadow_mapping_shaders, ShadowMappingSettings, SHADOW_MAP_CASCADE_COUNT,
 };
 use thiserror::Error;
 use vulkano::{
@@ -27,8 +22,7 @@ use vulkano::{
         BufferUsage, Subbuffer,
     },
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer,
     },
     descriptor_set::allocator::StandardDescriptorSetAllocator,
     device::{Device, DeviceOwned},
@@ -40,9 +34,9 @@ use vulkano::{
         view::ImageView,
     },
     memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
-    pipeline::{graphics::depth_stencil::CompareOp, ComputePipeline, GraphicsPipeline},
+    pipeline::GraphicsPipeline,
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    shader::{EntryPoint, ShaderModule},
+    shader::EntryPoint,
     DeviceSize, Validated, ValidationError, VulkanError,
 };
 
@@ -60,13 +54,16 @@ use crate::{
         self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent,
         Transform,
     },
+    settings::Settings,
 };
 
 mod ambient_occlusion;
+mod ambient_occlusion_pass;
+mod cascaded_shadow_maps_pass;
 mod light_culling;
 mod main_pass;
 mod post_process;
-mod shadow_maps;
+//mod shadow_maps;
 
 #[derive(Error, Debug)]
 pub enum RendererError {
@@ -74,43 +71,8 @@ pub enum RendererError {
     VulkanoVulkanError(#[from] Validated<VulkanError>),
     #[error("{0}")]
     VulkanoValidationError(#[from] Box<ValidationError>),
-}
-
-#[derive(Clone)]
-pub struct RendererSettings {
-    pub light_culling_max_lights_per_tile: u32,
-    pub light_culling_tile_size: u32,
-    pub light_culling_z_slices: u32,
-    pub cascaded_shadow_map_level_size: u32,
-    pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
-    pub shadow_bias: f32,
-    pub shadow_slope_bias: f32,
-    pub shadow_normal_bias: f32,
-    pub penumbra_max_size: f32,
-    pub shadow_map_cascade_split_lambda: f32,
-    pub sample_count: u32,
-    pub sample_radius: f32,
-    pub ambient_occlusion_intensity: f32,
-}
-
-impl Default for RendererSettings {
-    fn default() -> Self {
-        Self {
-            light_culling_max_lights_per_tile: 64,
-            light_culling_tile_size: 32,
-            light_culling_z_slices: 32,
-            cascaded_shadow_map_level_size: 1536,
-            sample_count_per_level: [10, 8, 2, 2],
-            shadow_bias: 0.0005,
-            shadow_slope_bias: 0.0005,
-            shadow_normal_bias: 0.012,
-            penumbra_max_size: 0.0015,
-            shadow_map_cascade_split_lambda: 0.75,
-            sample_count: 16,
-            sample_radius: 0.5,
-            ambient_occlusion_intensity: 1.0,
-        }
-    }
+    #[error("{0}")]
+    CascadedShadowMapsPassError(#[from] CascadedShadowMapsPassError),
 }
 
 struct RendererContext {
@@ -132,7 +94,7 @@ struct RendererContext {
 // }
 
 pub struct Renderer {
-    settings: RendererSettings,
+    settings: Settings,
 
     context: RendererContext,
     // device: Arc<Device>,
@@ -148,6 +110,8 @@ pub struct Renderer {
     g_buffer: Arc<Framebuffer>,
     ambient_occlusion_buffer: Arc<Framebuffer>,
 
+    cascaded_shadow_maps_pass: CascadedShadowMapsPass,
+    light_culling_pass: LightCullingPass,
     meshes_pass: MeshesPass,
 
     full_screen_quad_vs: EntryPoint,
@@ -158,16 +122,9 @@ pub struct Renderer {
     ambient_occlusion_render_pass: Arc<RenderPass>,
     ambient_occlusion_pipeline: Arc<GraphicsPipeline>,
 
-    shadow_mapping_render_pass: Arc<RenderPass>,
-    shadow_mapping_vs: EntryPoint,
-    shadow_mapping_fs: EntryPoint,
-    shadow_mapping_pipeline: Arc<GraphicsPipeline>,
-
     shadow_map_framebuffer: Arc<Framebuffer>,
 
     /// For tiled rendering
-    light_culling_pipeline: Arc<ComputePipeline>,
-    light_culling_cs_module: Arc<ShaderModule>,
     old_light_culling_max_lights_per_tile: u32,
 
     full_screen_vertex_buffer: Subbuffer<[Vertex]>,
@@ -220,7 +177,7 @@ impl AssetDatabaseChangeObserver for RendererAssetChangeListener {
 
 impl Renderer {
     pub fn new(
-        settings: RendererSettings,
+        settings: Settings,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         asset_database: Arc<RwLock<AssetDatabase>>,
         memory_allocator: Arc<StandardMemoryAllocator>,
@@ -230,11 +187,6 @@ impl Renderer {
         let context = {
             let device = memory_allocator.device().clone();
             let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-                device.clone(),
-                Default::default(),
-            ));
-
-            let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
                 device.clone(),
                 Default::default(),
             ));
@@ -289,52 +241,11 @@ impl Renderer {
             }
         };
 
-        let light_culling_cs_module = light_culling_shader::cs::load(context.device.clone())?;
-
-        let light_culling_pipeline = create_light_culling_pipeline(
-            &context.device,
-            &light_culling_cs_module,
-            settings.light_culling_max_lights_per_tile,
-        )?;
-
-        let shadow_mapping_render_pass = create_shadow_map_renderpass(&context.device)?;
-
-        let shadow_mapping_vs = shadow_mapping_shaders::vs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-        let shadow_mapping_fs = shadow_mapping_shaders::fs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-
-        let shadow_map_framebuffer = create_shadow_map_framebuffer(
-            &context.memory_allocator,
-            &shadow_mapping_render_pass,
-            settings.cascaded_shadow_map_level_size,
-        )?;
-
-        let shadow_mapping_pipeline = create_shadow_map_pipeline(
-            Vec2::from(shadow_map_framebuffer.extent().map(|x| x as f32)),
-            &shadow_mapping_render_pass,
-            &context.memory_allocator,
-            &shadow_mapping_vs,
-            &shadow_mapping_fs,
-        )?;
-
-        let render_pass = create_main_render_pass(&context.device)?;
-
-        let mesh_vs = mesh_shaders::vs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-        let mesh_fs = mesh_shaders::fs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-
-        let skybox_vs = skybox_shaders::vs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-        let skybox_fs = skybox_shaders::fs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
+        // let shadow_map_framebuffer = create_shadow_map_framebuffer(
+        //     &context.memory_allocator,
+        //     &shadow_mapping_render_pass,
+        //     settings.renderer.shadow_mapping.cascade_level_size,
+        // )?;
 
         let full_screen_quad_vs = full_screen_quad::vs::load(context.device.clone())?
             .entry_point("main")
@@ -381,18 +292,6 @@ impl Renderer {
             },
         )?;
 
-        let shadow_map_sampler = Sampler::new(
-            context.device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                lod: 0.0..=LOD_CLAMP_NONE,
-                address_mode: [SamplerAddressMode::Repeat; 3],
-                compare: Some(CompareOp::Less),
-                ..Default::default()
-            },
-        )?;
-
         let extent = Vec2::new(1280.0, 720.0);
 
         let post_processing_render_pass =
@@ -406,11 +305,11 @@ impl Renderer {
             &nearest_sampler_any,
         )?;
 
-        let g_buffer = create_g_buffer_framebuffer(
-            &render_pass,
-            &memory_allocator,
-            [extent.x as u32, extent.y as u32, 1],
-        )?;
+        // let g_buffer = create_g_buffer_framebuffer(
+        //     &render_pass,
+        //     &memory_allocator,
+        //     [extent.x as u32, extent.y as u32, 1],
+        // )?;
 
         let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&context.device)?;
         let ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
@@ -474,7 +373,16 @@ impl Renderer {
 
         assert!(size_of::<mesh_shaders::fs::Material>() % 16 == 0);
 
+        let cascaded_shadow_maps_pass = CascadedShadowMapsPass::new(&context, &settings)?;
+        let light_culling_pass = LightCullingPass::new(&context, &settings)?;
         let meshes_pass = MeshesPass::new(builder, &context, extent, &asset_database, &world)?;
+
+        let shadow_map_framebuffer = cascaded_shadow_maps_pass.create_framebuffer(
+            &context,
+            settings.renderer.shadow_mapping.cascade_level_size,
+        )?;
+
+        let g_buffer = meshes_pass.create_g_buffer_framebuffer(&context, extent.as_uvec2())?;
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
             textures_changed: false,
@@ -494,8 +402,10 @@ impl Renderer {
             asset_database,
 
             g_buffer,
+            light_culling_pass,
             ambient_occlusion_buffer,
 
+            cascaded_shadow_maps_pass,
             meshes_pass,
 
             full_screen_quad_vs,
@@ -506,15 +416,12 @@ impl Renderer {
             ambient_occlusion_render_pass,
             ambient_occlusion_pipeline,
 
-            shadow_mapping_render_pass,
-            shadow_mapping_pipeline,
-            shadow_mapping_vs,
-            shadow_mapping_fs,
             shadow_map_framebuffer,
 
-            light_culling_pipeline,
-            light_culling_cs_module,
-            old_light_culling_max_lights_per_tile: settings.light_culling_max_lights_per_tile,
+            old_light_culling_max_lights_per_tile: settings
+                .renderer
+                .light_culling
+                .max_lights_per_tile,
 
             full_screen_vertex_buffer,
             full_screen_index_buffer,
@@ -530,7 +437,7 @@ impl Renderer {
         Ok(renderer)
     }
 
-    pub fn settings_mut(&mut self) -> &mut RendererSettings {
+    pub fn settings_mut(&mut self) -> &mut Settings {
         &mut self.settings
     }
 
@@ -644,30 +551,22 @@ impl Renderer {
     }
 
     pub fn apply_changed_settings(&mut self) -> Result<(), RendererError> {
-        if self.settings.light_culling_max_lights_per_tile
+        if self.settings.renderer.light_culling.max_lights_per_tile
             != self.old_light_culling_max_lights_per_tile
         {
-            self.light_culling_pipeline = create_light_culling_pipeline(
-                &self.context.device,
-                &self.light_culling_cs_module,
-                self.settings.light_culling_max_lights_per_tile,
-            )?;
+            self.light_culling_pass = LightCullingPass::new(&self.context, &self.settings)?;
             self.old_light_culling_max_lights_per_tile =
-                self.settings.light_culling_max_lights_per_tile;
+                self.settings.renderer.light_culling.max_lights_per_tile;
         }
 
-        if self.settings.cascaded_shadow_map_level_size != self.shadow_map_framebuffer.extent()[0] {
-            self.shadow_map_framebuffer = create_shadow_map_framebuffer(
-                &self.context.memory_allocator,
-                &self.shadow_mapping_render_pass,
-                self.settings.cascaded_shadow_map_level_size,
-            )?;
-            self.shadow_mapping_pipeline = create_shadow_map_pipeline(
-                Vec2::from(self.shadow_map_framebuffer.extent().map(|x| x as f32)),
-                &self.shadow_mapping_render_pass,
-                &self.context.memory_allocator,
-                &self.shadow_mapping_vs,
-                &self.shadow_mapping_fs,
+        if self.settings.renderer.shadow_mapping.cascade_level_size
+            != self.shadow_map_framebuffer.extent()[0]
+        {
+            self.cascaded_shadow_maps_pass =
+                CascadedShadowMapsPass::new(&self.context, &self.settings)?;
+            self.shadow_map_framebuffer = self.cascaded_shadow_maps_pass.create_framebuffer(
+                &self.context,
+                self.settings.renderer.shadow_mapping.cascade_level_size,
             )?;
         }
 
@@ -688,58 +587,68 @@ impl Renderer {
 
         self.apply_changed_settings()?;
 
-        let shadow_map_matrices_and_splits =
-            self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
+        // let shadow_map_matrices_and_splits =
+        //     self.compute_shadow_map_matrices_and_splits(&camera, aspect_ratio);
+
+        let g_buffer_extent = uvec2(
+            self.g_buffer.attachments()[0].image().extent()[0],
+            self.g_buffer.attachments()[0].image().extent()[1],
+        );
 
         let (visible_light_indices_storage_buffer, lights_from_tile_storage_image_view) =
-            self.cull_lights(builder, &camera, aspect_ratio, &point_lights_buffer)?;
+            self.light_culling_pass.execute(
+                builder,
+                &self.context,
+                &camera,
+                aspect_ratio,
+                &point_lights_buffer,
+                g_buffer_extent,
+                &self.settings,
+            )?;
 
         let entities_data_and_indirect_commands =
             self.get_entities_data_and_indirect_draw_commands();
 
+        let asset_database_read = self.asset_database.read().unwrap();
+        let vertex_buffer = asset_database_read.vertex_buffer().clone();
+        let index_buffer = asset_database_read.index_buffer().clone();
+        drop(asset_database_read);
+
         if let Some((entities_data, indirect_commands)) =
             entities_data_and_indirect_commands.as_ref()
         {
-            if let Some((_depth_splits, light_space_matrices)) = shadow_map_matrices_and_splits {
-                self.render_shadow_maps(
-                    builder,
-                    &entities_data,
-                    &indirect_commands,
-                    &light_space_matrices,
-                )?;
-            }
+            let (shadow_maps_texture, shadow_map_matrices_and_splits) = self.cascaded_shadow_maps_pass.execute(
+                builder,
+                &self.context,
+                &self.shadow_map_framebuffer,
+                &entities_data,
+                &indirect_commands,
+                &vertex_buffer,
+                &index_buffer,
+                &camera,
+                aspect_ratio,
+                &self.world,
+                &self.settings,
+            )?;
+            // main pass
+            self.meshes_pass.run(
+                builder,
+                &self.context,
+                camera,
+                aspect_ratio,
+                &point_lights_buffer,
+                &directional_lights_buffer,
+                &visible_light_indices_storage_buffer,
+                &lights_from_tile_storage_image_view,
+                &shadow_maps_texture,
+                &shadow_map_matrices_and_splits,
+                &self.asset_database,
+                &self.settings,
+                &self.g_buffer,
+                &self.world,
+            )?;
         }
 
-        // main pass
-        self.meshes_pass.run(
-            builder,
-            &self.context,
-            camera,
-            aspect_ratio,
-            &point_lights_buffer,
-            &directional_lights_buffer,
-            &visible_light_indices_storage_buffer,
-            &lights_from_tile_storage_image_view,
-            &self.shadow_map_framebuffer.attachments()[0],
-            &shadow_map_matrices_and_splits,
-            &self.asset_database,
-            &LightCullingSettings {
-                max_lights_per_tile: self.settings.light_culling_max_lights_per_tile,
-                tile_size: self.settings.light_culling_tile_size,
-                z_slices: self.settings.light_culling_z_slices,
-            },
-            &ShadowMappingSettings {
-                cascade_level_size: self.settings.cascaded_shadow_map_level_size,
-                sample_count_per_level: self.settings.sample_count_per_level,
-                bias: self.settings.shadow_bias,
-                slope_bias: self.settings.shadow_slope_bias,
-                normal_bias: self.settings.shadow_normal_bias,
-                penumbra_max_size: self.settings.penumbra_max_size,
-                cascade_split_lambda: self.settings.shadow_map_cascade_split_lambda,
-            },
-            &self.g_buffer,
-            &self.world,
-        )?;
         self.ambient_occlusion_pass(builder, &camera, aspect_ratio)?;
 
         self.post_processing_pass(builder, framebuffer)?;

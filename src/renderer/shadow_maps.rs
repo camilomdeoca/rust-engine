@@ -39,22 +39,10 @@ use vulkano::{
 use crate::{
     assets::vertex::Vertex,
     camera::Camera,
-    ecs::components::{DirectionalLight, DirectionalLightShadowMap, Transform},
+    ecs::components::{DirectionalLight, DirectionalLightShadowMap, Transform}, settings::SHADOW_MAP_CASCADE_COUNT,
 };
 
 use super::{main_pass::mesh_shaders, Renderer, RendererError};
-
-pub const SHADOW_MAP_CASCADE_COUNT: u32 = 4;
-
-pub struct ShadowMappingSettings {
-    pub cascade_level_size: u32,
-    pub sample_count_per_level: [u32; SHADOW_MAP_CASCADE_COUNT as usize],
-    pub bias: f32,
-    pub slope_bias: f32,
-    pub normal_bias: f32,
-    pub penumbra_max_size: f32,
-    pub cascade_split_lambda: f32,
-}
 
 pub fn create_shadow_map_renderpass(
     device: &Arc<Device>,

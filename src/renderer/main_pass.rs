@@ -19,7 +19,7 @@ use vulkano::{
         view::{ImageView, ImageViewCreateInfo},
         Image, ImageCreateInfo, ImageSubresourceRange, ImageType, ImageUsage,
     },
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter},
     pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -48,12 +48,10 @@ use crate::{
     camera::Camera,
     ecs::components::{self, MaterialComponent, MeshComponent, Transform},
     renderer::RendererAssetChangeListener,
+    settings::{Settings, SHADOW_MAP_CASCADE_COUNT},
 };
 
-use super::{
-    light_culling::LightCullingSettings, shadow_maps::ShadowMappingSettings, RendererContext,
-    RendererError, SHADOW_MAP_CASCADE_COUNT,
-};
+use super::{RendererContext, RendererError};
 
 /// The index of the descitptor set that doesnt change every frame
 /// It has textures and materials buffer
@@ -102,66 +100,6 @@ pub struct MeshesPass {
     cube_index_buffer: Subbuffer<[u32]>,
 
     asset_change_listener: Arc<RwLock<RendererAssetChangeListener>>,
-}
-
-pub fn create_g_buffer_framebuffer(
-    render_pass: &Arc<RenderPass>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    extent: [u32; 3],
-) -> Result<Arc<Framebuffer>, RendererError> {
-    // We need to build mip chain for rendering SSAO at lower resolution and to then upscale it
-    // with Joint Bilateral upsampling. We will also use it to sample smaller levels first:
-    // We will store the min of 4 pixels in each next mip level, and if when comparing the depth it
-    // is outside the radius then we dont sample bigger level as all will be bigger (they are
-    // behind)
-    let mip_levels = extent.iter().max().unwrap().ilog2();
-    let depth_buffer_image = Image::new(
-        memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::D32_SFLOAT,
-            extent,
-            mip_levels,
-            usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .unwrap();
-
-    let depth_buffer = ImageView::new(
-        depth_buffer_image.clone(),
-        ImageViewCreateInfo {
-            subresource_range: ImageSubresourceRange {
-                mip_levels: 0..1,
-                ..depth_buffer_image.subresource_range()
-            },
-            ..ImageViewCreateInfo::from_image(&depth_buffer_image)
-        },
-    )?;
-
-    let g_buffer = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::R32G32_UINT,
-                extent,
-                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )?;
-
-    Ok(Framebuffer::new(
-        render_pass.clone(),
-        FramebufferCreateInfo {
-            attachments: vec![g_buffer.clone(), depth_buffer.clone()],
-            ..Default::default()
-        },
-    )?)
 }
 
 pub fn create_main_render_pass(
@@ -614,18 +552,72 @@ impl MeshesPass {
         })
     }
 
+    pub fn create_g_buffer_framebuffer(
+        &self,
+        context: &RendererContext,
+        extent: UVec2,
+    ) -> Result<Arc<Framebuffer>, RendererError> {
+        // We need to build mip chain for rendering SSAO at lower resolution and to then upscale it
+        // with Joint Bilateral upsampling. We will also use it to sample smaller levels first:
+        // We will store the min of 4 pixels in each next mip level, and if when comparing the depth it
+        // is outside the radius then we dont sample bigger level as all will be bigger (they are
+        // behind)
+        let mip_levels = extent.max_element().ilog2();
+        let depth_buffer_image = Image::new(
+            context.memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D32_SFLOAT,
+                extent: [extent.x, extent.y, 1],
+                mip_levels,
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let depth_buffer = ImageView::new(
+            depth_buffer_image.clone(),
+            ImageViewCreateInfo {
+                subresource_range: ImageSubresourceRange {
+                    mip_levels: 0..1,
+                    ..depth_buffer_image.subresource_range()
+                },
+                ..ImageViewCreateInfo::from_image(&depth_buffer_image)
+            },
+        )?;
+
+        let g_buffer = ImageView::new_default(
+            Image::new(
+                context.memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R32G32_UINT,
+                    extent: [extent.x, extent.y, 1],
+                    usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap(),
+        )?;
+
+        Ok(Framebuffer::new(
+            self.render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![g_buffer.clone(), depth_buffer.clone()],
+                ..Default::default()
+            },
+        )?)
+    }
+
     pub fn resize_and_create_g_buffer(
         &mut self,
         context: &RendererContext,
         extent: UVec2,
     ) -> Result<Arc<Framebuffer>, RendererError> {
-        let extent_array = [extent.x, extent.y, 1];
-
-        let g_buffer = create_g_buffer_framebuffer(
-            &self.render_pass,
-            &context.memory_allocator,
-            extent_array,
-        )?;
+        let g_buffer = self.create_g_buffer_framebuffer(context, extent)?;
 
         self.mesh_pipeline = create_mesh_pipeline(
             extent.as_vec2(),
@@ -847,8 +839,7 @@ impl MeshesPass {
             [Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
         )>,
         asset_database: &Arc<RwLock<AssetDatabase>>,
-        light_culling_settings: &LightCullingSettings,
-        shadow_mapping_settings: &ShadowMappingSettings,
+        settings: &Settings,
         g_buffer: &Arc<Framebuffer>,
         world: &World,
     ) -> Result<(), RendererError> {
@@ -879,8 +870,7 @@ impl MeshesPass {
                 shadow_map,
                 shadow_map_matrices_and_splits,
                 asset_database,
-                light_culling_settings,
-                shadow_mapping_settings,
+                settings,
             )?;
         }
 
@@ -918,8 +908,7 @@ impl MeshesPass {
             [Mat4; SHADOW_MAP_CASCADE_COUNT as usize],
         )>,
         asset_database: &Arc<RwLock<AssetDatabase>>,
-        light_culling_settings: &LightCullingSettings,
-        shadow_mapping_settings: &ShadowMappingSettings,
+        settings: &Settings,
     ) -> Result<(), RendererError> {
         let view = Mat4::look_to_rh(
             camera.position,
@@ -968,15 +957,17 @@ impl MeshesPass {
                     .map(|buffer| buffer.len() as u32)
                     .unwrap_or(0),
                 cutoff_distances: cascade_splits.map(|split| split.into()),
-                light_culling_tile_size: light_culling_settings.tile_size,
-                light_culling_z_slices: light_culling_settings.z_slices.into(),
-                light_culling_sample_count_per_level: shadow_mapping_settings
+                light_culling_tile_size: settings.renderer.light_culling.tile_size,
+                light_culling_z_slices: settings.renderer.light_culling.z_slices.into(),
+                light_culling_sample_count_per_level: settings
+                    .renderer
+                    .shadow_mapping
                     .sample_count_per_level
                     .map(|x| x.into()),
-                shadow_bias: shadow_mapping_settings.bias.into(),
-                shadow_slope_bias: shadow_mapping_settings.slope_bias.into(),
-                shadow_normal_bias: shadow_mapping_settings.normal_bias.into(),
-                penumbra_filter_size: shadow_mapping_settings.penumbra_max_size.into(),
+                shadow_bias: settings.renderer.shadow_mapping.bias.into(),
+                shadow_slope_bias: settings.renderer.shadow_mapping.slope_bias.into(),
+                shadow_normal_bias: settings.renderer.shadow_mapping.normal_bias.into(),
+                penumbra_filter_size: settings.renderer.shadow_mapping.penumbra_max_size.into(),
                 light_space_matrices: light_space_matrices.map(|mat| mat.to_cols_array_2d()),
             };
 

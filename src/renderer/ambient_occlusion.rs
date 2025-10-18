@@ -189,9 +189,9 @@ impl Renderer {
                 inverse_projection: proj.inverse().to_cols_array_2d(),
                 view: view.to_cols_array_2d(),
                 projection: proj.to_cols_array_2d(),
-                sample_count: self.settings.sample_count as f32,
-                sample_radius: self.settings.sample_radius,
-                intensity: self.settings.ambient_occlusion_intensity,
+                sample_count: self.settings.renderer.ambient_occlusion.sample_count as f32,
+                sample_radius: self.settings.renderer.ambient_occlusion.sample_radius,
+                intensity: self.settings.renderer.ambient_occlusion.ambient_occlusion_intensity,
             };
 
             let buffer = self.context.uniform_buffer_allocator.allocate_sized().unwrap();
