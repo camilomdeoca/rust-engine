@@ -1,15 +1,22 @@
 use std::sync::Arc;
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, UVec2, Vec2, Vec3};
 use vulkano::{
+    buffer::Subbuffer,
     command_buffer::{
         AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
     },
     descriptor_set::{DescriptorSet, WriteDescriptorSet},
     device::Device,
     format::Format,
-    image::{sampler::Sampler, view::ImageView, Image, ImageCreateInfo, ImageType, ImageUsage},
-    memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator},
+    image::{
+        sampler::{
+            BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE,
+        },
+        view::ImageView,
+        Image, ImageCreateInfo, ImageType, ImageUsage,
+    },
+    memory::allocator::AllocationCreateInfo,
     pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -29,46 +36,16 @@ use vulkano::{
     Validated, VulkanError,
 };
 
-use crate::{assets::vertex::Vertex, camera::Camera};
+use crate::{assets::vertex::Vertex, camera::Camera, settings::Settings};
 
-use super::{Renderer, RendererError};
+use super::{full_screen_quad, RendererContext, RendererError};
 
-pub fn create_ambient_occlusion_framebuffer(
-    render_pass: &Arc<RenderPass>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    extent: [u32; 3],
-) -> Result<Arc<Framebuffer>, RendererError> {
-    let extent = [
-        (extent[0] as f32 * 1.0) as u32,
-        (extent[1] as f32 * 1.0) as u32,
-        extent[2],
-    ];
-
-    let ambient_occlusion_buffer = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::R8_UNORM,
-                extent,
-                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )?;
-
-    Ok(Framebuffer::new(
-        render_pass.clone(),
-        FramebufferCreateInfo {
-            attachments: vec![ambient_occlusion_buffer.clone()],
-            ..Default::default()
-        },
-    )?)
+pub struct AmbientOcclusionPass {
+    pipeline: Arc<GraphicsPipeline>,
+    render_pass: Arc<RenderPass>,
 }
 
-pub fn create_ambient_occlusion_render_pass(
+fn create_ambient_occlusion_render_pass(
     device: &Arc<Device>,
 ) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
     vulkano::ordered_passes_renderpass!(
@@ -92,8 +69,8 @@ pub fn create_ambient_occlusion_render_pass(
     )
 }
 
-pub fn create_ambient_occlusion_pipeline(
-    extent: Vec2,
+fn create_ambient_occlusion_pipeline(
+    extent: UVec2,
     sub_pass: Subpass,
     device: &Arc<Device>,
     vs: &EntryPoint,
@@ -101,7 +78,10 @@ pub fn create_ambient_occlusion_pipeline(
     sampler_float: &Arc<Sampler>,
     sampler_uint: &Arc<Sampler>,
 ) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
-    let extent = Vec2::new((extent.x * 1.0).trunc(), (extent.y * 1.0).trunc());
+    let extent = Vec2::new(
+        (extent.x as f32 * 1.0).trunc(),
+        (extent.y as f32 * 1.0).trunc(),
+    );
     let viewport = Viewport {
         offset: [0.0, 0.0],
         extent: extent.into(),
@@ -159,22 +139,113 @@ pub fn create_ambient_occlusion_pipeline(
     )
 }
 
-impl Renderer {
-    pub fn ambient_occlusion_pass(
+impl AmbientOcclusionPass {
+    pub fn new(context: &RendererContext, output_extent: UVec2) -> Result<Self, RendererError> {
+        let full_screen_quad_vs = full_screen_quad::vs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let fs = ambient_occlusion_shaders::fs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+        let render_pass = create_ambient_occlusion_render_pass(&context.device)?;
+
+        let nearest_sampler_float = Sampler::new(
+            context.device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::ClampToBorder; 3],
+                border_color: BorderColor::FloatOpaqueWhite,
+                ..Default::default()
+            },
+        )?;
+
+        let nearest_sampler_any = Sampler::new(
+            context.device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )?;
+
+        let pipeline = create_ambient_occlusion_pipeline(
+            output_extent,
+            Subpass::from(render_pass.clone(), 0).unwrap(),
+            &context.device,
+            &full_screen_quad_vs,
+            &fs,
+            &nearest_sampler_float,
+            &nearest_sampler_any,
+        )?;
+
+        Ok(Self {
+            pipeline,
+            render_pass,
+        })
+    }
+
+    pub fn create_framebuffer(
+        &self,
+        context: &RendererContext,
+        extent: UVec2,
+    ) -> Result<Arc<Framebuffer>, RendererError> {
+        let extent = [
+            (extent[0] as f32 * 1.0) as u32,
+            (extent[1] as f32 * 1.0) as u32,
+            1,
+        ];
+
+        let ambient_occlusion_buffer = ImageView::new_default(
+            Image::new(
+                context.memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R8_UNORM,
+                    extent,
+                    usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap(),
+        )?;
+
+        Ok(Framebuffer::new(
+            self.render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![ambient_occlusion_buffer.clone()],
+                ..Default::default()
+            },
+        )?)
+    }
+
+    pub fn execute(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        context: &RendererContext,
+        framebuffer: &Arc<Framebuffer>,
+        g_buffer: &Arc<ImageView>,
+        depth_buffer: &Arc<ImageView>,
+        full_screen_vertex_buffer: &Subbuffer<[Vertex]>,
+        full_screen_index_buffer: &Subbuffer<[u32]>,
         camera: &Camera,
         aspect_ratio: f32,
+        settings: &Settings,
     ) -> Result<(), RendererError> {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
-                    ..RenderPassBeginInfo::framebuffer(self.ambient_occlusion_buffer.clone())
+                    ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo::default(),
             )?
-            .bind_pipeline_graphics(self.ambient_occlusion_pipeline.clone())?;
+            .bind_pipeline_graphics(self.pipeline.clone())?;
 
         let uniform_buffer = {
             let view = Mat4::look_to_rh(
@@ -189,23 +260,26 @@ impl Renderer {
                 inverse_projection: proj.inverse().to_cols_array_2d(),
                 view: view.to_cols_array_2d(),
                 projection: proj.to_cols_array_2d(),
-                sample_count: self.settings.renderer.ambient_occlusion.sample_count as f32,
-                sample_radius: self.settings.renderer.ambient_occlusion.sample_radius,
-                intensity: self.settings.renderer.ambient_occlusion.ambient_occlusion_intensity,
+                sample_count: settings.renderer.ambient_occlusion.sample_count as f32,
+                sample_radius: settings.renderer.ambient_occlusion.sample_radius,
+                intensity: settings
+                    .renderer
+                    .ambient_occlusion
+                    .ambient_occlusion_intensity,
             };
 
-            let buffer = self.context.uniform_buffer_allocator.allocate_sized().unwrap();
+            let buffer = context.uniform_buffer_allocator.allocate_sized().unwrap();
             *buffer.write().unwrap() = uniform_data;
 
             buffer
         };
 
         let descriptor_set = DescriptorSet::new(
-            self.context.descriptor_set_allocator.clone(),
-            self.ambient_occlusion_pipeline.layout().set_layouts()[0].clone(),
+            context.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::image_view(2, self.g_buffer.attachments()[0].clone()),
-                WriteDescriptorSet::image_view(3, self.g_buffer.attachments()[1].clone()),
+                WriteDescriptorSet::image_view(2, g_buffer.clone()),
+                WriteDescriptorSet::image_view(3, depth_buffer.clone()),
                 WriteDescriptorSet::buffer(4, uniform_buffer.clone()),
             ],
             [],
@@ -213,14 +287,14 @@ impl Renderer {
         builder
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.ambient_occlusion_pipeline.layout().clone(),
+                self.pipeline.layout().clone(),
                 0,
                 descriptor_set,
             )?
-            .bind_vertex_buffers(0, self.full_screen_vertex_buffer.clone())?
-            .bind_index_buffer(self.full_screen_index_buffer.clone())?;
-        assert_eq!(self.full_screen_index_buffer.len(), 6);
-        unsafe { builder.draw_indexed(self.full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
+            .bind_vertex_buffers(0, full_screen_vertex_buffer.clone())?
+            .bind_index_buffer(full_screen_index_buffer.clone())?;
+        assert_eq!(full_screen_index_buffer.len(), 6);
+        unsafe { builder.draw_indexed(full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
 
         builder.end_render_pass(Default::default())?;
 

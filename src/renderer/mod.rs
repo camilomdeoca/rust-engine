@@ -3,10 +3,7 @@ use std::{
     u32,
 };
 
-use ambient_occlusion::{
-    ambient_occlusion_shaders, create_ambient_occlusion_framebuffer,
-    create_ambient_occlusion_pipeline, create_ambient_occlusion_render_pass,
-};
+use ambient_occlusion::AmbientOcclusionPass;
 use cascaded_shadow_maps_pass::{CascadedShadowMapsPass, CascadedShadowMapsPassError};
 use flecs_ecs::prelude::*;
 use glam::{uvec2, Mat4, UVec2, Vec2, Vec3};
@@ -29,7 +26,7 @@ use vulkano::{
     format::Format,
     image::{
         sampler::{
-            BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE,
+            Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE,
         },
         view::ImageView,
     },
@@ -51,19 +48,17 @@ use crate::{
     },
     camera::Camera,
     ecs::components::{
-        self, DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent,
+        DirectionalLight, DirectionalLightShadowMap, MaterialComponent, MeshComponent,
         Transform,
     },
     settings::Settings,
 };
 
 mod ambient_occlusion;
-mod ambient_occlusion_pass;
 mod cascaded_shadow_maps_pass;
 mod light_culling;
 mod main_pass;
 mod post_process;
-//mod shadow_maps;
 
 #[derive(Error, Debug)]
 pub enum RendererError {
@@ -113,14 +108,12 @@ pub struct Renderer {
     cascaded_shadow_maps_pass: CascadedShadowMapsPass,
     light_culling_pass: LightCullingPass,
     meshes_pass: MeshesPass,
+    ambient_occlusion_pass: AmbientOcclusionPass,
 
     full_screen_quad_vs: EntryPoint,
     post_processing_fs: EntryPoint,
-    ambient_occlusion_fs: EntryPoint,
     post_processing_render_pass: Arc<RenderPass>,
     post_processing_pipeline: Arc<GraphicsPipeline>,
-    ambient_occlusion_render_pass: Arc<RenderPass>,
-    ambient_occlusion_pipeline: Arc<GraphicsPipeline>,
 
     shadow_map_framebuffer: Arc<Framebuffer>,
 
@@ -130,11 +123,8 @@ pub struct Renderer {
     full_screen_vertex_buffer: Subbuffer<[Vertex]>,
     full_screen_index_buffer: Subbuffer<[u32]>,
 
-    nearest_sampler_float: Arc<Sampler>,
     nearest_sampler_any: Arc<Sampler>,
-    sampler: Arc<Sampler>,
 
-    environment_cubemap_query: Query<&'static components::EnvironmentCubemap>,
     meshes_with_materials_query: Query<(
         &'static MeshComponent,
         &'static MaterialComponent,
@@ -241,12 +231,6 @@ impl Renderer {
             }
         };
 
-        // let shadow_map_framebuffer = create_shadow_map_framebuffer(
-        //     &context.memory_allocator,
-        //     &shadow_mapping_render_pass,
-        //     settings.renderer.shadow_mapping.cascade_level_size,
-        // )?;
-
         let full_screen_quad_vs = full_screen_quad::vs::load(context.device.clone())?
             .entry_point("main")
             .unwrap();
@@ -254,38 +238,11 @@ impl Renderer {
             .entry_point("main")
             .unwrap();
 
-        let ambient_occlusion_fs = ambient_occlusion_shaders::fs::load(context.device.clone())?
-            .entry_point("main")
-            .unwrap();
-
-        let nearest_sampler_float = Sampler::new(
-            context.device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                lod: 0.0..=LOD_CLAMP_NONE,
-                address_mode: [SamplerAddressMode::ClampToBorder; 3],
-                border_color: BorderColor::FloatOpaqueWhite,
-                ..Default::default()
-            },
-        )?;
-
         let nearest_sampler_any = Sampler::new(
             context.device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Nearest,
                 min_filter: Filter::Nearest,
-                lod: 0.0..=LOD_CLAMP_NONE,
-                address_mode: [SamplerAddressMode::Repeat; 3],
-                ..Default::default()
-            },
-        )?;
-
-        let sampler = Sampler::new(
-            context.device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
                 lod: 0.0..=LOD_CLAMP_NONE,
                 address_mode: [SamplerAddressMode::Repeat; 3],
                 ..Default::default()
@@ -311,22 +268,22 @@ impl Renderer {
         //     [extent.x as u32, extent.y as u32, 1],
         // )?;
 
-        let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&context.device)?;
-        let ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
-            extent,
-            Subpass::from(ambient_occlusion_render_pass.clone(), 0).unwrap(),
-            &context.device,
-            &full_screen_quad_vs,
-            &ambient_occlusion_fs,
-            &nearest_sampler_float,
-            &nearest_sampler_any,
-        )?;
-
-        let ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
-            &ambient_occlusion_render_pass,
-            &memory_allocator,
-            [extent.x as u32, extent.y as u32, 1],
-        )?;
+        // let ambient_occlusion_render_pass = create_ambient_occlusion_render_pass(&context.device)?;
+        // let ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
+        //     extent,
+        //     Subpass::from(ambient_occlusion_render_pass.clone(), 0).unwrap(),
+        //     &context.device,
+        //     &full_screen_quad_vs,
+        //     &ambient_occlusion_fs,
+        //     &nearest_sampler_float,
+        //     &nearest_sampler_any,
+        // )?;
+        //
+        // let ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
+        //     &ambient_occlusion_render_pass,
+        //     &memory_allocator,
+        //     [extent.x as u32, extent.y as u32, 1],
+        // )?;
 
         let (full_screen_vertex_buffer, full_screen_index_buffer) =
             load_mesh_from_buffers_into_new_buffers(
@@ -362,12 +319,6 @@ impl Renderer {
             )
             .unwrap();
 
-        let environment_cubemap_query = world
-            .query::<&components::EnvironmentCubemap>()
-            .term_at(0)
-            .singleton()
-            .build();
-
         let meshes_with_materials_query =
             world.new_query::<(&MeshComponent, &MaterialComponent, &Transform)>();
 
@@ -376,6 +327,7 @@ impl Renderer {
         let cascaded_shadow_maps_pass = CascadedShadowMapsPass::new(&context, &settings)?;
         let light_culling_pass = LightCullingPass::new(&context, &settings)?;
         let meshes_pass = MeshesPass::new(builder, &context, extent, &asset_database, &world)?;
+        let ambient_occlusion_pass = AmbientOcclusionPass::new(&context, extent.as_uvec2())?;
 
         let shadow_map_framebuffer = cascaded_shadow_maps_pass.create_framebuffer(
             &context,
@@ -383,6 +335,11 @@ impl Renderer {
         )?;
 
         let g_buffer = meshes_pass.create_g_buffer_framebuffer(&context, extent.as_uvec2())?;
+
+        let ambient_occlusion_buffer = ambient_occlusion_pass.create_framebuffer(
+            &context,
+            extent.as_uvec2(),
+        )?;
 
         let asset_change_listener = Arc::new(RwLock::new(RendererAssetChangeListener {
             textures_changed: false,
@@ -402,19 +359,17 @@ impl Renderer {
             asset_database,
 
             g_buffer,
-            light_culling_pass,
             ambient_occlusion_buffer,
 
+            light_culling_pass,
             cascaded_shadow_maps_pass,
             meshes_pass,
+            ambient_occlusion_pass,
 
             full_screen_quad_vs,
             post_processing_fs,
-            ambient_occlusion_fs,
             post_processing_render_pass,
             post_processing_pipeline,
-            ambient_occlusion_render_pass,
-            ambient_occlusion_pipeline,
 
             shadow_map_framebuffer,
 
@@ -426,10 +381,7 @@ impl Renderer {
             full_screen_vertex_buffer,
             full_screen_index_buffer,
 
-            nearest_sampler_float,
             nearest_sampler_any,
-            sampler,
-            environment_cubemap_query,
             meshes_with_materials_query,
             world,
         };
@@ -517,26 +469,20 @@ impl Renderer {
             .meshes_pass
             .resize_and_create_g_buffer(&self.context, UVec2::new(extent[0], extent[1]))?;
 
-        self.ambient_occlusion_buffer = create_ambient_occlusion_framebuffer(
-            &self.ambient_occlusion_render_pass,
-            &self.context.memory_allocator,
-            extent,
+        self.ambient_occlusion_pass = AmbientOcclusionPass::new(
+            &self.context,
+            uvec2(extent[0], extent[1]),
+        )?;
+
+        self.ambient_occlusion_buffer = self.ambient_occlusion_pass.create_framebuffer(
+            &self.context,
+            uvec2(extent[0], extent[1]),
         )?;
 
         let extent = Vec2::new(
             image_views[0].image().extent()[0] as f32,
             image_views[0].image().extent()[1] as f32,
         );
-
-        self.ambient_occlusion_pipeline = create_ambient_occlusion_pipeline(
-            extent,
-            Subpass::from(self.ambient_occlusion_render_pass.clone(), 0).unwrap(),
-            &self.context.device,
-            &self.full_screen_quad_vs,
-            &self.ambient_occlusion_fs,
-            &self.nearest_sampler_float,
-            &self.nearest_sampler_any,
-        )?;
 
         self.post_processing_pipeline = create_post_processing_pipeline(
             extent,
@@ -649,7 +595,18 @@ impl Renderer {
             )?;
         }
 
-        self.ambient_occlusion_pass(builder, &camera, aspect_ratio)?;
+        self.ambient_occlusion_pass.execute(
+            builder,
+            &self.context,
+            &self.ambient_occlusion_buffer,
+            &self.g_buffer.attachments()[0],
+            &self.g_buffer.attachments()[1],
+            &self.full_screen_vertex_buffer,
+            &self.full_screen_index_buffer,
+            &camera,
+            aspect_ratio,
+            &self.settings,
+        )?;
 
         self.post_processing_pass(builder, framebuffer)?;
 
