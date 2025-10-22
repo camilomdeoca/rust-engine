@@ -24,7 +24,7 @@ use crate::{
     settings::Settings,
 };
 
-use super::{main_pass::mesh_shaders, Renderer, RendererContext, RendererError};
+use super::{meshes_pass::mesh_shaders, Renderer, RendererContext, RendererError};
 
 pub struct LightCullingPass {
     light_culling_pipeline: Arc<ComputePipeline>,

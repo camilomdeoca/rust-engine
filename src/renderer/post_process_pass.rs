@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
-use glam::Vec2;
+use glam::UVec2;
 use vulkano::{
+    buffer::Subbuffer,
     command_buffer::{
         AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
     },
     descriptor_set::{DescriptorSet, WriteDescriptorSet},
     device::Device,
     format::Format,
-    image::sampler::Sampler,
+    image::{
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, LOD_CLAMP_NONE},
+        view::ImageView,
+    },
     pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -23,16 +27,21 @@ use vulkano::{
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
-    render_pass::{Framebuffer, RenderPass, Subpass},
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     shader::EntryPoint,
     Validated, VulkanError,
 };
 
 use crate::assets::vertex::Vertex;
 
-use super::{Renderer, RendererError};
+use super::{full_screen_quad, RendererContext, RendererError};
 
-pub fn create_post_processing_render_pass(
+pub struct PostProcessingPass {
+    pipeline: Arc<GraphicsPipeline>,
+    render_pass: Arc<RenderPass>,
+}
+
+fn create_post_processing_render_pass(
     device: &Arc<Device>,
     output_format: Format,
 ) -> Result<Arc<RenderPass>, Validated<VulkanError>> {
@@ -56,8 +65,8 @@ pub fn create_post_processing_render_pass(
     )
 }
 
-pub fn create_post_processing_pipeline(
-    extent: Vec2,
+fn create_post_processing_pipeline(
+    extent: UVec2,
     sub_pass: Subpass,
     device: &Arc<Device>,
     vs: &EntryPoint,
@@ -66,7 +75,7 @@ pub fn create_post_processing_pipeline(
 ) -> Result<Arc<GraphicsPipeline>, Validated<VulkanError>> {
     let viewport = Viewport {
         offset: [0.0, 0.0],
-        extent: extent.into(),
+        extent: extent.as_vec2().into(),
         depth_range: 0.0..=1.0,
     };
 
@@ -116,11 +125,78 @@ pub fn create_post_processing_pipeline(
     )
 }
 
-impl Renderer {
-    pub fn post_processing_pass(
+impl PostProcessingPass {
+    pub fn new(
+        context: &RendererContext,
+        output_extent: UVec2,
+        output_format: Format,
+    ) -> Result<Self, RendererError> {
+        let full_screen_quad_vs = full_screen_quad::vs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let fs = post_processing_shaders::fs::load(context.device.clone())?
+            .entry_point("main")
+            .unwrap();
+
+        let render_pass = create_post_processing_render_pass(&context.device, output_format)?;
+
+        let sampler = Sampler::new(
+            context.device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                lod: 0.0..=LOD_CLAMP_NONE,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )?;
+
+        let pipeline = create_post_processing_pipeline(
+            output_extent,
+            Subpass::from(render_pass.clone(), 0).unwrap(),
+            &context.device,
+            &full_screen_quad_vs,
+            &fs,
+            &sampler,
+        )?;
+
+        Ok(Self {
+            pipeline,
+            render_pass,
+        })
+    }
+
+    pub fn create_framebuffers(
+        &self,
+        image_views: &[Arc<ImageView>],
+    ) -> Result<Vec<Arc<Framebuffer>>, RendererError> {
+        let framebuffers = image_views
+            .iter()
+            .map(|image_view| {
+                Framebuffer::new(
+                    self.render_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![image_view.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        Ok(framebuffers)
+    }
+
+    pub fn execute(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        context: &RendererContext,
         framebuffer: &Arc<Framebuffer>,
+        g_buffer: &Arc<ImageView>,
+        ambient_occlusion_buffer: &Arc<ImageView>,
+        full_screen_vertex_buffer: &Subbuffer<[Vertex]>,
+        full_screen_index_buffer: &Subbuffer<[u32]>,
     ) -> Result<(), RendererError> {
         builder
             .begin_render_pass(
@@ -130,29 +206,26 @@ impl Renderer {
                 },
                 SubpassBeginInfo::default(),
             )?
-            .bind_pipeline_graphics(self.post_processing_pipeline.clone())?;
+            .bind_pipeline_graphics(self.pipeline.clone())?;
         let descriptor_set = DescriptorSet::new(
-            self.context.descriptor_set_allocator.clone(),
-            self.post_processing_pipeline.layout().set_layouts()[0].clone(),
+            context.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::image_view(1, self.g_buffer.attachments()[0].clone()),
-                WriteDescriptorSet::image_view(
-                    2,
-                    self.ambient_occlusion_buffer.attachments()[0].clone(),
-                ),
+                WriteDescriptorSet::image_view(1, g_buffer.clone()),
+                WriteDescriptorSet::image_view(2, ambient_occlusion_buffer.clone()),
             ],
             [],
         )?;
         builder
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.post_processing_pipeline.layout().clone(),
+                self.pipeline.layout().clone(),
                 0,
                 descriptor_set,
             )?
-            .bind_vertex_buffers(0, self.full_screen_vertex_buffer.clone())?
-            .bind_index_buffer(self.full_screen_index_buffer.clone())?;
-        unsafe { builder.draw_indexed(self.full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
+            .bind_vertex_buffers(0, full_screen_vertex_buffer.clone())?
+            .bind_index_buffer(full_screen_index_buffer.clone())?;
+        unsafe { builder.draw_indexed(full_screen_index_buffer.len() as u32, 1, 0, 0, 0) }?;
 
         builder.end_render_pass(Default::default())?;
 

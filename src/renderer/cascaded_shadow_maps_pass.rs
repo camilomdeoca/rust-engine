@@ -35,7 +35,7 @@ use crate::{
     settings::{Settings, SHADOW_MAP_CASCADE_COUNT},
 };
 
-use super::{main_pass::mesh_shaders, RendererContext};
+use super::{meshes_pass::mesh_shaders, RendererContext};
 
 #[derive(Error, Debug)]
 pub enum CascadedShadowMapsPassError {
